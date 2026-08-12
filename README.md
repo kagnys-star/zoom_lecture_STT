@@ -450,22 +450,45 @@ UI가 "볼륨을 올리라" 고 알려 줍니다.
 
 ## 구조
 
+```
+Sources/ZoomCaption/
+├── App/            실행 진입점, 옵션 파싱, 자가진단
+├── Server/         localhost HTTP/SSE 서버, 웹 UI, 라우트
+│   └── Routes/     엔드포인트를 기능별로 나눈 라우트 그룹
+├── Audio/          Core Audio 캡처, 리샘플, 소리 조각 보관
+├── Transcription/  SpeechAnalyzer(실시간) · whisper.cpp(재전사)
+├── Analysis/       대조(정렬), 정답지, 교안 용어 추출·캐시
+├── Summary/        요약 엔진, Ollama 클라이언트
+├── Storage/        자막 저장소, 세션 폴더
+└── Support/        파일 로깅
+```
+
 | 파일 | 역할 |
 |---|---|
-| `AudioTap.swift` | Core Audio process tap, 마이크 캡처, 리샘플러 |
-| `Transcription.swift` | SpeechAnalyzer 파이프라인, 모델 자산 준비 |
-| `Store.swift` | 자막 저장소, 편집, 이어 적기 오프셋, SRT/MD 내보내기 |
-| `Session.swift` | 세션 폴더 생성·목록·저장·불러오기, 폴더 선택 다이얼로그 |
-| `DomainCache.swift` | 교안 분석 결과 캐시 (내용 해시 기준) |
-| `DomainKnowledge.swift` | PDF 텍스트 추출, mecab-ko 용어 추출 (+ 규칙 폴백) |
-| `AudioArchive.swift` | 소리를 16kHz mono WAV 로 보관, 조각 목록 |
-| `Whisper.swift` | whisper.cpp 실행, 진행률·오류 추적, JSON 파싱 |
-| `Summarizer.swift` | 엔진 선택(Ollama→Apple→추출식), 스키마 정의, 마크다운 렌더 |
-| `OllamaClient.swift` | 로컬 Ollama 호출, JSON 스키마 구조화 출력 |
-| `HTTPServer.swift` | localhost HTTP/1.1 + SSE |
-| `WebUI.swift` | 웹 UI (단일 HTML) |
-| `main.swift` | 라우팅, 세션 제어, 시작 진단, 자가진단 |
-| `Logger.swift` | 파일 로깅, 일자별 회전, 14일 보관 |
+| `App/main.swift` | 앱 시작, 재실행 감지, 시작 진단 로그 |
+| `App/Options.swift` | 커맨드라인 옵션 파싱 |
+| `App/ZoomCaptionApp.swift` | 오케스트레이션 — 세션 제어, 라우트 묶어 내리기 |
+| `App/SelfTest.swift` | `--selftest` / `--pdftest` / `--sumtest` |
+| `Server/HTTPServer.swift` | localhost HTTP/1.1 + SSE |
+| `Server/RequestTypes.swift` | 요청/응답 공용 타입 |
+| `Server/WebUI.swift` + `WebUI+Style/Markup/Script.swift` | 웹 UI (CSS·HTML·JS로 분리, 합쳐서 한 장의 HTML로 응답) |
+| `Server/Routes/*.swift` | Core·Session·Analysis·Summary·Admin 별 엔드포인트 |
+| `Audio/AudioTap.swift` | Core Audio process tap, 마이크 캡처, 리샘플러 |
+| `Audio/AudioArchive.swift` | 소리를 16kHz mono WAV 로 보관, 조각 목록 |
+| `Audio/AudioSlice.swift` | 조각 경계 dBFS 측정 (무음 판정) |
+| `Audio/AdminFeed.swift` | 관리자 모드용 오디오 되먹임 |
+| `Transcription/TrackTranscriber.swift` | SpeechAnalyzer 파이프라인, 모델 자산 준비 |
+| `Transcription/Whisper.swift` | whisper.cpp 실행(+ VAD 옵션), 진행률·오류 추적, JSON 파싱 |
+| `Transcription/WhisperLive.swift` | Whisper 재전사 조각 스케줄링 |
+| `Analysis/Alignment.swift` | 실시간 ↔ Whisper 글자 단위 정렬(대조) |
+| `Analysis/Gold.swift` | 정답지 저장·CER 계산 |
+| `Analysis/DomainKnowledge.swift` | PDF 텍스트 추출, mecab-ko 용어 추출 (+ 규칙 폴백) |
+| `Analysis/DomainCache.swift` | 교안 분석 결과 캐시 (내용 해시 기준) |
+| `Summary/Summarizer.swift` | 엔진 선택(Ollama→Apple→추출식), 스키마 정의, 마크다운 렌더 |
+| `Summary/OllamaClient.swift` | 로컬 Ollama 호출, JSON 스키마 구조화 출력 |
+| `Storage/Store.swift` | 자막 저장소, 편집, 이어 적기 오프셋, SRT/MD 내보내기 |
+| `Storage/Session.swift` | 세션 폴더 생성·목록·저장·불러오기, 폴더 선택 다이얼로그 |
+| `Support/Logger.swift` | 파일 로깅, 일자별 회전, 14일 보관 |
 
 ## 알아둘 점
 

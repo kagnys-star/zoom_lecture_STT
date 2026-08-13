@@ -42,6 +42,8 @@ final class ZoomCaptionApp: @unchecked Sendable {
   private var archive: AudioArchive?
   /// 수업이 도는 동안 뒤에서 Whisper 를 돌리는 워커
   private var whisperLive: WhisperLive?
+  /// Whisper 가 청크 단위로 끊어 주는 줄을 마침표 기준 문장으로 다시 짜 맞춘다.
+  private var sentenceBuffer: SentenceReconstructor?
   /// 실시간 재전사가 안 돌고 있다면 그 이유. 위 칸이 왜 비어 있는지 화면에 그대로 띄운다.
   private var whisperLiveNote: String?
   private var silenceWatchdog: DispatchSourceTimer?
@@ -537,6 +539,43 @@ final class ZoomCaptionApp: @unchecked Sendable {
     do { try SessionStore.save(store) } catch { logWarn("자동 저장 실패: \(error.localizedDescription)") }
   }
 
+  /// 재구성된 Whisper 문장을 저장하고, 문단을 갱신하고, 화면에 알린다.
+  /// `onLines` 콜백과 `stop()`의 마지막 꼬리 처리가 이 로직을 그대로 같이 쓴다.
+  private func ingestWhisperLines(_ lines: [WhisperLive.Line]) {
+    guard !lines.isEmpty else { return }
+    let added = store.appendWhisper(lines)
+    for seg in added {
+      // 그 시각에 실제로 소리가 있었는지 대조한다. 지우지 않고 알리기만 한다 —
+      // 아직 근거가 환각 6건뿐이라, 오탐이 없는지 확인하는 단계다.
+      // Whisper 가 VAD 로 무음을 안 읽으므로 평소엔 걸릴 게 없다.
+      // 그래도 **로그에는 남긴다** — VAD 가 조용히 멈춰도 알 수 있어야 한다.
+      if let dir = store.sessionDir,
+         let db = AudioSlice.peakDBFS(dir: dir, from: seg.start, to: seg.end),
+         db < AudioSlice.quietCeiling {
+        logWarn("무음 위에 적힘 — \(TranscriptStore.clock(seg.start)) "
+              + "피크 \(String(format: "%.1f", db))dBFS 「\(seg.text.prefix(40))」 "
+              + "(VAD 가 안 도는지 확인하세요)")
+      }
+    }
+    // 문단 번호는 문맥이 쌓여야 확정되니, 방금 붙은 줄이 아니라 몇 조각 전에
+    // 붙었던 줄에 처음 번호가 매겨지는 경우가 흔하다 — 그 옛 줄도 같이 갱신한다.
+    let changedParagraphs = store.regroupParagraphs()
+    let addedIDs = Set(added.map(\.id))
+    for seg in added {
+      var payload: [String: Any] = [
+        "id": seg.id, "start": seg.start, "end": seg.end, "text": seg.text]
+      if let p = changedParagraphs.first(where: { $0.id == seg.id })?.paragraph {
+        payload["paragraph"] = p
+      }
+      live.broadcast(event: "whisperSegment", payload: payload)
+    }
+    for seg in changedParagraphs where !addedIDs.contains(seg.id) {
+      guard let p = seg.paragraph else { continue }
+      live.broadcast(event: "whisperParagraph", payload: ["id": seg.id, "paragraph": p])
+    }
+    autosave()
+  }
+
   // MARK: - 세션 제어
 
   func start(title: String?, terms: [String],
@@ -596,41 +635,15 @@ final class ZoomCaptionApp: @unchecked Sendable {
           // 문단화 모델도 같이 준비한다. Whisper 없이는 문단화도 의미가 없어 여기서만 싣는다.
           // 로드가 늦어도 자막은 안 막힌다 — 준비되기 전까지는 문장 단위로 그대로 나간다.
           Task { await Paragraph.prepare() }
+          let reconstructor = SentenceReconstructor()
+          sentenceBuffer = reconstructor
           let worker = WhisperLive(
             prompt: allTerms.prefix(60).joined(separator: ", "),
             onLines: { [weak self] lines in
               guard let self else { return }
-              let added = self.store.appendWhisper(lines)
-              for seg in added {
-                // 그 시각에 실제로 소리가 있었는지 대조한다. 지우지 않고 알리기만 한다 —
-                // 아직 근거가 환각 6건뿐이라, 오탐이 없는지 확인하는 단계다.
-                // Whisper 가 VAD 로 무음을 안 읽으므로 평소엔 걸릴 게 없다.
-                // 그래도 **로그에는 남긴다** — VAD 가 조용히 멈춰도 알 수 있어야 한다.
-                if let dir = self.store.sessionDir,
-                   let db = AudioSlice.peakDBFS(dir: dir, from: seg.start, to: seg.end),
-                   db < AudioSlice.quietCeiling {
-                  logWarn("무음 위에 적힘 — \(TranscriptStore.clock(seg.start)) "
-                        + "피크 \(String(format: "%.1f", db))dBFS 「\(seg.text.prefix(40))」 "
-                        + "(VAD 가 안 도는지 확인하세요)")
-                }
-              }
-              // 문단 번호는 문맥이 쌓여야 확정되니, 방금 붙은 줄이 아니라 몇 조각 전에
-              // 붙었던 줄에 처음 번호가 매겨지는 경우가 흔하다 — 그 옛 줄도 같이 갱신한다.
-              let changedParagraphs = self.store.regroupParagraphs()
-              let addedIDs = Set(added.map(\.id))
-              for seg in added {
-                var payload: [String: Any] = [
-                  "id": seg.id, "start": seg.start, "end": seg.end, "text": seg.text]
-                if let p = changedParagraphs.first(where: { $0.id == seg.id })?.paragraph {
-                  payload["paragraph"] = p
-                }
-                self.live.broadcast(event: "whisperSegment", payload: payload)
-              }
-              for seg in changedParagraphs where !addedIDs.contains(seg.id) {
-                guard let p = seg.paragraph else { continue }
-                self.live.broadcast(event: "whisperParagraph", payload: ["id": seg.id, "paragraph": p])
-              }
-              self.autosave()
+              // Whisper 청크가 끊어 준 줄을 그대로 쓰지 않고, 마침표 기준 문장으로
+              // 다시 짜 맞춘 뒤에 저장한다(SentenceReconstructor 헤더 참고).
+              self.ingestWhisperLines(reconstructor.reconstruct(lines))
             },
             onProgress: { [weak self] done, total in
               self?.live.broadcast(event: "whisperLive",
@@ -757,6 +770,11 @@ final class ZoomCaptionApp: @unchecked Sendable {
           "message": "Whisper 가 마지막 구간을 정리하는 중입니다…", "level": "info"])
       }
       await worker.finish()
+      // 마침표를 못 만나 문장으로 못 묶고 대기 중이던 꼬리 — 더 올 줄이 없으니 그대로 확정.
+      if let tail = sentenceBuffer?.finalize(), !tail.isEmpty {
+        ingestWhisperLines(tail)
+      }
+      sentenceBuffer = nil
       log("Whisper 실시간 재전사 종료 — 조각 \(worker.progress.done)개, \(store.whisperSegments.count)줄")
       whisperLive = nil
       // 마지막 2~3문장은 앞으로 문맥이 더 쌓일 일이 없다 — 대기하던 판정을 여기서 확정한다.

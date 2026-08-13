@@ -23,11 +23,19 @@ extension WebUI {
   const stream = $('#stream'), live = $('#live'), liveText = $('#liveText'), empty = $('#empty');
   const fastStream = $('#fastStream');
 
-  // 아래 칸은 "지금 무슨 말이 나오나" 를 보는 용도다. 오래된 줄은 화면에서만 지운다.
-  // 저장은 서버가 전부 하고 있고, 정식 기록은 위 칸(Whisper)이다.
-  // 90분치를 DOM 에 쌓아두면 줄마다 렌더 비용이 붙어 실시간이 다시 끊긴다.
-  const FAST_WINDOW = 60;
+  // 아래 칸은 "지금 무슨 말이 나오나" 를 보는 용도다. Whisper 가 이미 정리해서 위 칸에
+  // 올려놓은 구간은 아래 칸에서 뺀다 — 같은 내용이 두 번 보일 이유가 없고, 위 칸(문단화된
+  // Whisper)이 더 정확하다. 저장은 서버가 전부 하고 있고, 정식 기록은 위 칸이다.
+  //
+  // Whisper 가 못 따라오거나(밀림) 아예 꺼져 있으면 whisperCoverEnd 가 안 늘어나는데,
+  // 그럴 때도 90분치가 DOM 에 쌓여 렌더가 끊기면 안 되므로 SAFETY_WINDOW 로 상한을 둔다
+  // (최근 값 기준 최대 3분 — 정상 상황에서 Whisper 지연은 60~90초대라 이 안에서는
+  // whisperCoverEnd 가 항상 이긴다).
+  const SAFETY_WINDOW = 180;
+  let whisperCoverEnd = 0;   // Whisper 가 지금까지 처리한 구간의 끝(초). 이 전은 아래 칸에서 뺀다.
   let fastTotal = 0;
+
+  function fastCutoff(now) { return Math.max(whisperCoverEnd, now - SAFETY_WINDOW); }
 
   function addFast(seg) {
     const el = document.createElement('div');
@@ -36,17 +44,25 @@ extension WebUI {
     el.innerHTML = `<span class="t">${clock(seg.start)}</span><span>${esc(seg.text)}</span>`;
     fastStream.appendChild(el);
     fastTotal++;
-    trimFast(seg.start);
+    trimFast(fastCutoff(seg.start));
     fastStream.scrollTop = fastStream.scrollHeight;
     $('#fastCount').textContent = fastTotal + '줄 저장됨';
   }
 
-  function trimFast(now) {
-    const cutoff = now - FAST_WINDOW;
+  function trimFast(cutoff) {
     for (const el of [...fastStream.children]) {
       if (parseFloat(el.dataset.start) < cutoff && fastStream.children.length > 1) el.remove();
       else break;
     }
+  }
+
+  // Whisper 쪽 목록이 바뀔 때마다(새 조각·문단화 확정 포함) 부른다. 커버리지가 늘어난
+  // 만큼 아래 칸에서 겹치는 줄을 뺀다. 뒤로 갈 일은 없으니(Whisper 는 계속 앞으로만
+  // 나아간다) 줄어드는 방향은 고려하지 않는다.
+  function extendCoverage(end) {
+    if (end <= whisperCoverEnd) return;
+    whisperCoverEnd = end;
+    trimFast(whisperCoverEnd);
   }
   let running = false, startedAt = null, tick = null;
   let lines = new Map();      // id -> element
@@ -261,6 +277,7 @@ extension WebUI {
   function addSegment(seg, fresh) {
     empty.style.display = 'none';
     if (fresh) setLive('');   // 확정된 줄이 올라왔으면 받아쓰던 줄은 비운다
+    extendCoverage(seg.end); // 이 구간은 이제 Whisper 가 처리했다 — 아래 칸에서 겹치는 줄을 뺀다
     const el = document.createElement('div');
     el.className = 'line' + (fresh ? ' fresh' : '') + (seg.edited ? ' wasEdited' : '');
     el.dataset.id = seg.id; el.dataset.text = seg.text; el.dataset.start = seg.start;
@@ -510,14 +527,16 @@ extension WebUI {
     stream.querySelectorAll('.line').forEach(e => e.remove());
     lines.clear();
     fastStream.innerHTML = '';
+    whisperCoverEnd = 0;   // 다른 세션으로 갈아탈 수 있으니 이전 커버리지를 들고 오면 안 된다
     $('#title').value = s.title || 'Zoom 수업';
 
-    // 위 칸 = Whisper(정식 기록). 아래 칸 = 실시간 전사기의 최근 구간만.
+    // 위 칸 = Whisper(정식 기록, 문단화됨). 아래 칸 = Whisper 가 아직 못 따라간 구간만.
+    // addSegment 가 안에서 whisperCoverEnd 를 늘려 두므로, 아래 fast 필터는 그 값을 그대로 쓴다.
     (s.whisperSegments || []).forEach(seg => addSegment(seg, false));
     const fast = s.segments || [];
     fastTotal = fast.length;
     const last = fast.length ? fast[fast.length - 1].start : 0;
-    fast.filter(x => x.start >= last - FAST_WINDOW).forEach(x => {
+    fast.filter(x => x.start >= fastCutoff(last)).forEach(x => {
       const el = document.createElement('div');
       el.className = 'fline'; el.dataset.start = x.start; el.dataset.id = x.id;
       el.innerHTML = `<span class="t">${clock(x.start)}</span><span>${esc(x.text)}</span>`;
@@ -607,7 +626,12 @@ extension WebUI {
 
   function mergeFast(list) {
     const last = list.length ? list[list.length - 1].start : 0;
-    const want = list.filter(x => x.start >= last - FAST_WINDOW);
+    const cutoff = fastCutoff(last);
+    const want = list.filter(x => x.start >= cutoff);
+    const wantIDs = new Set(want.map(x => String(x.id)));
+    for (const el of [...fastStream.children]) {
+      if (!wantIDs.has(el.dataset.id)) el.remove();   // Whisper 가 따라잡아 빠진 줄 정리
+    }
     const have = new Set([...fastStream.children].map(e => e.dataset.id));
     for (const x of want) {
       if (have.has(String(x.id))) continue;

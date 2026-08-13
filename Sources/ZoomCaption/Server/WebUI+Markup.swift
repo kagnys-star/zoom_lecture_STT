@@ -79,7 +79,7 @@ extension WebUI {
     <div id="fastPane">
       <div class="paneBar">
         <span class="paneTag fast">실시간</span>
-        <span class="paneNote">SpeechTranscriber · 최근 <b id="fastWindow">1분</b>만 표시 (전부 저장됩니다)</span>
+        <span class="paneNote">SpeechTranscriber · Whisper가 정리하기 전까지만 표시 (전부 저장됩니다)</span>
         <span class="spacer"></span>
         <span class="paneNote" id="fastCount"></span>
       </div>

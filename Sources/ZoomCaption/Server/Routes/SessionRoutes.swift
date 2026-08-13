@@ -93,7 +93,14 @@ extension ZoomCaptionApp {
       return .response(.json(["ok": true, "saved": saved ?? "", "state": await stateJSON()]))
 
     // ── 편집 ──
+    //
+    // 녹음 중에는 편집을 막는다. Whisper 가 뒤에서 계속 줄을 추가·재배치하는 중에
+    // 사용자가 같은 줄을 고치면 어느 쪽이 이기는지 애매해지고, 문단화(Paragraph.swift)가
+    // 이미 벡터를 캐시해 둔 문장의 내용이 바뀌면 그 캐시만 조용히 낡는다.
     case ("POST", "/api/segment/update"):
+      if stateLock.withLock({ running }) {
+        return .response(.json(["ok": false, "error": "녹음 중에는 편집할 수 없습니다. 정지한 뒤 고쳐 주세요."]))
+      }
       guard let r = req.json(EditRequest.self), let id = r.id else {
         return .response(.json(["ok": false, "error": "잘못된 요청"]))
       }
@@ -104,6 +111,9 @@ extension ZoomCaptionApp {
       return .response(.json(["ok": ok]))
 
     case ("POST", "/api/segment/delete"):
+      if stateLock.withLock({ running }) {
+        return .response(.json(["ok": false, "error": "녹음 중에는 편집할 수 없습니다. 정지한 뒤 지워 주세요."]))
+      }
       guard let r = req.json(DeleteRequest.self) else {
         return .response(.json(["ok": false, "error": "잘못된 요청"]))
       }

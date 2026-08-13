@@ -247,12 +247,24 @@ extension WebUI {
   }
 
   // ── 자막 렌더 ──
+  // 문단 번호가 바로 앞 줄과 다르면 그 줄에 위 여백을 준다(.parastart, CSS 참고).
+  // el 자신뿐 아니라 바로 다음 줄도 다시 봐야 한다 — el 이 그 사이에 새로 끼어들었을 수 있다.
+  function markParaBoundary(el) {
+    const prev = el.previousElementSibling;
+    el.classList.toggle('parastart', !!el.dataset.para && el.dataset.para !== (prev ? prev.dataset.para : undefined));
+    const next = el.nextElementSibling;
+    if (next) {
+      next.classList.toggle('parastart', !!next.dataset.para && next.dataset.para !== el.dataset.para);
+    }
+  }
+
   function addSegment(seg, fresh) {
     empty.style.display = 'none';
     if (fresh) setLive('');   // 확정된 줄이 올라왔으면 받아쓰던 줄은 비운다
     const el = document.createElement('div');
     el.className = 'line' + (fresh ? ' fresh' : '') + (seg.edited ? ' wasEdited' : '');
     el.dataset.id = seg.id; el.dataset.text = seg.text; el.dataset.start = seg.start;
+    if (seg.paragraph != null) el.dataset.para = seg.paragraph;
     el.innerHTML =
       `<input type="checkbox" class="pick">` +
       `<span class="ts">${clock(seg.start)}</span>` +
@@ -266,6 +278,7 @@ extension WebUI {
     }
     stream.insertBefore(el, ref);
     lines.set(seg.id, el);
+    markParaBoundary(el);
     wire(el);
     if ($('#showDiv').checked && divs.has(seg.id)) paintDivs(el);
     updateCount();
@@ -404,9 +417,14 @@ extension WebUI {
     $('#statusText').textContent = on ? '녹음 중' : '대기 중';
     $('#btnStart').style.display = on ? 'none' : '';
     $('#btnStop').style.display = on ? '' : 'none';
-    document.querySelectorAll('#keepAudio, #folder, #baseDir, #btnPick, #btnNewSession')
+    document.querySelectorAll('#keepAudio, #folder, #baseDir, #btnPick, #btnNewSession, #btnEdit')
       .forEach(e => e.disabled = on);
+    $('#btnEdit').title = on ? '녹음 중에는 편집할 수 없습니다 — 정지한 뒤 이용하세요.' : '';
     if (on) {
+      // 녹음 중엔 편집을 막는다(서버도 같은 판단을 한다 — 여긴 그걸 미리 보여줄 뿐이다).
+      // 이미 편집 모드였다면(다른 탭에서 방금 시작을 눌렀을 수도 있다) 강제로 빠져나온다.
+      document.body.classList.remove('editing');
+      stream.querySelectorAll('.pick').forEach(c => c.checked = false);
       startedAt = startedAt || Date.now();
       tick = tick || setInterval(() => $('#clock').textContent = clock((Date.now() - startedAt)/1000), 500);
       setLive('');            // 받아쓰기 칸을 미리 띄워 자리를 잡아 둔다
@@ -575,6 +593,14 @@ extension WebUI {
         el.classList.toggle('wasEdited', !!seg.edited);
         changed++;
       }
+      // dataset 값은 항상 문자열이라 숫자와 그냥 비교하면 매번 다르다고 나온다 —
+      // 그래서 String 으로 맞춰서 비교한다. undefined 로 지정하면 문자열 "undefined" 가
+      // 박히므로 delete 로 속성 자체를 뗀다.
+      const para = seg.paragraph != null ? String(seg.paragraph) : undefined;
+      if (el.dataset.para !== para) {
+        if (para === undefined) delete el.dataset.para; else el.dataset.para = para;
+        markParaBoundary(el);
+      }
     }
     return { added, removed, changed };
   }
@@ -663,6 +689,13 @@ extension WebUI {
   es.addEventListener('whisperSegment', e => {
     const d = JSON.parse(e.data); if (!seen(d)) return;
     addSegment(d, true);
+  });
+  // 문단 번호는 문맥이 쌓인 뒤에야 확정되므로, 이미 화면에 있는 줄에 뒤늦게 붙기도 한다
+  // (새 줄이 아니라서 whisperSegment 가 아니라 이걸로 따로 온다).
+  es.addEventListener('whisperParagraph', e => {
+    const d = JSON.parse(e.data); if (!seen(d)) return;
+    const el = lines.get(d.id);
+    if (el) { el.dataset.para = d.paragraph; markParaBoundary(el); }
   });
   es.addEventListener('whisperLive', e => {
     const d = JSON.parse(e.data); if (!seen(d)) return;
@@ -888,7 +921,7 @@ extension WebUI {
   // 본문에서 직접 고친 것을 전부 원래대로 되돌린다.
   $('#btnCorrectRevert').onclick = async () => {
     const r = await post('/api/correct/revert');
-    if (!r.ok) return;
+    if (!r.ok) { toast(r.error || '되돌리지 못했습니다.'); return; }
     reloadAll(r.state);
     notice('#cmpNotice', 'info', `${r.reverted}줄을 교정 전으로 되돌렸습니다.`);
     loadCompare();

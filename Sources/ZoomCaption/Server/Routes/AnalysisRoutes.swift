@@ -46,6 +46,11 @@ extension ZoomCaptionApp {
     // 갈린 자리에 밑줄을 긋고, 눌러서 실시간 쪽 표기를 보고, 골라서 고친다.
     // 사용자가 어차피 하는 일(복습하며 읽기) 위에 얹히기 때문에 따로 드는 시간이 없다.
     case ("POST", "/api/fix"):
+      // 편집과 같은 이유로 녹음 중엔 막는다(SessionRoutes.swift 의 "편집" 절 참고) —
+      // 여기서 고치는 것도 결국 whisperSegments 의 text 를 바꾸는 일이라 위험이 같다.
+      if stateLock.withLock({ running }) {
+        return .response(.json(["ok": false, "error": "녹음 중에는 편집할 수 없습니다. 정지한 뒤 고쳐 주세요."]))
+      }
       guard let r = req.json(FixRequest.self) else {
         return .response(.json(["ok": false, "error": "고칠 내용을 읽지 못했습니다."]))
       }
@@ -78,6 +83,10 @@ extension ZoomCaptionApp {
     // ── 교정 되돌리기 ──
     // 본문에서 직접 고친 것을 원래대로 돌린다.
     case ("POST", "/api/correct/revert"):
+      // 되돌리기도 text 를 바꾸는 편집의 일종이라 같은 이유로 막는다.
+      if stateLock.withLock({ running }) {
+        return .response(.json(["ok": false, "error": "녹음 중에는 편집할 수 없습니다. 정지한 뒤 되돌려 주세요."]))
+      }
       let n = store.revertCorrections()
       autosave()
       log("문맥 교정 되돌림 — \(n)줄 복원")

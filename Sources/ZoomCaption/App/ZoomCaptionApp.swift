@@ -483,9 +483,13 @@ final class ZoomCaptionApp: @unchecked Sendable {
     }
     let isRunning = stateLock.withLock { running }
     let engine = await Summarizer.currentEngine()
-    let whisper = store.whisperSegments.map {
-      ["id": $0.id, "start": $0.start, "end": $0.end,
-       "text": $0.text, "edited": $0.edited] as [String: Any]
+    let whisper = store.whisperSegments.map { seg -> [String: Any] in
+      var d: [String: Any] = ["id": seg.id, "start": seg.start, "end": seg.end,
+                               "text": seg.text, "edited": seg.edited]
+      // paragraph 는 Int? 라 nil 이면 아예 키를 뺀다. JSONSerialization 이
+      // Optional<Int> 를 그대로 못 받아서, nil 을 그냥 넣으면 인코딩이 깨진다.
+      if let p = seg.paragraph { d["paragraph"] = p }
+      return d
     }
     var json: [String: Any] = [
       // 화면이 "내가 여기까지 봤다" 를 대조할 기준점. 이벤트를 놓쳤는지 이걸로 안다.
@@ -589,11 +593,15 @@ final class ZoomCaptionApp: @unchecked Sendable {
 
         // 소리를 남기는 김에, 수업이 도는 동안 Whisper 도 뒤에서 돌린다.
         if Whisper.isReady {
+          // 문단화 모델도 같이 준비한다. Whisper 없이는 문단화도 의미가 없어 여기서만 싣는다.
+          // 로드가 늦어도 자막은 안 막힌다 — 준비되기 전까지는 문장 단위로 그대로 나간다.
+          Task { await Paragraph.prepare() }
           let worker = WhisperLive(
             prompt: allTerms.prefix(60).joined(separator: ", "),
             onLines: { [weak self] lines in
               guard let self else { return }
-              for seg in self.store.appendWhisper(lines) {
+              let added = self.store.appendWhisper(lines)
+              for seg in added {
                 // 그 시각에 실제로 소리가 있었는지 대조한다. 지우지 않고 알리기만 한다 —
                 // 아직 근거가 환각 6건뿐이라, 오탐이 없는지 확인하는 단계다.
                 // Whisper 가 VAD 로 무음을 안 읽으므로 평소엔 걸릴 게 없다.
@@ -605,8 +613,22 @@ final class ZoomCaptionApp: @unchecked Sendable {
                         + "피크 \(String(format: "%.1f", db))dBFS 「\(seg.text.prefix(40))」 "
                         + "(VAD 가 안 도는지 확인하세요)")
                 }
-                self.live.broadcast(event: "whisperSegment", payload: [
-                  "id": seg.id, "start": seg.start, "end": seg.end, "text": seg.text])
+              }
+              // 문단 번호는 문맥이 쌓여야 확정되니, 방금 붙은 줄이 아니라 몇 조각 전에
+              // 붙었던 줄에 처음 번호가 매겨지는 경우가 흔하다 — 그 옛 줄도 같이 갱신한다.
+              let changedParagraphs = self.store.regroupParagraphs()
+              let addedIDs = Set(added.map(\.id))
+              for seg in added {
+                var payload: [String: Any] = [
+                  "id": seg.id, "start": seg.start, "end": seg.end, "text": seg.text]
+                if let p = changedParagraphs.first(where: { $0.id == seg.id })?.paragraph {
+                  payload["paragraph"] = p
+                }
+                self.live.broadcast(event: "whisperSegment", payload: payload)
+              }
+              for seg in changedParagraphs where !addedIDs.contains(seg.id) {
+                guard let p = seg.paragraph else { continue }
+                self.live.broadcast(event: "whisperParagraph", payload: ["id": seg.id, "paragraph": p])
               }
               self.autosave()
             },
@@ -616,8 +638,9 @@ final class ZoomCaptionApp: @unchecked Sendable {
             })
           whisperLive = worker
           clip!.onChunk = { [weak worker] url, start in worker?.enqueue(url: url, start: start) }
-          log("Whisper 실시간 재전사 켬 — \(Int(AudioArchive.chunkSeconds))초 조각, "
-            + "겹침 \(Int(AudioArchive.overlapSeconds))초, 모델 \(Whisper.modelPath?.lastPathComponent ?? "?")")
+          log("Whisper 뒤늦은 재전사 켬 — \(Int(AudioArchive.chunkTargetSeconds))초 조각, "
+            + "\(Int(AudioArchive.releaseDelaySeconds))초 지난 뒤부터, "
+            + "모델 \(Whisper.modelPath?.lastPathComponent ?? "?")")
         } else {
           log("Whisper 를 쓸 수 없어 실시간 재전사는 건너뜁니다 — \(Whisper.status.detail)")
         }
@@ -660,7 +683,7 @@ final class ZoomCaptionApp: @unchecked Sendable {
     } catch {
       await lecture.finish()
       lectureTranscriber = nil
-      archive?.finish(); archive = nil
+      await archive?.finish(); archive = nil
       throw error
     }
     tap = audioTap
@@ -720,7 +743,7 @@ final class ZoomCaptionApp: @unchecked Sendable {
 
     // 탭을 멈춘 뒤에 닫아야 마지막 버퍼까지 들어간다.
     // finish() 안에서 자투리가 마지막 조각으로 나가므로 Whisper 를 기다리는 건 그다음이다.
-    if let done = archive?.finish() {
+    if let done = await archive?.finish() {
       log(String(format: "소리 저장 완료: %@ — %.0f초, %.1fMB",
                  done.url.lastPathComponent, done.seconds, Double(done.bytes) / 1_048_576))
     }
@@ -736,6 +759,11 @@ final class ZoomCaptionApp: @unchecked Sendable {
       await worker.finish()
       log("Whisper 실시간 재전사 종료 — 조각 \(worker.progress.done)개, \(store.whisperSegments.count)줄")
       whisperLive = nil
+      // 마지막 2~3문장은 앞으로 문맥이 더 쌓일 일이 없다 — 대기하던 판정을 여기서 확정한다.
+      for seg in store.finalizeParagraphs() {
+        guard let p = seg.paragraph else { continue }
+        live.broadcast(event: "whisperParagraph", payload: ["id": seg.id, "paragraph": p])
+      }
     }
 
     await lectureTranscriber?.finish(); lectureTranscriber = nil

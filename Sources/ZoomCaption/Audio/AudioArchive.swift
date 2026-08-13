@@ -33,18 +33,27 @@ final class AudioArchive: @unchecked Sendable {
   let startOffset: Double
   let url: URL
 
-  /// 30초가 모일 때마다 부른다. (조각 파일, 세션 타임라인에서의 시작 초)
+  /// 조각 하나가 준비될 때마다 부른다. (조각 파일, 세션 타임라인에서의 시작 초)
   /// 수업이 도는 동안 Whisper 를 뒤에서 돌리기 위한 통로다.
   var onChunk: (@Sendable (URL, Double) -> Void)?
 
-  /// Whisper 인코더가 30초 고정이라 조각도 30초로 맞춘다. 더 잘게 자르면 손해만 난다.
-  static let chunkSeconds = 30.0
-  /// 조각 경계에서 단어가 잘리는 걸 막는 겹침. 앞 조각의 꼬리를 붙여서 보낸다.
-  static let overlapSeconds = 2.0
+  /// Whisper 에 넘길 조각의 목표 길이. 정확히 이 지점에서 자르지 않고, 이 근처의
+  /// 자연스러운 쉼(`VADBoundary`)을 찾아 자른다 — 그래서 겹침도 중복 제거도 필요 없다.
+  static let chunkTargetSeconds = 30.0
+  /// 화면엔 실시간(Apple) 이 곧바로 뜨고, 그보다 이만큼 지난 구간부터 Whisper 로 갈아
+  /// 끼운다. Whisper 를 수업 내내 실시간으로 돌리지 않고 한 박자 늦게 뒤따라가게 해서,
+  /// 두 엔진이 동시에 GPU 를 다투는 걸 줄이려는 의도다.
+  static let releaseDelaySeconds = 60.0
+  /// 이만큼 쌓여야 한 조각을 내보낸다 — 그래야 내보낸 조각의 **끝**이 항상
+  /// releaseDelaySeconds 이상 지난 상태가 된다(30초를 떼어내도 60초가 그대로 남는다).
+  private static var triggerSeconds: Double { chunkTargetSeconds + releaseDelaySeconds }
+  /// VAD 로 쉼을 찾을 때 목표 지점 앞뒤로 볼 여유. 이 범위 안에 쉼이 없으면
+  /// `VADBoundary.maxSpeechSeconds` 강제 분할에 걸린다.
+  private static let vadSearchRadius = 10.0
 
   private static let rate = 16_000.0
-  private var chunkCapacity: Int { Int(Self.chunkSeconds * Self.rate) }
-  private var overlapCapacity: Int { Int(Self.overlapSeconds * Self.rate) }
+  private var triggerCapacity: Int { Int(Self.triggerSeconds * Self.rate) }
+  private var targetCutSamples: Int { Int(Self.chunkTargetSeconds * Self.rate) }
 
   private let lock = NSLock()
   private var file: AVAudioFile?
@@ -52,13 +61,16 @@ final class AudioArchive: @unchecked Sendable {
   private var _frames: Int64 = 0
   private var failed = false
 
-  /// 아직 조각으로 안 나간 샘플, 그리고 다음 조각 앞에 붙일 꼬리
+  /// 아직 조각으로 안 나간 샘플.
   private var pending: [Int16] = []
-  private var tail: [Int16] = []
   /// 지금까지 조각으로 내보낸 샘플 수 (조각 시작 시각 계산용)
   private var emitted: Int = 0
   private var chunkIndex = 0
   private let chunkDir: URL
+  /// VAD 로 자를 지점을 찾는 동안(프로세스 실행, 수백 ms) 오디오 콜백 스레드를 막으면
+  /// 안 된다 — 그래서 백그라운드로 뺀다. 이미 하나가 도는 중이면 더 안 띄운다,
+  /// Whisper 조각을 한 번에 하나씩만 처리하는 것과 같은 이유다.
+  private var cutting = false
 
   /// 저장된 길이(초)
   var duration: Double { lock.withLock { Double(_frames) / 16_000 } }
@@ -100,8 +112,33 @@ final class AudioArchive: @unchecked Sendable {
   /// 수업에는 쉬는 시간과 침묵이 많아서 그대로 두면 정식 기록이 헛소리로 오염된다.
   private static let silenceCeiling: Int16 = 250
 
-  /// 모아둔 샘플을 조각 WAV 로 떨어뜨린다. lock 을 쥔 채로 부른다.
-  private func flushChunk(_ samples: [Int16], startSample: Int) {
+  /// PCM 샘플을 WAV 파일로 쓴다. 조각 하나 쓰는 데도, VAD 탐색용 미리보기 쓰는 데도 쓴다.
+  private func writeWav(_ samples: [Int16], to fileURL: URL) -> Bool {
+    guard let format = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: Self.rate,
+                                     channels: 1, interleaved: true),
+          let buffer = AVAudioPCMBuffer(pcmFormat: format,
+                                        frameCapacity: AVAudioFrameCount(samples.count)),
+          let dst = buffer.int16ChannelData
+    else { return false }
+    buffer.frameLength = AVAudioFrameCount(samples.count)
+    samples.withUnsafeBufferPointer { src in
+      dst[0].update(from: src.baseAddress!, count: samples.count)
+    }
+    do {
+      let out = try AVAudioFile(forWriting: fileURL, settings: [
+        AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: Self.rate,
+        AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16,
+        AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false,
+      ], commonFormat: .pcmFormatInt16, interleaved: true)
+      try out.write(from: buffer)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /// 모아둔 샘플을 조각 WAV 로 떨어뜨린다. 락 밖에서 부른다(백그라운드 작업이라 안전).
+  private func flushChunk(_ samples: [Int16], startSample: Int, index: Int) {
     var peak: Int16 = 0
     for i in stride(from: 0, to: samples.count, by: 8) {   // 8샘플마다 훑어도 충분하다
       let v = samples[i] == Int16.min ? Int16.max : abs(samples[i])
@@ -111,33 +148,55 @@ final class AudioArchive: @unchecked Sendable {
       log("조용한 구간이라 Whisper 에 넘기지 않습니다 (피크 \(peak), 약 \(Int(Double(samples.count) / Self.rate))초)")
       return
     }
-    guard let format = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: Self.rate,
-                                     channels: 1, interleaved: true),
-          let buffer = AVAudioPCMBuffer(pcmFormat: format,
-                                        frameCapacity: AVAudioFrameCount(samples.count)),
-          let dst = buffer.int16ChannelData
-    else { return }
-    buffer.frameLength = AVAudioFrameCount(samples.count)
-    samples.withUnsafeBufferPointer { src in
-      dst[0].update(from: src.baseAddress!, count: samples.count)
-    }
-
-    let url = chunkDir.appendingPathComponent(String(format: "chunk_%04d.wav", chunkIndex))
-    chunkIndex += 1
-    do {
-      let out = try AVAudioFile(forWriting: url, settings: [
-        AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: Self.rate,
-        AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16,
-        AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false,
-      ], commonFormat: .pcmFormatInt16, interleaved: true)
-      try out.write(from: buffer)
-    } catch {
-      logWarn("오디오 조각을 쓰지 못했습니다: \(error.localizedDescription)")
+    let chunkURL = chunkDir.appendingPathComponent(String(format: "chunk_%04d.wav", index))
+    guard writeWav(samples, to: chunkURL) else {
+      logWarn("오디오 조각을 쓰지 못했습니다")
       return
     }
-    // 조각의 시작 시각. 겹쳐 붙인 꼬리만큼 앞으로 당겨진다.
     let start = startOffset + Double(startSample) / Self.rate
-    onChunk?(url, start)
+    onChunk?(chunkURL, start)
+  }
+
+  /// 목표 지점(조각 앞에서 `chunkTargetSeconds`) 근처의 자연스러운 쉼을 찾아 자른다.
+  /// VAD 를 못 쓰면(모델·바이너리 없음) 그냥 목표 지점에서 자른다 — 있으면 좋고
+  /// 없어도 되는 부품이다(Whisper.swift 의 VAD 와 같은 원칙).
+  ///
+  /// 오디오 콜백 스레드가 아니라 백그라운드에서 돈다(`write()` 참고) — VAD 프로세스 실행에
+  /// 수백 ms 걸리는데, 그걸 실시간 오디오 경로에서 기다리면 안 되기 때문이다.
+  private func cutAndFlush(snapshot: [Int16], base: Int) {
+    defer { lock.withLock { cutting = false } }
+
+    // VAD 로 못 자르면(모델 없음, 후보 없음 등) 목표 지점에서 그냥 자른다 — 정상적으로는
+    // 거의 안 일어난다(실측 java3 8개 전부 목표 근처에서 성공). 일어나면 그 조각만
+    // 경계가 부정확할 수 있다는 뜻이라 남겨 둘 값어치가 있다.
+    var cutSamples = targetCutSamples
+    if let vad = Whisper.vadModelPath, VADBoundary.binaryPath != nil {
+      let analysisSamples = min(snapshot.count,
+        Int((Self.chunkTargetSeconds + Self.vadSearchRadius + 5) * Self.rate))
+      let probeURL = chunkDir.appendingPathComponent("probe_\(UUID().uuidString).wav")
+      if writeWav(Array(snapshot.prefix(analysisSamples)), to: probeURL) {
+        if let segs = VADBoundary.speechSegments(wav: probeURL, vadModel: vad) {
+          if let cutSeconds = VADBoundary.cutPoint(near: Self.chunkTargetSeconds, in: segs,
+                                                    maxSearch: Self.vadSearchRadius) {
+            cutSamples = min(snapshot.count, max(1, Int(cutSeconds * Self.rate)))
+          } else {
+            logWarn("이 조각은 \(Self.vadSearchRadius)초 반경 안에 쉼이 없어 목표 지점에서 그냥 잘랐습니다 — 문장이 걸렸을 수 있습니다.")
+          }
+        }
+        try? FileManager.default.removeItem(at: probeURL)
+      }
+    }
+
+    let body = Array(snapshot.prefix(cutSamples))
+    let index: Int = lock.withLock {
+      // snapshot 의 앞부분과 지금 pending 의 앞부분은 항상 같다 — 이 함수가 한 번에
+      // 하나씩만 돌고(cutting 가드), pending 은 뒤로만 자라기 때문이다.
+      if pending.count >= body.count { pending.removeFirst(body.count) }
+      emitted = base + body.count
+      defer { chunkIndex += 1 }
+      return chunkIndex
+    }
+    flushChunk(body, startSample: base, index: index)
   }
 
   /// 오디오 콜백에서 바로 불린다. 여기서 실패해도 녹취는 계속되어야 한다.
@@ -150,17 +209,19 @@ final class AudioArchive: @unchecked Sendable {
       try file.write(from: converted)
       _frames += Int64(converted.frameLength)
 
-      // 같은 샘플을 조각 버퍼에도 쌓아 둔다. 30초가 차면 뒤로 넘긴다.
+      // 같은 샘플을 조각 버퍼에도 쌓아 둔다. releaseDelaySeconds + chunkTargetSeconds 만큼
+      // 쌓이면 백그라운드로 잘라 내보낸다 — write() 자체는 계속 빨라야 하므로
+      // 여기서 직접 자르지 않는다.
       if onChunk != nil, let src = converted.int16ChannelData {
         let n = Int(converted.frameLength)
         pending.append(contentsOf: UnsafeBufferPointer(start: src[0], count: n))
-        while pending.count >= chunkCapacity {
-          let body = Array(pending.prefix(chunkCapacity))
-          pending.removeFirst(chunkCapacity)
-          // 앞 조각의 꼬리를 붙여 경계에서 단어가 잘리지 않게 한다.
-          flushChunk(tail + body, startSample: emitted - tail.count)
-          emitted += chunkCapacity
-          tail = Array(body.suffix(overlapCapacity))
+        if !cutting, pending.count >= triggerCapacity {
+          cutting = true
+          let snapshot = pending
+          let base = emitted
+          Task.detached(priority: .utility) { [weak self] in
+            self?.cutAndFlush(snapshot: snapshot, base: base)
+          }
         }
       }
     } catch {
@@ -172,24 +233,42 @@ final class AudioArchive: @unchecked Sendable {
 
   /// 파일을 닫는다. 닫아야 WAV 헤더의 길이가 확정된다.
   @discardableResult
-  func finish() -> (url: URL, seconds: Double, bytes: Int64)? {
-    lock.lock()
-    defer { lock.unlock() }
-    guard file != nil else { return nil }
-
-    // 남은 자투리도 마지막 조각으로 내보낸다. 너무 짧으면 Whisper 가 헛소리를 하므로 2초를 하한으로 둔다.
-    if onChunk != nil, pending.count >= Int(2 * Self.rate) {
-      flushChunk(tail + pending, startSample: emitted - tail.count)
-      emitted += pending.count
-      pending.removeAll()
+  func finish() async -> (url: URL, seconds: Double, bytes: Int64)? {
+    // 지금 돌고 있는 컷 작업이 있으면 끝날 때까지 기다린다 — 안 그러면 그 작업이
+    // pending 에서 떼어 가려던 부분과, 여기서 자투리로 통째로 내보내는 부분이 겹친다.
+    while lock.withLock({ cutting }) {
+      try? await Task.sleep(for: .milliseconds(50))
     }
-    file = nil                       // AVAudioFile 은 해제될 때 헤더를 마무리한다
-    let seconds = Double(_frames) / 16_000
+
+    // flushChunk 는 파일 I/O 라 락 밖에서 부른다(withLock 안에서 부르면 async 컨텍스트의
+    // 원시 lock()/unlock() 을 쓰게 되어 Swift 6 모드에서 금지된다). 필요한 값만 락 안에서
+    // 빼내고, 상태(file=nil 등)도 그 안에서 미리 다 정리해 둔다.
+    let result: (tail: (samples: [Int16], base: Int, index: Int)?, seconds: Double, bytes: Int64)?
+      = lock.withLock {
+        guard file != nil else { return nil }
+        // 남은 자투리도 마지막 조각으로 내보낸다. 마지막이라 다음 조각과 겹칠 걱정이
+        // 없으니 VAD 로 자를 지점을 찾을 필요도 없다 — 있는 그대로 다 넘긴다.
+        // 너무 짧으면 Whisper 가 헛소리를 하므로 2초를 하한으로 둔다.
+        var tail: (samples: [Int16], base: Int, index: Int)?
+        if onChunk != nil, pending.count >= Int(2 * Self.rate) {
+          tail = (pending, emitted, chunkIndex)
+          chunkIndex += 1
+          emitted += pending.count
+          pending.removeAll()
+        }
+        file = nil                   // AVAudioFile 은 해제될 때 헤더를 마무리한다
+        return (tail, Double(_frames) / 16_000, _frames * 2)
+      }
+    guard let result else { return nil }
+    if let tail = result.tail {
+      flushChunk(tail.samples, startSample: tail.base, index: tail.index)
+    }
+    let seconds = result.seconds
     // 소리가 거의 없으면 껍데기 파일을 남기지 않는다.
     if seconds < 0.5 {
       try? FileManager.default.removeItem(at: url)
       return nil
     }
-    return (url, seconds, _frames * 2)
+    return (url, seconds, result.bytes)
   }
 }

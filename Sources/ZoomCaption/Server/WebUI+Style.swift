@@ -115,6 +115,9 @@ extension WebUI {
   .line.picked { background: var(--danger-soft); }
   .line.fresh { animation: slidein .28s ease-out; }
   @keyframes slidein { from { opacity: 0; transform: translateY(6px) } to { opacity: 1; transform: none } }
+  /* 문단 시작 줄만 위에 여백을 더 준다 — Whisper 세그먼트(3~10초 단위)를 문단으로
+     묶어 보여줄 때(Paragraph.swift), 어디서 화제가 바뀌는지 한눈에 보이게. */
+  .line.parastart { margin-top: 14px; }
 
   .line .pick, .line .del { visibility: hidden; }
   body.editing .line .pick, body.editing .line .del { visibility: visible; }

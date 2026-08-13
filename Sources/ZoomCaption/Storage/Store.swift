@@ -32,6 +32,10 @@ struct Segment: Codable, Sendable, Identifiable {
   /// 옛 세션에는 없으므로 반드시 Optional 이어야 한다 —
   /// 기본값만 준 비Optional 은 디코딩을 통째로 실패시킨다. (gold.json 에서 겪었다.)
   var words: [WordTime]?
+  /// 문단 번호(Whisper 줄에만 있다). `Paragraph` 가 매기며, 아직 판정 못 한
+  /// 최근 줄(문맥이 덜 쌓인 꼬리)은 nil — 그 줄은 화면에서 원래대로 따로 보인다.
+  /// 마찬가지로 반드시 Optional 이어야 한다 — words 와 같은 이유.
+  var paragraph: Int?
 }
 
 /// 디스크에 저장되는 세션 원본. .md/.srt 는 이걸로부터 파생된다.
@@ -103,6 +107,13 @@ final class TranscriptStore: @unchecked Sendable {
   /// Whisper 줄의 id 는 실시간 자막과 겹치지 않게 따로 띄운다.
   private var nextWhisperID = 1_000_000
 
+  /// 문단화 — 문장 id → 임베딩 벡터(계산 한 번만, 이후 재사용) / 문장 id → 확정된 문단 번호.
+  /// 번호가 한 번 매겨진 문장은 다시 안 건드린다 — 화면에 보여준 문단이 나중에 또
+  /// 갈라지면 가독성 목적과 반대로 간다.
+  private var paragraphVectors: [Int: [Double]] = [:]
+  private var paragraphOf: [Int: Int] = [:]
+  private var nextParagraphNumber = 1
+
   /// 저장·요약·내보내기의 기준이 되는 기록.
   /// Whisper 가 있으면 그쪽이다 — 실측에서 영문 식별자를 24종 살려내는 동안
   /// 실시간 전사기는 0종이었다. 없으면 실시간 기록으로 떨어진다.
@@ -138,6 +149,9 @@ final class TranscriptStore: @unchecked Sendable {
       reference = nil
       preCorrection = [:]
       nextWhisperID = 1_000_000
+      paragraphVectors = [:]
+      paragraphOf = [:]
+      nextParagraphNumber = 1
     }
   }
 
@@ -162,6 +176,13 @@ final class TranscriptStore: @unchecked Sendable {
       preCorrection = Dictionary(uniqueKeysWithValues:
         (file.preCorrection ?? [:]).compactMap { k, v in Int(k).map { ($0, v) } })
       nextWhisperID = max(1_000_000, (whisperSegments.map(\.id).max() ?? 999_999) + 1)
+      // 이미 매겨진 문단 번호는 그대로 이어받는다 — 다시 계산하면 이전 회차에서
+      // 보여줬던 문단이 재배치될 수 있다. 벡터 캐시는 안 들고 왔으니(저장 안 함)
+      // 아직 번호가 없는 꼬리 문장은 새 조각이 붙을 때 다시 계산된다.
+      paragraphVectors = [:]
+      paragraphOf = Dictionary(uniqueKeysWithValues:
+        whisperSegments.compactMap { seg in seg.paragraph.map { (seg.id, $0) } })
+      nextParagraphNumber = (paragraphOf.values.max() ?? 0) + 1
       // 마지막 발화 끝 + 2초 여백부터 이어 붙인다. 두 목록 모두 본다.
       timeBase = max(file.duration, lastEndLocked()) + 2
     }
@@ -379,6 +400,67 @@ final class TranscriptStore: @unchecked Sendable {
     }
   }
 
+  /// 새 Whisper 줄이 붙을 때마다 호출해 문단 번호를 매긴다. `appendWhisper` 직후에 부른다.
+  /// 앞뒤로 `Paragraph.windowRadius`개의 문맥이 아직 안 쌓인 꼬리 문장은 이번엔 건너뛰고
+  /// 다음 호출에서 다시 시도한다 — 나중에 판정이 뒤집혀 이미 보여준 문단이 재배치되는 걸
+  /// 막기 위해서다.
+  @discardableResult
+  func regroupParagraphs() -> [Segment] { assignParagraphs(finalize: false) }
+
+  /// 수업이 끝나 더 이상 Whisper 조각이 안 올 때 마지막으로 부른다. 문맥이 모자라
+  /// 미뤄뒀던 꼬리 문장까지, 지금 있는 정보만으로 확정한다 — 더 기다려도 새 문맥이
+  /// 오지 않으니 미루는 의미가 없다. 이걸 안 부르면 마지막 2~3문장은 영영 문단이
+  /// 안 매겨진 채로 저장된다(실제로 겪었다 — 정지 직후 꼬리 문장 3개가 계속 nil).
+  @discardableResult
+  func finalizeParagraphs() -> [Segment] { assignParagraphs(finalize: true) }
+
+  /// 임베딩 계산(모델 추론)은 락 밖에서 한다 — 락을 쥔 채로 추론을 돌리면 그동안
+  /// 다른 스레드가 store 를 못 건드린다. 이미 번호가 있는 문장은 다시 계산하지 않는다.
+  ///
+  /// 이번 호출에서 번호가 **새로** 매겨진 문장만 돌려준다 — 방금 붙은 새 줄뿐 아니라,
+  /// 몇 조각 전에 붙었지만 그때는 문맥이 모자라 보류됐던 줄도 여기 섞여 나올 수 있다.
+  /// 호출부가 그 옛 줄까지 화면에 갱신해 줘야 한다(안 그러면 저장 파일과 화면이 어긋난다).
+  private func assignParagraphs(finalize: Bool) -> [Segment] {
+    guard Paragraph.isReady else { return [] }
+    let missing: [(id: Int, text: String)] = lock.withLock {
+      whisperSegments.compactMap { seg in
+        paragraphVectors[seg.id] == nil ? (seg.id, seg.text) : nil
+      }
+    }
+    var freshVectors: [Int: [Double]] = [:]
+    for item in missing {
+      if let v = Paragraph.vector(item.text) { freshVectors[item.id] = v }
+    }
+    return lock.withLock {
+      for (id, v) in freshVectors { paragraphVectors[id] = v }
+      let segs = whisperSegments
+      let vectors = segs.map { paragraphVectors[$0.id] }
+      var changedIDs = Set<Int>()
+      for i in segs.indices {
+        let seg = segs[i]
+        if paragraphOf[seg.id] != nil { continue }
+        if i == 0 {
+          paragraphOf[seg.id] = nextParagraphNumber
+          changedIDs.insert(seg.id)
+          continue
+        }
+        if !finalize {
+          guard i + Paragraph.windowRadius < segs.count else { continue }
+        }
+        if Paragraph.isBoundary(before: i, vectors: vectors) { nextParagraphNumber += 1 }
+        paragraphOf[seg.id] = nextParagraphNumber
+        changedIDs.insert(seg.id)
+      }
+      guard !changedIDs.isEmpty else { return [] }
+      var changed: [Segment] = []
+      for i in whisperSegments.indices {
+        whisperSegments[i].paragraph = paragraphOf[whisperSegments[i].id]
+        if changedIDs.contains(whisperSegments[i].id) { changed.append(whisperSegments[i]) }
+      }
+      return changed
+    }
+  }
+
   @discardableResult
   func updateWhisperSegment(id: Int, text: String) -> Bool {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -522,8 +604,25 @@ final class TranscriptStore: @unchecked Sendable {
       out += hasOwnHeading ? "\(summary)\n\n" : "## 요약\n\n\(summary)\n\n"
     }
     out += "## 전체 기록\n\n"
-    for seg in segs {
-      out += "**[\(Self.clock(seg.start))] \(seg.track.label)** — \(seg.text)\n\n"
+    // 문단 번호가 같은 연속 줄은 한 문단으로 묶어 적는다 — Whisper 세그먼트(3~10초 단위)
+    // 그대로 한 줄씩 적으면 뚝뚝 끊겨 나중에 다시 읽기 어렵다(문단화 도입 배경).
+    // 번호가 없는 줄(문단화 전, 또는 아직 문맥이 안 쌓인 꼬리)은 예전처럼 한 줄씩 적는다.
+    var i = 0
+    while i < segs.count {
+      let seg = segs[i]
+      if let p = seg.paragraph {
+        var texts = [seg.text]
+        var j = i + 1
+        while j < segs.count, segs[j].paragraph == p {
+          texts.append(segs[j].text)
+          j += 1
+        }
+        out += "**[\(Self.clock(seg.start))] \(seg.track.label)** — \(texts.joined(separator: " "))\n\n"
+        i = j
+      } else {
+        out += "**[\(Self.clock(seg.start))] \(seg.track.label)** — \(seg.text)\n\n"
+        i += 1
+      }
     }
     return out
   }

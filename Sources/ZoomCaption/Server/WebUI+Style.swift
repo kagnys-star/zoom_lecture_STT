@@ -118,6 +118,10 @@ extension WebUI {
   /* 문단 시작 줄만 위에 여백을 더 준다 — Whisper 세그먼트(3~10초 단위)를 문단으로
      묶어 보여줄 때(Paragraph.swift), 어디서 화제가 바뀌는지 한눈에 보이게. */
   .line.parastart { margin-top: 14px; }
+  /* 같은 문단이 이어지는 줄은 타임스탬프를 지운다 — 세그먼트 경계가 문장 중간에서
+     끊기면 그 자리에 시각이 끼어 보여서 오히려 읽기 어려워진다(markParaBoundary 참고).
+     grid 열은 그대로 남겨 텍스트 시작 위치는 흔들리지 않는다. */
+  .line.paracont .ts { visibility: hidden; }
 
   .line .pick, .line .del { visibility: hidden; }
   body.editing .line .pick, body.editing .line .del { visibility: visible; }

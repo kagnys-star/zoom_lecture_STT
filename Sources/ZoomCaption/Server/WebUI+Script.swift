@@ -264,13 +264,21 @@ extension WebUI {
 
   // ── 자막 렌더 ──
   // 문단 번호가 바로 앞 줄과 다르면 그 줄에 위 여백을 준다(.parastart, CSS 참고).
+  // 같은 문단이 이어지는 줄(.paracont)은 타임스탬프를 숨긴다 — Whisper 세그먼트 경계는
+  // 문법적 문장 경계와 안 맞을 때가 있어서, 안 숨기면 한 문장 한가운데에 다음 세그먼트의
+  // 타임스탬프가 끼어 보인다(예: "proxy가 [00:01:00] 포함되어 있는"). 문단이 아직 안
+  // 배정된 줄(방금 올라온 꼬리 부분)은 그 자체로 독립된 줄이니 항상 보여준다.
   // el 자신뿐 아니라 바로 다음 줄도 다시 봐야 한다 — el 이 그 사이에 새로 끼어들었을 수 있다.
   function markParaBoundary(el) {
     const prev = el.previousElementSibling;
-    el.classList.toggle('parastart', !!el.dataset.para && el.dataset.para !== (prev ? prev.dataset.para : undefined));
+    const isStart = !!el.dataset.para && el.dataset.para !== (prev ? prev.dataset.para : undefined);
+    el.classList.toggle('parastart', isStart);
+    el.classList.toggle('paracont', !!el.dataset.para && !isStart);
     const next = el.nextElementSibling;
     if (next) {
-      next.classList.toggle('parastart', !!next.dataset.para && next.dataset.para !== el.dataset.para);
+      const nextIsStart = !!next.dataset.para && next.dataset.para !== el.dataset.para;
+      next.classList.toggle('parastart', nextIsStart);
+      next.classList.toggle('paracont', !!next.dataset.para && !nextIsStart);
     }
   }
 

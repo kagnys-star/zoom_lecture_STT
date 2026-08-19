@@ -485,7 +485,11 @@ final class ZoomCaptionApp: @unchecked Sendable {
     }
     let isRunning = stateLock.withLock { running }
     let engine = await Summarizer.currentEngine()
-    let whisper = store.whisperSegments.map { seg -> [String: Any] in
+    let whisper = store.whisperSegments.compactMap { seg -> [String: Any]? in
+      // 녹음 중이고 문단화가 작동 중이면, 문단이 아직 안 정해진 꼬리는 새로고침
+      // 해도 안 보낸다 — ingestWhisperLines 와 같은 이유(재배치 방지). 정지 후엔
+      // finalizeParagraphs 가 전부 확정해 두므로 이 조건에 안 걸린다.
+      if isRunning, Paragraph.isReady, seg.paragraph == nil { return nil }
       var d: [String: Any] = ["id": seg.id, "start": seg.start, "end": seg.end,
                                "text": seg.text, "edited": seg.edited]
       // paragraph 는 Int? 라 nil 이면 아예 키를 뺀다. JSONSerialization 이
@@ -560,18 +564,33 @@ final class ZoomCaptionApp: @unchecked Sendable {
     // 문단 번호는 문맥이 쌓여야 확정되니, 방금 붙은 줄이 아니라 몇 조각 전에
     // 붙었던 줄에 처음 번호가 매겨지는 경우가 흔하다 — 그 옛 줄도 같이 갱신한다.
     let changedParagraphs = store.regroupParagraphs()
-    let addedIDs = Set(added.map(\.id))
-    for seg in added {
-      var payload: [String: Any] = [
-        "id": seg.id, "start": seg.start, "end": seg.end, "text": seg.text]
-      if let p = changedParagraphs.first(where: { $0.id == seg.id })?.paragraph {
-        payload["paragraph"] = p
+
+    guard Paragraph.isReady else {
+      // 문단화 모델이 아예 안 떴으면(에셋 실패 등) 문단은 영원히 안 정해진다.
+      // 그럴 때도 아래처럼 "정해질 때까지 안 보여준다" 를 그대로 하면 자막이
+      // 영영 안 뜨는 훨씬 큰 문제가 된다 — 그래서 예전처럼 바로 보여주는 것으로
+      // 폴백한다(문단 구분 없이, 문장마다 타임스탬프가 보이는 모양).
+      for seg in added {
+        live.broadcast(event: "whisperSegment", payload: [
+          "id": seg.id, "start": seg.start, "end": seg.end, "text": seg.text])
       }
-      live.broadcast(event: "whisperSegment", payload: payload)
+      autosave()
+      return
     }
-    for seg in changedParagraphs where !addedIDs.contains(seg.id) {
+
+    // 문단이 이번에 처음 확정된 줄만 화면에 새로 띄운다 — 아직 문맥이 덜 쌓여
+    // 문단이 안 정해진 줄(방금 붙은 꼬리 포함)은 여기서 아예 안 보낸다.
+    //
+    // 예전엔 방금 붙은 줄을 문단 없이 먼저 띄우고, 나중에 문단이 정해지면
+    // whisperParagraph 이벤트로 이미 보여준 그 줄을 다시 찾아 타임스탬프를
+    // 지웠다 — 그러다 보니 사람이 이미 읽은 줄이 눈앞에서 위 줄과 합쳐지며
+    // 재배치되는 문제가 있었다(실제 강의 중 발견). 이제는 문단이 확정된
+    // 순간에만, 이미 최종 모양으로 등장한다. 그동안 그 구간은 아래 칸
+    // (실시간)이 계속 보여주고 있으니 화면에 빈 자리가 생기지 않는다.
+    for seg in changedParagraphs {
       guard let p = seg.paragraph else { continue }
-      live.broadcast(event: "whisperParagraph", payload: ["id": seg.id, "paragraph": p])
+      live.broadcast(event: "whisperSegment", payload: [
+        "id": seg.id, "start": seg.start, "end": seg.end, "text": seg.text, "paragraph": p])
     }
     autosave()
   }
@@ -778,9 +797,13 @@ final class ZoomCaptionApp: @unchecked Sendable {
       log("Whisper 실시간 재전사 종료 — 조각 \(worker.progress.done)개, \(store.whisperSegments.count)줄")
       whisperLive = nil
       // 마지막 2~3문장은 앞으로 문맥이 더 쌓일 일이 없다 — 대기하던 판정을 여기서 확정한다.
+      // ingestWhisperLines 가 문단 없는 줄은 화면에 아예 안 띄워 왔으므로(재배치 방지),
+      // 여기서 나오는 줄들은 전부 처음 등장하는 것이다 — 그래서 whisperSegment 로
+      // 온전히 보낸다(whisperParagraph 는 이미 떠 있는 줄을 갱신하는 용도라 안 맞는다).
       for seg in store.finalizeParagraphs() {
         guard let p = seg.paragraph else { continue }
-        live.broadcast(event: "whisperParagraph", payload: ["id": seg.id, "paragraph": p])
+        live.broadcast(event: "whisperSegment", payload: [
+          "id": seg.id, "start": seg.start, "end": seg.end, "text": seg.text, "paragraph": p])
       }
     }
 
@@ -819,10 +842,69 @@ final class ZoomCaptionApp: @unchecked Sendable {
     }
   }
 
-  // MARK: - 문맥 교정
+  // MARK: - 문맥 다듬기 (자기 일관성 교정 — 미리보기)
 
-  /// Whisper 기록을 원안으로 두고, 정렬기가 찾아낸 갈린 지점만 모델에 묻는다.
-  /// 결과는 곧바로 반영하지 않고 제안 목록으로 내보낸다 — 사람이 보고 고르게 한다.
+  /// Whisper 기록을 원안으로 두고, 강의 전체 문맥으로 표기 불일치를 찾는다.
+  /// **지금은 미리보기 단계다** — 결과를 곧바로 반영하지 않고 제안 목록만 화면에
+  /// 띄운다(원문은 안 건드린다). segID 없이 "이 표기 → 저 표기" 규칙만 모델에게
+  /// 받고, 실제로 원문 어디에 있는지·근거가 있는지는 여기서 검증만 해서 같이
+  /// 보여준다 — 사람이 보고 신뢰할 만한지 가늠하라는 뜻이지, 자동 적용 여부를
+  /// 정하는 게 아니다.
+  func suggestPolish() async {
+    let text = store.plainText(includeTimestamps: false)
+    guard !text.isEmpty else {
+      live.broadcast(event: "polishDone", payload: ["ok": false, "error": "녹취 내용이 없습니다."])
+      return
+    }
+    live.broadcast(event: "polishProgress", payload: ["message": "모델을 준비하는 중…"], durable: false)
+    // 서버가 안 떠 있어도 디스크에 모델이 있으면 골라 둔다(Summarizer.currentEngine
+    // 과 같은 패턴) — 아래 ensureServer() 가 실제로 띄운다.
+    let model: String
+    if let installed = await OllamaClient.installedModels(),
+       let m = OllamaClient.pickModel(from: installed) {
+      model = m
+    } else if OllamaClient.binaryPath != nil,
+              let m = OllamaClient.pickModel(from: OllamaClient.installedModelsOffline()) {
+      model = m
+    } else {
+      live.broadcast(event: "polishDone", payload: [
+        "ok": false, "error": "쓸 수 있는 Ollama 모델이 없습니다. `ollama pull qwen3:8b` 로 내려받으세요."])
+      return
+    }
+    guard await OllamaClient.ensureServer() else {
+      live.broadcast(event: "polishDone", payload: ["ok": false, "error": "Ollama 서버를 띄우지 못했습니다."])
+      return
+    }
+    live.broadcast(event: "polishProgress", payload: ["message": "강의 전체를 검토하는 중…"], durable: false)
+    let glossary = DomainKnowledge.glossary(store.domainTerms)
+    do {
+      let suggestions = try await OllamaClient.suggestCorrections(
+        transcript: text, title: store.title, glossary: glossary, model: model)
+
+      // 검증(적용은 안 함) — before 가 실제 원문에 있는지, after 가 교안/녹취
+      // 다른 곳에 근거가 있는지만 표시한다. 모델이 규칙을 어겼는지 한눈에 보임.
+      let allText = store.whisperSegments.map(\.text).joined(separator: "\n")
+      let glossarySet = Set(store.domainTerms.map { $0.replacingOccurrences(of: " ", with: "").lowercased() })
+      let annotated = suggestions.map { s -> (s: OllamaClient.CorrectionSuggestion, beforeExists: Bool, afterGrounded: Bool) in
+        let beforeExists = allText.contains(s.before)
+        let normalizedAfter = s.after.replacingOccurrences(of: " ", with: "").lowercased()
+        let afterGrounded = glossarySet.contains(normalizedAfter) || allText.contains(s.after)
+        return (s, beforeExists, afterGrounded)
+      }
+      log("문맥 다듬기 미리보기 — 제안 \(suggestions.count)건 "
+        + "(원문에 있음 \(annotated.filter(\.beforeExists).count)건, "
+        + "근거 있음 \(annotated.filter(\.afterGrounded).count)건)")
+
+      let payload = annotated.map { a -> [String: Any] in
+        ["before": a.s.before, "after": a.s.after, "reason": a.s.reason,
+         "beforeExists": a.beforeExists, "afterGrounded": a.afterGrounded]
+      }
+      live.broadcast(event: "polishDone", payload: ["ok": true, "model": model, "corrections": payload])
+    } catch {
+      live.broadcast(event: "polishDone", payload: ["ok": false, "error": error.localizedDescription])
+    }
+  }
+
   // MARK: - 요약
 
   func runSummary(from: Double?) async {

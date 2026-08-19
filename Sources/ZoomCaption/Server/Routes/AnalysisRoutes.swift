@@ -41,6 +41,14 @@ extension ZoomCaptionApp {
       json["settledUntil"] = settled.isFinite ? settled : -1     // -1 = 제한 없음
       return .response(.json(json))
 
+    // ── 문맥 다듬기 (미리보기) ──
+    case ("POST", "/api/polish/suggest"):
+      guard !store.whisperSegments.isEmpty else {
+        return .response(.json(["ok": false, "error": "Whisper 기록이 없어 다듬을 내용이 없습니다."]))
+      }
+      Task { await self.suggestPolish() }
+      return .response(.json(["ok": true]))
+
     // ── 본문에서 바로 고치기 ──
     //
     // 갈린 자리에 밑줄을 긋고, 눌러서 실시간 쪽 표기를 보고, 골라서 고친다.

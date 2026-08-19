@@ -234,6 +234,32 @@ extension WebUI {
   .quitBtns { display: flex; justify-content: flex-end; gap: 9px; margin-top: 18px; }
   .quitBtns[hidden] { display: none; }
 
+  /* 정지 → 마무리 대기 */
+  #stopVeil {
+    position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center;
+    background: color-mix(in srgb, #000 45%, transparent); padding: 20px;
+  }
+  #stopVeil[hidden] { display: none; }
+  .stopCard {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 15px;
+    padding: 22px 24px; max-width: 380px; width: 100%; box-shadow: 0 18px 50px rgba(0,0,0,.3);
+  }
+  .stopCard h3 { margin: 0 0 6px; font-size: 17px; }
+  .stopHint { margin: 0 0 16px; font-size: 13px; color: var(--muted); line-height: 1.6; word-break: keep-all; }
+  /* 단계 한 줄. pending(아직 대기) → active(도는 중, 테두리가 돈다) → done(체크) 순서로 바뀐다. */
+  .stopStep { display: flex; align-items: center; gap: 10px; padding: 7px 0; font-size: 14px; }
+  .stopStep .stopIcon {
+    width: 16px; height: 16px; flex: 0 0 auto; border-radius: 50%; border: 2px solid var(--line);
+    display: flex; align-items: center; justify-content: center; font-size: 10px; color: var(--panel);
+  }
+  .stopStep.active .stopIcon { border-color: var(--accent); border-top-color: transparent; animation: spin .8s linear infinite; }
+  .stopStep.done .stopIcon { border-color: var(--accent); background: var(--accent); }
+  .stopStep.done .stopIcon::after { content: "\2713"; }
+  .stopStep.pending .stopLabel { color: var(--muted); }
+  .stopStep .stopLabel { flex: 1; }
+  .stopStep .stopDetail { font-size: 12px; color: var(--muted); }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
   /* 창을 다시 열었을 때 "이미 돌고 있던 녹음" 임을 분명히 알린다 */
   #resumeBar { display: none; align-items: center; gap: 10px; padding: 10px 18px;
                background: var(--warn-soft); color: var(--warn); font-size: 13.5px;

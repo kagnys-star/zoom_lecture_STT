@@ -350,4 +350,121 @@ enum OllamaClient {
     }
     return kept
   }
+
+  // MARK: - 문맥 다듬기 (자기 일관성 교정)
+
+  /// 모델이 제안하는 교정 하나. segID 가 없다 — "이 표기를 이 표기로" 라는 규칙만
+  /// 돌려주고, 녹취 전체에서 그 규칙이 맞는 자리를 찾는 건 호출부의 몫이다. 같은
+  /// 실수가 여러 번 반복돼도 모델이 한 번만 판단하면 되므로 더 안정적이다.
+  struct CorrectionSuggestion: Codable, Sendable {
+    var before: String
+    var after: String
+    var reason: String
+  }
+
+  private static let correctionSchema: [String: Any] = [
+    "type": "object",
+    "properties": [
+      "corrections": [
+        "type": "array",
+        "items": [
+          "type": "object",
+          "properties": [
+            "before": ["type": "string"],
+            "after": ["type": "string"],
+            "reason": ["type": "string"],
+          ],
+          "required": ["before", "after", "reason"],
+        ],
+      ],
+    ],
+    "required": ["corrections"],
+  ]
+
+  /// 강의 전체를 한 번에 넣고, 음성 인식이 잘못 알아들어 생긴 표기 불일치를 찾는다.
+  /// 결과는 제안일 뿐이다 — 호출부가 원문에 실제로 있는지, 근거가 있는지 검증하고
+  /// 반영 여부도 따로 정한다(이 함수는 아무것도 바꾸지 않는다).
+  static func suggestCorrections(transcript: String, title: String,
+                                 glossary: String, model: String) async throws -> [CorrectionSuggestion] {
+    let glossaryLine = glossary.isEmpty
+      ? "(교안 없음 — 녹취 안에서 같은 대상이 다르게 표기된 자리만 근거로 삼아라)"
+      : glossary
+    let system = """
+      너는 한국어 강의 녹취록에서 음성 인식 오류를 잡아내는 전문 교정자다.
+      특히 외래어·전문 용어가 한국어로 옮겨지며 발음이 비슷해서 잘못 들린 경우를
+      알아채는 게 네 전문 분야다.
+
+      이 강의 교안의 정확한 용어:
+      \(glossaryLine)
+
+      규칙:
+      - 고칠 게 없는 문장은 corrections 목록에 아예 넣지 마라. 모든 문장을
+        판단해서 적으라는 게 아니다 — 실제로 고칠 것이 있는 항목만 담아라.
+        before 와 after 가 같은 항목은 절대 만들지 마라.
+      - "같은 대상"이란 발음이 비슷해서 인식기가 다르게 받아적은 경우만 뜻한다.
+        화자가 실제로 다른 낱말을 쓴 경우(동의어, 바꿔 말하기)는 대상이 아니다.
+      - 교안 용어집이 최우선 기준이다. 교안에 있는 표기와 다르면, 녹취에 그 표기가
+        한 번도 정확히 안 나왔어도 교안 표기로 고쳐라.
+      - 교안에 없는 말은 녹취 다른 곳에 정확히 그대로 나온 경우에만 그 표기로 통일하고,
+        그마저도 없으면 고치지 마라.
+      - 어투·문법·반복·군말은 손대지 마라 — 인식 오류가 아닌 건 원문 그대로 둔다.
+      - before 는 녹취 원문과 띄어쓰기·조사까지 글자 하나 다르지 않게 그대로 적어라.
+      - 한두 글자짜리 흔한 표현은 고르지 마라 — 다른 문맥에서 우연히 같은 글자가
+        나오면 엉뚱한 곳까지 고쳐질 수 있다.
+      - 확신이 없으면(정말 같은 발음에서 갈라진 건지 의심되면) 목록에서 빼라.
+        개수보다 정확도가 중요하다.
+      """
+
+    // 요약과 같은 추정식 재사용 — segID·타임스탬프가 없어 요약보다 입력이 짧다.
+    let estimated = Int(Double(transcript.count) * tokensPerChar) + 800
+    let numCtx = min(maxContext, max(8192, estimated + 1024))
+
+    let body: [String: Any] = [
+      "model": model,
+      "messages": [
+        ["role": "system", "content": system],
+        ["role": "user", "content": "다음은 「\(title)」 녹취다.\n\n---\n\(transcript)\n---"],
+      ],
+      "stream": false,
+      "format": correctionSchema,
+      "think": false,
+      "keep_alive": 0,
+      // num_predict 없이 실측했더니 3000자짜리 작은 입력에서도 GPU 100%를 문 채
+      // 160초 넘게 안 끝났다 — 요약(oneLine·keyPoints 몇 개)과 달리 이건 "찾는 대로
+      // 계속 추가"하는 배열이라 모델이 반복 패턴에 걸리면 끝날 조건이 없다(오늘
+      // 발견한 Whisper "팀에서" 반복 루프와 같은 종류). 교정 항목 하나가 대략
+      // 60~90토큰이라 2048이면 20~30개까지 담기고(빡빡한 규칙상 실제로 이보다
+      // 훨씬 적게 나옴), 폭주해도 1~2분 안에 강제로 끊긴다.
+      "options": ["temperature": 0, "num_ctx": numCtx, "num_predict": 2048],
+    ]
+
+    guard let url = URL(string: "\(host)/api/chat") else { throw OllamaError.notRunning }
+    var req = URLRequest(url: url)
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = try JSONSerialization.data(withJSONObject: body)
+    req.timeoutInterval = 900
+
+    log("Ollama 다듬기 요청 — 모델 \(model), 입력 \(transcript.count)자, num_ctx \(numCtx)")
+    let startedAt = Date()
+    let (data, response) = try await URLSession.shared.data(for: req)
+    guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+      throw OllamaError.badResponse(String(data: data.prefix(300), encoding: .utf8) ?? "?")
+    }
+    guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let message = root["message"] as? [String: Any],
+          let content = message["content"] as? String,
+          let parsed = try? JSONSerialization.jsonObject(with: Data(content.utf8)) as? [String: Any],
+          let rawList = parsed["corrections"] as? [[String: Any]]
+    else { throw OllamaError.badResponse(String(data: data.prefix(300), encoding: .utf8) ?? "?") }
+
+    let suggestions: [CorrectionSuggestion] = rawList.compactMap { item in
+      guard let before = item["before"] as? String, let after = item["after"] as? String,
+            !before.isEmpty, !after.isEmpty, before != after else { return nil }
+      return CorrectionSuggestion(before: before, after: after, reason: item["reason"] as? String ?? "")
+    }
+    log("Ollama 다듬기 완료 — \(String(format: "%.1f", Date().timeIntervalSince(startedAt)))초, "
+      + "제안 \(suggestions.count)건")
+    return suggestions
+  }
 }

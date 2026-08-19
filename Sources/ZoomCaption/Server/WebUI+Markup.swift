@@ -40,6 +40,17 @@ extension WebUI {
   </div>
 </div>
 
+<!-- 정지 → 마무리 대기. 단계는 JS(stopSteps 배열)가 채운다 —
+     지금은 Whisper 정리 한 단계뿐이지만, 나중에 LLM 다듬기를 자동으로 붙이면
+     이 카드에 줄이 하나 늘어난다(WebUI+Script.swift 의 stopSteps 주석 참고). -->
+<div id="stopVeil" hidden>
+  <div class="stopCard">
+    <h3>마무리하는 중…</h3>
+    <p class="stopHint">기록을 정리하는 중입니다. 창을 닫지 말고 잠시만 기다려 주세요.</p>
+    <div id="stopStepsBox"></div>
+  </div>
+</div>
+
 <main>
   <section class="captions">
     <div id="resumeBar">
@@ -96,6 +107,7 @@ extension WebUI {
       <div class="tab on" data-tab="sum">요약</div>
       <div class="tab" data-tab="doc">교안</div>
       <div class="tab" data-tab="cmp">대조</div>
+      <div class="tab" data-tab="pol">다듬기</div>
       <div class="tab" data-tab="ses">세션</div>
       <div class="tab" data-tab="cfg">설정</div>
     </div>
@@ -201,6 +213,21 @@ extension WebUI {
         </div>
       </div>
 
+    </div>
+
+    <!-- 다듬기 (미리보기 단계 — 원문은 아직 안 건드림) -->
+    <div class="panel" id="panel-pol">
+      <div class="field">
+        <label>문맥 다듬기 (미리보기)</label>
+        <div class="hint">강의 전체를 다시 훑어서, 음성 인식이 잘못 알아들어 표기가
+          갈린 자리(예: 「빔 팩토리」 ↔ 「Bean Factory」)를 찾습니다.
+          <b>여기서는 제안만 보여줄 뿐, 원문을 바로 고치지는 않습니다.</b></div>
+        <div class="row" style="margin-top:9px">
+          <button id="btnPolish" class="sm primary" style="flex:0 0 auto">다듬기 확인</button>
+        </div>
+      </div>
+      <div id="polNotice"></div>
+      <div id="polResult"></div>
     </div>
 
     <!-- 세션 -->

@@ -718,16 +718,11 @@ extension WebUI {
     const d = JSON.parse(e.data); if (!seen(d)) return;
     showSilent(''); addFast(d);
   });
+  // 문단이 확정된 줄만 서버가 보낸다(ZoomCaptionApp.ingestWhisperLines 참고) —
+  // 그래서 이 줄은 등장할 때 이미 최종 모양이고, 나중에 다시 갱신될 일이 없다.
   es.addEventListener('whisperSegment', e => {
     const d = JSON.parse(e.data); if (!seen(d)) return;
     addSegment(d, true);
-  });
-  // 문단 번호는 문맥이 쌓인 뒤에야 확정되므로, 이미 화면에 있는 줄에 뒤늦게 붙기도 한다
-  // (새 줄이 아니라서 whisperSegment 가 아니라 이걸로 따로 온다).
-  es.addEventListener('whisperParagraph', e => {
-    const d = JSON.parse(e.data); if (!seen(d)) return;
-    const el = lines.get(d.id);
-    if (el) { el.dataset.para = d.paragraph; markParaBoundary(el); }
   });
   es.addEventListener('whisperLive', e => {
     const d = JSON.parse(e.data); if (!seen(d)) return;
@@ -735,6 +730,8 @@ extension WebUI {
     $('#waitNote').textContent = behind > 0
       ? `Whisper 가 ${behind}조각 뒤에서 따라오는 중` : '';
     if (d.note !== undefined) showWhisperWhy(d.note);
+    // 정지를 누른 뒤 대기 중이면, 같은 신호로 마무리 카드의 진행률도 채운다.
+    if (stopping) setStopStep('whisper', 'active', d.total > 0 ? `${d.done} / ${d.total} 조각` : '');
   });
 
   // 소리가 안 들어오면 자막 위에 띄운다. 소리가 돌아오면 알아서 사라진다.
@@ -794,6 +791,17 @@ extension WebUI {
     $('#saveSummaryBox').style.display = '';
     if (!$('#sumName').value) $('#sumName').value = ($('#title').value || '수업') + '_요약.md';
   });
+  es.addEventListener('polishProgress', e => {
+    const d = JSON.parse(e.data); if (!seen(d)) return;
+    $('#polResult').innerHTML = `<p class="muted-note">${esc(d.message)}</p>`;
+  });
+  es.addEventListener('polishDone', e => {
+    const d = JSON.parse(e.data); if (!seen(d)) return;
+    $('#btnPolish').disabled = false;
+    if (!d.ok) { notice('#polNotice', 'warn', esc(d.error || '실패')); $('#polResult').innerHTML = ''; return; }
+    notice('#polNotice', '', '');
+    renderPolish(d.corrections, d.model);
+  });
 
   // ── 액션 ──
   $('#btnStart').onclick = async () => {
@@ -813,11 +821,77 @@ extension WebUI {
     }
     startedAt = Date.now(); setRunning(true); renderSession(r.state);
   };
+  // ── 정지 → 마무리 대기 ──
+  //
+  // /api/stop 은 Whisper 남은 조각을 다 처리할 때까지 서버에서 붙잡고 있다가 응답한다
+  // (ZoomCaptionApp.stop() 참고). 그동안 화면이 멈춘 것처럼 보이면 안 되니 카드를 띄우고,
+  // 이미 흐르고 있던 whisperLive SSE 로 그 안의 진행률(조각 수)을 채운다.
+  //
+  // stopSteps 는 **단계 목록**이다. 지금은 whisper 하나뿐이지만, 나중에 정지 직후
+  // LLM 다듬기(/api/polish/suggest, 이미 있음)를 자동으로 붙이려면 이 배열에
+  // 원소 하나만 더하면 된다:
+  //   { key: 'llm', label: 'AI 교정', run: async () => {
+  //       await post('/api/polish/suggest');
+  //       await new Promise(res => es.addEventListener('polishDone', res, { once: true }));
+  //     } }
+  // run() 안에서 폴리시 단계 전용 진행률을 보여주고 싶으면 polishProgress 리스너에서
+  // whisperLive 와 같은 방식으로 setStopStep('llm', 'active', d.message) 를 불러 주면 된다.
+  const stopSteps = [
+    { key: 'whisper', label: 'Whisper 인식 정리', run: async () => {
+        const r = await post('/api/stop');
+        setRunning(false); startedAt = null;
+        if (r.state) renderSession(r.state);
+        loadSessions();
+      } },
+  ];
+  let stopping = false;
+
+  function renderStopSteps() {
+    $('#stopStepsBox').innerHTML = stopSteps.map(s => `
+      <div class="stopStep ${s.status || 'pending'}" data-step="${s.key}">
+        <span class="stopIcon"></span>
+        <span class="stopLabel">${esc(s.label)}</span>
+        <span class="stopDetail">${esc(s.detail || '')}</span>
+      </div>`).join('');
+  }
+  function setStopStep(key, status, detail) {
+    const s = stopSteps.find(x => x.key === key);
+    if (!s) return;
+    s.status = status;
+    if (detail !== undefined) s.detail = detail;
+    renderStopStepsThrottled();
+  }
+  // whisperLive 는 조각마다 온다(수십 개) — 매번 innerHTML 을 다시 그릴 것 없이 다음
+  // 애니메이션 프레임에 한 번만 그린다.
+  let stopStepsRAF = null;
+  function renderStopStepsThrottled() {
+    if (stopStepsRAF) return;
+    stopStepsRAF = requestAnimationFrame(() => { stopStepsRAF = null; renderStopSteps(); });
+  }
+
   $('#btnStop').onclick = async () => {
-    const r = await post('/api/stop');
-    setRunning(false); startedAt = null;
-    if (r.state) renderSession(r.state);
-    loadSessions();
+    if (stopping) return;
+    stopping = true;
+    stopSteps.forEach(s => { s.status = 'pending'; s.detail = ''; });
+    renderStopSteps();
+    $('#stopVeil').hidden = false;
+    const shownAt = Date.now();
+    try {
+      for (const step of stopSteps) {
+        setStopStep(step.key, 'active');
+        await step.run();
+        setStopStep(step.key, 'done');
+      }
+    } finally {
+      // Whisper 가 이미 다 따라잡았으면(흔한 경우) /api/stop 이 거의 즉시 끝나서
+      // 카드가 뜨자마자 사라진다 — 떴는지도 모르게 없어지면 "아무 반응 없음" 처럼
+      // 보이니, 최소한은 눈에 보이게 붙잡아 둔다.
+      const minVisible = 500;
+      const left = minVisible - (Date.now() - shownAt);
+      if (left > 0) await new Promise(res => setTimeout(res, left));
+      stopping = false;
+      $('#stopVeil').hidden = true;
+    }
   };
 
   $('#btnEdit').onclick = () => document.body.classList.add('editing');
@@ -841,6 +915,39 @@ extension WebUI {
     const r = await post('/api/summarize', from === null ? {} : { from });
     if (!r.ok) { $('#summary').innerHTML = `<p class="muted-note">${esc(r.error||'실패')}</p>`; $('#btnSummarize').disabled = false; }
   };
+
+  $('#btnPolish').onclick = async () => {
+    $('#btnPolish').disabled = true;
+    notice('#polNotice', '', '');
+    $('#polResult').innerHTML = '<p class="muted-note">모델을 준비하는 중…</p>';
+    const r = await post('/api/polish/suggest');
+    if (!r.ok) {
+      notice('#polNotice', 'warn', esc(r.error || '실패'));
+      $('#polResult').innerHTML = '';
+      $('#btnPolish').disabled = false;
+    }
+  };
+
+  // 미리보기 단계라 반영 버튼은 없다 — before/after/근거만 보여준다.
+  // beforeExists=false 면 서버가 원문에서 그 글자를 못 찾았다는 뜻(모델이 살짝
+  // 다르게 옮겨 적었을 수 있음), afterGrounded=false 면 교안·녹취 어디에도
+  // 근거가 없다는 뜻 — 둘 다 사람이 거를 때 참고하라고 보여주는 것뿐이다.
+  function renderPolish(corrections, model) {
+    if (!corrections || !corrections.length) {
+      $('#polResult').innerHTML = `<p class="muted-note">고칠 만한 표기 불일치를 못 찾았습니다. (모델: ${esc(model || '?')})</p>`;
+      return;
+    }
+    $('#polResult').innerHTML =
+      `<p class="hint" style="margin-bottom:10px">모델: ${esc(model)} · 제안 ${corrections.length}건 — 원문은 아직 안 바뀌었습니다.</p>` +
+      corrections.map(c => `
+        <div class="card" style="margin-bottom:8px;flex-direction:column;align-items:flex-start;gap:4px">
+          <div><span style="text-decoration:line-through;color:var(--muted)">${esc(c.before)}</span>
+            → <b>${esc(c.after)}</b></div>
+          <div class="hint">${esc(c.reason || '')}</div>
+          ${(!c.beforeExists || !c.afterGrounded) ? `<div class="hint" style="color:var(--warn)">
+            ${!c.beforeExists ? '⚠ 원문에서 정확히 못 찾음 ' : ''}${!c.afterGrounded ? '⚠ 근거(교안/녹취) 없음' : ''}</div>` : ''}
+        </div>`).join('');
+  }
   // 마지막으로 요약이 훑은 지점을 보여주고, 다음 요약 시작점으로 넣을 수 있게 한다.
   function showLastSummarized(at) {
     const btn = $('#btnFromLast');

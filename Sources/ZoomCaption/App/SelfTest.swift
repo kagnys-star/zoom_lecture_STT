@@ -55,7 +55,7 @@ func runSumTest(path: String, pdf: String?) async -> Never {
     let text = try String(contentsOfFile: path, encoding: .utf8)
     var glossary = ""
     if let pdf {
-      let r = try DomainKnowledge.analyze(pdf: URL(fileURLWithPath: pdf))
+      let r = try DomainKnowledge.analyze(pdf: Data(contentsOf: URL(fileURLWithPath: pdf)))
       glossary = DomainKnowledge.glossary(r.terms)
       log("교안 용어 \(r.terms.count)개 (\(r.analyzer))")
     }
@@ -77,7 +77,7 @@ func runSumTest(path: String, pdf: String?) async -> Never {
 /// 교안 PDF 분석만 돌려본다. `--pdftest <파일.pdf>`
 func runPDFTest(path: String, useLLM: Bool) async -> Never {
   do {
-    let r = try DomainKnowledge.analyze(pdf: URL(fileURLWithPath: path))
+    let r = try DomainKnowledge.analyze(pdf: Data(contentsOf: URL(fileURLWithPath: path)))
     log("\(r.pages)쪽, \(r.characters)자, 분석기: \(r.analyzer), 스캔본: \(r.looksScanned)")
     log("용어 \(r.terms.count)개 (상위 40): \(r.terms.prefix(40).joined(separator: ", "))")
     if !r.droppedBoilerplate.isEmpty {

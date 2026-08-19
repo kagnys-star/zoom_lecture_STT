@@ -53,8 +53,6 @@ final class ZoomCaptionApp: @unchecked Sendable {
   private var resolvedLocale: Locale?
   private var analyzerFormat: AVAudioFormat?
   private var userTerms: [String] = []
-  /// 세션 폴더가 생기기 전에 올라온 교안 PDF
-  var pendingDomainPDF: (name: String, url: URL)?
 
   init(options: Options) {
     self.options = options
@@ -323,26 +321,10 @@ final class ZoomCaptionApp: @unchecked Sendable {
       return .json(["ok": false, "error": "파일이 비어 있습니다."])
     }
 
-    // 세션 폴더가 있으면 그 안에, 없으면 임시 폴더에 두었다가 나중에 옮긴다.
-    let target: URL
-    if let dir = store.sessionDir {
-      target = dir.appendingPathComponent(name)
-    } else {
-      let tmp = FileManager.default.temporaryDirectory
-        .appendingPathComponent("zoomcaption-\(UUID().uuidString)", isDirectory: true)
-      try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
-      target = tmp.appendingPathComponent(name)
-    }
-
     do {
-      try req.body.write(to: target, options: .atomic)
-
-      if store.sessionDir == nil {
-        stateLock.withLock { pendingDomainPDF = (name, target) }
-      }
-
-      // 같은 교안을 다시 올리는 일이 잦다(이어 적기, 새 세션, 앱 재시작).
-      // 파일 내용 해시로 붙잡아 두면 mecab 9초 + 모델 정제 18초를 통째로 건너뛴다.
+      // 용어를 뽑는 데만 쓰고 원본 PDF 는 어디에도 남기지 않는다 — 세션 폴더에도,
+      // 임시 폴더에도. PDFDocument(data:) 로 메모리에서 바로 열리므로 디스크에 쓸
+      // 이유가 없다. 캐시(DomainCache)도 추출된 용어만 담지, PDF 바이트는 안 담는다.
       let t0 = Date()
       let cacheKey = DomainCache.key(for: req.body)
       var entry = DomainCache.load(key: cacheKey)
@@ -352,7 +334,7 @@ final class ZoomCaptionApp: @unchecked Sendable {
         log("교안 캐시 적중: \(name) — \(hit.pages)쪽, 용어 \(hit.terms.count)개 "
           + "[\(hit.refinedBy)], \(Self.ago(hit.cachedAt)) 분석한 결과")
       } else {
-        let result = try DomainKnowledge.analyze(pdf: target)
+        let result = try DomainKnowledge.analyze(pdf: req.body)
 
         // 규칙으로 거른 뒤, 로컬 모델이 있으면 "강의에서 말할 용어" 만 남긴다.
         // 코드 조각은 언어별 예약어 목록 없이 이 단계에서 걸러진다.
@@ -465,15 +447,6 @@ final class ZoomCaptionApp: @unchecked Sendable {
     case ..<86400: return "\(Int(seconds / 3600))시간 전"
     default: return "\(Int(seconds / 86400))일 전"
     }
-  }
-
-  func adoptPendingDomainPDF(into dir: URL) {
-    guard let pending = stateLock.withLock({ pendingDomainPDF }) else { return }
-    let dest = dir.appendingPathComponent(pending.name)
-    try? FileManager.default.removeItem(at: dest)
-    try? FileManager.default.copyItem(at: pending.url, to: dest)
-    try? FileManager.default.removeItem(at: pending.url.deletingLastPathComponent())
-    stateLock.withLock { pendingDomainPDF = nil }
   }
 
   // MARK: - 상태
@@ -620,7 +593,6 @@ final class ZoomCaptionApp: @unchecked Sendable {
       let parent = (baseDir?.isEmpty == false) ? URL(fileURLWithPath: baseDir!) : options.baseDir
       let dir = try SessionStore.createDir(base: parent, name: folder, title: store.title)
       store.sessionDir = dir
-      adoptPendingDomainPDF(into: dir)
       log("세션 폴더: \(dir.path)")
     }
     store.beginRecording()
@@ -821,7 +793,6 @@ final class ZoomCaptionApp: @unchecked Sendable {
       if store.sessionDir == nil {
         let dir = try SessionStore.createDir(base: options.baseDir, name: nil, title: store.title)
         store.sessionDir = dir
-        adoptPendingDomainPDF(into: dir)
         log("세션 폴더가 없어 새로 만들었습니다: \(dir.lastPathComponent)")
       }
       guard let dir = try SessionStore.save(store) else {

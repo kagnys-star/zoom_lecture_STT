@@ -33,7 +33,6 @@ extension ZoomCaptionApp {
         return .response(.json(["ok": false, "error": "녹음 중에는 새 세션을 만들 수 없습니다."]))
       }
       store.reset(title: "Zoom 수업")
-      stateLock.withLock { pendingDomainPDF = nil }
       return .response(.json(["ok": true, "state": await stateJSON()]))
 
     case ("POST", "/api/pickFolder"):
@@ -47,7 +46,6 @@ extension ZoomCaptionApp {
         if store.sessionDir == nil {
           let dir = try SessionStore.createDir(base: options.baseDir, name: nil, title: store.title)
           store.sessionDir = dir
-          adoptPendingDomainPDF(into: dir)
         }
         let dir = try SessionStore.save(store)
         return .response(.json(["ok": true, "path": dir?.path ?? ""]))

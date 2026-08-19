@@ -135,8 +135,8 @@ enum DomainKnowledge {
   /// 너무 많이 넣으면 인식이 오히려 흔들리므로 상위 빈도만 쓴다.
   static let maxContextualTerms = 150
 
-  static func analyze(pdf url: URL, maxTerms: Int = maxContextualTerms) throws -> Result {
-    guard let doc = PDFDocument(url: url) else { throw DomainError.cannotOpen }
+  static func analyze(pdf data: Data, maxTerms: Int = maxContextualTerms) throws -> Result {
+    guard let doc = PDFDocument(data: data) else { throw DomainError.cannotOpen }
 
     // 페이지별 텍스트가 필요하다. 어느 페이지에 나오는지가 곧 판단 근거다.
     var pageTexts: [String] = []

@@ -1589,6 +1589,19 @@ extension WebUI {
     if (t.dataset.tab === 'cmp') { loadCompare(); loadGold(); loadGoldAll(); }
   });
 
+  // ── 사이드 패널 접기 ──
+  // 자막에 화면을 더 쓰고 싶을 때(예: 발표 화면 공유와 나란히 두기) 쓰라고 만든다.
+  // 상태를 localStorage 에 남겨서, 접어 둔 채 새로고침해도 다시 안 펼쳐진다.
+  const SIDE_KEY = 'zoomcaption.sideCollapsed';
+  function setSideCollapsed(on) {
+    document.body.classList.toggle('side-collapsed', on);
+    $('#sideToggle').textContent = on ? '›' : '‹';
+    $('#sideToggle').title = on ? '사이드 패널 펼치기' : '사이드 패널 접기';
+    localStorage.setItem(SIDE_KEY, on ? '1' : '0');
+  }
+  $('#sideToggle').onclick = () => setSideCollapsed(!document.body.classList.contains('side-collapsed'));
+  setSideCollapsed(localStorage.getItem(SIDE_KEY) === '1');
+
   $('#btnResumeOK').onclick = () => $('#resumeBar').classList.remove('on');
 
   fetch('/api/state').then(r => r.json()).then(s => {

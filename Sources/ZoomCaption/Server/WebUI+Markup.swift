@@ -102,6 +102,8 @@ extension WebUI {
     </div>
   </section>
 
+  <button id="sideToggle" title="사이드 패널 접기" aria-label="사이드 패널 접기">‹</button>
+
   <aside>
     <div class="tabs">
       <div class="tab on" data-tab="sum">요약</div>

@@ -79,8 +79,21 @@ extension WebUI {
   button.danger:hover:not(:disabled) { background: var(--danger-soft); }
   button.sm { font-size: 13px; padding: 5px 10px; }
 
-  main { flex: 1; display: grid; grid-template-columns: minmax(0,1fr) 390px; min-height: 0; }
+  main { flex: 1; display: grid; grid-template-columns: minmax(0,1fr) 22px 390px; min-height: 0; }
   @media (max-width: 940px) { main { grid-template-columns: 1fr; } aside { border-left: none !important; border-top: 1px solid var(--line); } }
+
+  /* 사이드 접기. #sideToggle 은 <aside> 앞에 오는 별도 DOM 요소라 grid 세 번째
+     칸이 아니라 가운데 칸(항상 22px)에 자동으로 앉는다 — 접어도 손잡이는 그대로
+     보여야 다시 펼 수 있다. 상태는 localStorage 에 남겨 새로고침해도 유지한다. */
+  body.side-collapsed main { grid-template-columns: minmax(0,1fr) 22px; }
+  body.side-collapsed aside { display: none; }
+  #sideToggle {
+    display: flex; align-items: center; justify-content: center;
+    background: var(--panel); border: none;
+    border-left: 1px solid var(--line); border-right: 1px solid var(--line); border-radius: 0;
+    color: var(--muted); font-size: 13px; padding: 0; cursor: pointer;
+  }
+  #sideToggle:hover { background: var(--bg); color: var(--ink); }
 
   /* ── 자막 ── */
   section.captions { display: flex; flex-direction: column; min-height: 0; min-width: 0; }

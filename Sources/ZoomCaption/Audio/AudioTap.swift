@@ -73,6 +73,36 @@ enum CoreAudioInfo {
     guard AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &cf) == noErr else { return nil }
     return cf as String?
   }
+
+  /// 기본 출력 장치의 사람이 읽는 이름("AirPods", "MacBook Pro 스피커" 등).
+  /// 장치 전환 알림 문구에 UID 대신 이 이름을 보여준다.
+  static func defaultOutputName() -> String? {
+    var addr = sysAddr(kAudioHardwarePropertyDefaultOutputDevice)
+    var dev = AudioDeviceID(0)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &dev) == noErr
+    else { return nil }
+    addr = sysAddr(kAudioObjectPropertyName)
+    var cf: CFString?
+    size = UInt32(MemoryLayout<CFString?>.size)
+    guard AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &cf) == noErr else { return nil }
+    return cf as String?
+  }
+
+  /// 기본 출력 장치가 바뀔 때마다 `onChange` 를 부른다(이어폰 꽂기/빼기 등).
+  ///
+  /// 녹음 시작·정지마다 구독을 다시 걸 필요 없이 앱 켤 때 한 번만 등록해 두고,
+  /// 녹음 중인지는 콜백을 받는 쪽에서 판단하게 한다 — 하루에 여러 번 시작·정지해도
+  /// 등록/해제를 반복하다 꼬일 일이 없다.
+  ///
+  /// CoreAudio 의 HAL 알림 스레드를 오래 붙잡지 않도록, 콜백은 우리가 지정한
+  /// 전역 큐에서 돌게 한다(`inDispatchQueue`에 nil을 주면 그 내부 스레드에서 바로 실행됨).
+  static func watchDefaultOutputDevice(onChange: @escaping @Sendable () -> Void) {
+    var addr = sysAddr(kAudioHardwarePropertyDefaultOutputDevice)
+    AudioObjectAddPropertyListenerBlock(
+      AudioObjectID(kAudioObjectSystemObject), &addr, DispatchQueue.global()
+    ) { _, _ in onChange() }
+  }
 }
 
 // MARK: - 시스템 오디오 탭
@@ -114,14 +144,35 @@ final class SystemAudioTap: @unchecked Sendable {
   /// 캡처된 샘플이 전부 0인지 감시한다. 권한이 없으면 macOS는 에러 대신 무음을 준다.
   private let silenceLock = NSLock()
   private var _framesSeen: Int = 0
-  private var _nonSilentFrames: Int = 0
+  private var _lastNonSilentAt: Date?
   // 입력 레벨. 정규화(게인 보정)가 필요한지 판단하는 근거로 쓴다.
   private var _peak: Float = 0
   private var _sumSquares: Double = 0
   private var _sampleCount: Int = 0
 
+  /// 무음 판정 기준(초). Whisper 청크 주기(30초)와 맞춰 뒀다 — 나중에 "무음일 때
+  /// Whisper 가 실시간을 따라잡느라 대기만 하고 처리를 안 하는" 문제를 풀 때
+  /// 이 값을 그대로 재사용할 것.
+  static let recentSoundWindow: TimeInterval = 30
+
   var framesSeen: Int { silenceLock.withLock { _framesSeen } }
-  var hasHeardSound: Bool { silenceLock.withLock { _nonSilentFrames > 0 } }
+
+  /// 마지막으로 소리를 들은 뒤 지난 시간(초). 계속 듣고 있으면 0에 가깝고,
+  /// 이번 탭을 시작한 뒤로 한 번도 못 들었으면 nil. 기존엔 "이 탭이 시작된 뒤로
+  /// 평생 한 번이라도 들었는지"만 재는 누적 카운터였는데, 그러면 정상적으로
+  /// 잘 듣다가 중간에(예: 이어폰 전환으로) 죽어도 다시는 안 걸렸다. 지금은 시각
+  /// 하나만 들고 있다가 "지금으로부터 얼마나 지났는지"를 매번 다시 재므로,
+  /// 30초든 강의 쉬는 시간(5~8분, 별도 논의)이든 부르는 쪽이 원하는 기준을
+  /// 각자 적용할 수 있다.
+  var silenceDuration: TimeInterval? {
+    silenceLock.withLock {
+      guard let last = _lastNonSilentAt else { return nil }
+      return Date().timeIntervalSince(last)
+    }
+  }
+
+  /// 최근 recentSoundWindow(30초) 안에 소리를 들었는지.
+  var isHearingSound: Bool { (silenceDuration ?? .infinity) < Self.recentSoundWindow }
 
   /// 지금까지 관측한 최대 진폭 (0~1)
   var peakLevel: Float { silenceLock.withLock { _peak } }
@@ -233,7 +284,7 @@ final class SystemAudioTap: @unchecked Sendable {
     }
     silenceLock.lock()
     _framesSeen += Int(frames)
-    if nonSilent { _nonSilentFrames += Int(frames) }
+    if nonSilent { _lastNonSilentAt = Date() }
     if peak > _peak { _peak = peak }
     _sumSquares += sumSquares
     _sampleCount += counted
@@ -257,7 +308,7 @@ final class SystemAudioTap: @unchecked Sendable {
     aggregateID = AudioObjectID(kAudioObjectUnknown)
     tapID = AudioObjectID(kAudioObjectUnknown)
     silenceLock.withLock {
-      _framesSeen = 0; _nonSilentFrames = 0
+      _framesSeen = 0; _lastNonSilentAt = nil
       _peak = 0; _sumSquares = 0; _sampleCount = 0
     }
   }

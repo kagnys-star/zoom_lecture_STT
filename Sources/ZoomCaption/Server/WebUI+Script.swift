@@ -720,8 +720,16 @@ extension WebUI {
   });
   // 문단이 확정된 줄만 서버가 보낸다(ZoomCaptionApp.ingestWhisperLines 참고) —
   // 그래서 이 줄은 등장할 때 이미 최종 모양이고, 나중에 다시 갱신될 일이 없다.
+  //
+  // 같은 id 가 두 번 오는 경우가 실제로 있다 — resync()(60초 안전망·이벤트 누락
+  // 감지)가 /api/state 스냅샷으로 mergeWhisper 를 돌리는 순간, 마침 같은 줄의
+  // 라이브 이벤트가 SSE 큐에 남아 있다가 뒤이어 도착하면 이 핸들러가 한 번 더
+  // addSegment 를 부른다. mergeWhisper 는 lines.get 으로 이미 걸러 주는데, 여기는
+  // 그 확인이 없어서 stop() 이 finalizeParagraphs 로 한꺼번에 여러 줄을 쏟아낼 때
+  // (=바로 이 경합이 열리는 순간) 화면에 같은 줄이 두 번 그려졌다.
   es.addEventListener('whisperSegment', e => {
     const d = JSON.parse(e.data); if (!seen(d)) return;
+    if (lines.has(d.id)) return;   // 이미 그려진 줄 — 다시 만들지 않는다
     addSegment(d, true);
   });
   es.addEventListener('whisperLive', e => {
@@ -768,14 +776,12 @@ extension WebUI {
     const d = JSON.parse(e.data); if (!seen(d)) return;
     if (typeof d.running === 'boolean') setRunning(d.running);
     if (d.message !== undefined) notice('#cfgNotice', d.level || 'info', d.message ? esc(d.message) : '');
-    // 무음의 원인이 둘인데 대처가 정반대다. 어느 쪽인지 짚어서 말한다.
+    // Zoom 은 소리를 내는데 우리만 못 듣는, 확실한 문제일 때만 뜬다(서버 쪽에서
+    // 이미 걸러서 보낸다) — 그냥 강의자가 조용한 경우는 애초에 이 이벤트 자체가 안 온다.
     if (d.silent) {
-      const others = (d.others || []).join(', ');
-      showSilent(d.zoomPlaying
-        ? '<b>Zoom 소리가 들어오지 않습니다.</b> 권한 문제일 수 있습니다 — 시스템 설정 &gt; ' +
-          '개인정보 보호 및 보안 &gt; <b>화면 및 시스템 오디오 기록</b> 에서 ZoomCaption을 켠 뒤 다시 실행하세요.'
-        : 'Zoom 에서 <b>아무 소리도 나오지 않고 있습니다.</b> 회의에 들어가 있고 발표자가 말하는 중인지 확인해 주세요.' +
-          (others ? `<br>지금 소리를 내는 앱: <b>${esc(others)}</b> — 이 소리는 잡지 않습니다.` : ''));
+      showSilent(`<b>${esc(d.silentMessage || '오디오 입력에 문제가 있습니다.')}</b>`);
+    } else if (d.silent === false) {
+      showSilent('');
     }
   });
   es.addEventListener('summaryProgress', e => {
@@ -820,6 +826,7 @@ extension WebUI {
       return;
     }
     startedAt = Date.now(); setRunning(true); renderSession(r.state);
+    showSilent('');   // 무음 배너가 남아있었다면 재시작으로 문제를 해결했다고 보고 지운다
   };
   // ── 정지 → 마무리 대기 ──
   //
@@ -1603,6 +1610,7 @@ extension WebUI {
   setSideCollapsed(localStorage.getItem(SIDE_KEY) === '1');
 
   $('#btnResumeOK').onclick = () => $('#resumeBar').classList.remove('on');
+  $('#btnSilentOK').onclick = () => showSilent('');
 
   fetch('/api/state').then(r => r.json()).then(s => {
     lastSeq = s.seq || 0; boot = s.boot;

@@ -47,6 +47,21 @@ final class ZoomCaptionApp: @unchecked Sendable {
   /// 실시간 재전사가 안 돌고 있다면 그 이유. 위 칸이 왜 비어 있는지 화면에 그대로 띄운다.
   private var whisperLiveNote: String?
   private var silenceWatchdog: DispatchSourceTimer?
+  /// 무음 감시가 "직전 틱에도 조용했는지" 기억해 두는 용도. 상태가 바뀔 때만
+  /// 로그·알림을 내보내려고 — 20초마다 매번 남기면 강의 쉬는 시간 10분 동안
+  /// 30줄씩 쌓인다. stateLock 이 보호한다.
+  private var wasSilent = false
+  /// 기본 출력 장치가 마지막으로 바뀐 시각·이름(이어폰 꽂기/빼기 등). 무음 감시가
+  /// "왜 조용해졌는지" 문구를 구체적으로 채울 때 참고만 한다 — 이것 자체로는
+  /// 아무것도 알리지 않는다(장치가 바뀌어도 캡처가 안 죽는 경우가 더 흔하다).
+  private var lastDeviceChangeAt: Date?
+  private var lastDeviceChangeName: String?
+  /// 지금 이어지는 무음 구간에서 이미 알렸는지. 무음이 시작되는 바로 그 틱에
+  /// 하필 "온 시스템이 조용함"(playing.isEmpty)이면 그 틱엔 판단 근거가 없어
+  /// 넘어가는데, 이걸 "전환된 틱에만 확인"으로 짜면 몇 틱 뒤 Zoom이 다시 소리를
+  /// 내기 시작해도 다시는 확인을 안 하게 된다. 그래서 "조용한 동안은 매 틱 계속
+  /// 재확인하되, 한 번 알린 뒤로는 반복하지 않는다"로 따로 뗐다.
+  private var silenceNotified = false
 
   let stateLock = NSLock()
   var running = false
@@ -95,7 +110,25 @@ final class ZoomCaptionApp: @unchecked Sendable {
     log("기본 저장 위치: \(options.baseDir.path)")
     if options.openBrowser { NSWorkspace.shared.open(url) }
 
+    startOutputDeviceWatcher()
     Task { await self.prepareModels() }
+  }
+
+  /// 이어폰 꽂기/빼기 등으로 기본 출력 장치가 바뀌는 걸 감지한다. 시작·정지와
+  /// 무관하게 앱이 뜬 동안 딱 한 번만 등록해 둔다 — 녹음 중이 아닐 때 온 이벤트는
+  /// 콜백 안에서 그냥 걸러낸다.
+  ///
+  /// 이것 자체로는 아무것도 알리지 않는다 — 장치가 바뀌어도 캡처가 안 죽는 경우가
+  /// 더 흔해서, 바뀔 때마다 알리면 오탐이 된다. 그냥 "언제, 무엇으로 바뀌었는지"만
+  /// 기억해 뒀다가 `startSilenceWatchdog` 가 진짜 무음을 확인했을 때 문구를
+  /// 구체화하는 데만 쓴다.
+  private func startOutputDeviceWatcher() {
+    CoreAudioInfo.watchDefaultOutputDevice { [weak self] in
+      guard let self, self.stateLock.withLock({ self.running }) else { return }
+      let name = CoreAudioInfo.defaultOutputName() ?? "알 수 없는 장치"
+      self.stateLock.withLock { self.lastDeviceChangeAt = Date(); self.lastDeviceChangeName = name }
+      log("오디오 출력 장치 전환 감지 — 지금 기본 출력: \(name)")
+    }
   }
 
   /// 포트를 잡는다. 이미 쓰이고 있으면 그게 우리 인스턴스인지 확인하고,
@@ -176,7 +209,8 @@ final class ZoomCaptionApp: @unchecked Sendable {
   func diagJSON() -> [String: Any] {
     var json: [String: Any] = [:]
     json["framesSeen"] = tap?.framesSeen ?? 0
-    json["heardSound"] = tap?.hasHeardSound ?? false
+    json["heardSound"] = tap?.isHearingSound ?? false
+    json["silenceSeconds"] = tap?.silenceDuration ?? 0
     json["somethingPlaying"] = CoreAudioInfo.isAnythingPlaying()
     json["sourceFormat"] = tap?.sourceFormat.map { "\($0.sampleRate)Hz ch\($0.channelCount)" } ?? "-"
     json["peak"] = Double(tap?.peakLevel ?? 0)
@@ -207,7 +241,7 @@ final class ZoomCaptionApp: @unchecked Sendable {
   /// 입력 레벨을 보고 정규화(게인 보정)가 필요한 상태인지 한 줄로 알려준다.
   private static func levelAdvice(_ tap: SystemAudioTap?) -> String {
     guard let tap, tap.framesSeen > 0 else { return "아직 오디오가 들어오지 않았습니다." }
-    guard tap.hasHeardSound else { return "무음만 들어옵니다 — 시스템 오디오 권한을 확인하세요." }
+    guard tap.isHearingSound else { return "무음만 들어옵니다 — 시스템 오디오 권한을 확인하세요." }
     let db = tap.peakDBFS
     switch db {
     case ..<(-30): return String(format: "입력이 매우 작습니다 (피크 %.1f dBFS). Zoom·시스템 볼륨을 올리면 인식률이 올라갑니다.", db)
@@ -701,29 +735,72 @@ final class ZoomCaptionApp: @unchecked Sendable {
 
   /// 소리가 하나도 안 들어오는 상태를 알린다.
   ///
-  /// 원인이 둘인데 대처법이 정반대라 반드시 구분해서 말해야 한다.
-  /// ① 권한 없음 — macOS 는 오류 대신 무음을 흘려보낸다. 설정에서 권한을 켜야 한다.
-  /// ② Zoom 이 조용함 — 회의에 안 들어갔거나 발표자가 말을 안 하는 것. 기다리면 된다.
-  ///    이때 다른 앱(브라우저 강의 영상 등)이 소리를 내고 있으면 그건 잡히지 않는다.
+  /// 알리는 조건은 딱 하나다 — **Zoom 은 CoreAudio 상으로 "지금 소리를 낸다"고
+  /// 스스로 보고하는데, 우리 탭은 30초(SystemAudioTap.recentSoundWindow) 넘게
+  /// 아무것도 못 들은 경우.** 이게 권한 문제(macOS 는 에러 대신 무음을 흘려보낸다)나
+  /// 이어폰 전환 등으로 탭이 죽었다는 확실한 신호다. Zoom 자체가 조용한 경우(회의에
+  /// 안 들어갔거나 발표자가 말을 안 하는 것)는 강의자 쪽 사정이지 이 앱의 문제가
+  /// 아니라서 알리지 않는다 — 로그만 남긴다.
+  ///
+  /// 이어폰 전환 자체는 독립적으로 알리지 않는다(장치가 바뀌어도 캡처가 안
+  /// 죽는 경우가 더 흔해서 오탐이 된다) — `lastDeviceChangeAt` 은 위 조건이 실제로
+  /// 걸렸을 때 "왜 그런지" 문구를 구체화하는 재료로만 쓴다.
+  ///
+  /// 20초마다 매번 다시 알리면 강의 쉬는 시간 10분 동안 30번 반복되므로,
+  /// **상태가 바뀔 때(조용해질 때 / 돌아올 때)만** 로그·알림을 낸다.
   private func startSilenceWatchdog() {
+    stateLock.withLock { wasSilent = false; silenceNotified = false }   // 새 녹음 구간은 매번 깨끗한 상태에서 시작
+
     let timer = DispatchSource.makeTimerSource(queue: .global())
     timer.schedule(deadline: .now() + 12, repeating: 20)
     timer.setEventHandler { [weak self] in
-      guard let self, let tap = self.tap else { return }
-      guard tap.framesSeen > 0, !tap.hasHeardSound else { return }
+      guard let self, let tap = self.tap, tap.framesSeen > 0 else { return }
+
+      let silentNow = !tap.isHearingSound
+      let wasSilentBefore = self.stateLock.withLock { () -> Bool in
+        let prev = self.wasSilent
+        self.wasSilent = silentNow
+        return prev
+      }
+
+      guard silentNow else {
+        if wasSilentBefore {   // 방금 회복된 그 틱에서만 한 번
+          log("오디오 입력 복구됨 — 다시 소리가 들어오고 있습니다.")
+          self.live.broadcast(event: "status", payload: ["silent": false])
+          self.stateLock.withLock { self.silenceNotified = false }   // 다음 무음 구간엔 다시 알릴 수 있게
+        }
+        return
+      }
+
+      // 이미 이번 무음 구간에서 알렸으면 반복하지 않는다. 아직이면 조용한 동안
+      // 매 틱(20초마다) 계속 재확인한다 — 무음이 시작된 바로 그 틱에 하필
+      // 시스템 전체가 조용해서(playing.isEmpty) 판단 근거가 없었어도, 몇 틱 뒤
+      // Zoom이 다시 소리를 내기 시작하면 그때 잡아내야 하기 때문이다.
+      guard !(self.stateLock.withLock { self.silenceNotified }) else { return }
 
       // "앱이 떠 있다" 가 아니라 "지금 소리를 내고 있다" 로 판정해야 한다.
       // Zoom 은 회의에 안 들어가 있어도 오디오 프로세스를 들고 있어서, 앱 존재로 재면 늘 참이 된다.
       let playing = CoreAudioInfo.playingBundleIDs()
       let zoomPlaying = playing.contains { SystemAudioTap.zoomBundleIDs.contains($0) }
-      let others = playing.filter { !SystemAudioTap.zoomBundleIDs.contains($0) }
-      guard !playing.isEmpty else { return }   // 온 시스템이 조용하면 알릴 게 없다
+      guard !playing.isEmpty else { return }   // 이번 틱엔 판단 근거가 없다 — 다음 틱에 다시 본다
 
-      self.live.broadcast(event: "status", payload: [
-        "silent": true,
-        "zoomPlaying": zoomPlaying,
-        "others": Array(others.prefix(4)),
-      ])
+      guard zoomPlaying else {
+        if !wasSilentBefore {   // 이번 무음 구간에서 처음 확인한 틱에만 로그
+          logWarn("무음 감지 — Zoom 은 소리를 안 내고 있습니다(회의 미참여·발표자 침묵 등으로 추정) — 알리지 않음.")
+        }
+        return
+      }
+
+      let (changedAt, changedName) = self.stateLock.withLock { (self.lastDeviceChangeAt, self.lastDeviceChangeName) }
+      let recentSwitch = changedAt.map { Date().timeIntervalSince($0) < 60 } == true
+      let message = recentSwitch
+        ? "오디오 출력 장치가 \(changedName ?? "다른 장치")로 바뀐 뒤로 소리가 안 들어오고 있습니다 — 정지 후 다시 시작해 주세요."
+        : "Zoom은 소리를 내고 있는데 이 앱에는 들리지 않습니다 — 시스템 설정 > 화면 및 시스템 오디오 기록 권한을 확인하거나, 정지 후 다시 시작해 보세요."
+      logWarn("무음 감지 — \(message)")
+      self.stateLock.withLock { self.silenceNotified = true }
+      // "message" 는 #cfgNotice 가 이미 쓰는 공용 필드라 겹치면 엉뚱한 자리에도 뜬다.
+      // 그래서 무음 배너 전용 필드를 따로 둔다.
+      self.live.broadcast(event: "status", payload: ["silent": true, "silentMessage": message])
     }
     timer.resume()
     silenceWatchdog = timer

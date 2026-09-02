@@ -59,6 +59,7 @@ extension WebUI {
     </div>
     <div id="silentBar">
       <span class="grow" id="silentText"></span>
+      <button id="btnSilentOK" class="sm">알겠습니다</button>
     </div>
     <div class="toolbar">
       <span class="paneTag main">Whisper</span>

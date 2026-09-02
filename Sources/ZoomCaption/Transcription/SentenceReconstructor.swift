@@ -7,7 +7,8 @@ import Foundation
 ///
 /// 그래서 원문을 그대로 화면에 뿌리지 않고, 마침표(.?!) 기준으로 다시 쪼갠다 — 그래야
 /// `Paragraph`(NLContextualEmbedding) 벡터 하나가 정확히 문장 하나만 대표하게 되고,
-/// 화면에도 문장 단위로 깔끔하게 보인다.
+/// 화면에도 문장 단위로 깔끔하게 보인다. 마침표 없이 쉼표로만 길게 이어 말하는
+/// 화자도 있어서(아래 `commaFallbackCharLimit` 참고), 그럴 땐 쉼표도 보조 경계로 쓴다.
 ///
 /// **줄 하나에 문장이 여러 개 온전히 들어있으면 다음 줄을 기다릴 필요가 없다** — 그
 /// 자리에서 바로 다 쪼개서 즉시 내보낸다. 기다리는 건 딱 "문장이 줄 경계에서 잘린
@@ -37,6 +38,16 @@ final class SentenceReconstructor: @unchecked Sendable {
   /// 잡아서, 정상적인 문장은 절대 여기 안 걸리게 한다.
   private static let forceFlushCharLimit = 400
 
+  /// 마침표를 아직 못 찾았어도, 대기 글자 수가 이걸 넘으면 쉼표를 경계로 받아들인다.
+  ///
+  /// 실측(2026-08-25 라이브 강의): 화자가 5분 가까이 마침표 없이 쉼표로만 쭉 이어
+  /// 말해서, "문장"이 578자·105초짜리 한 덩어리로 뭉쳐 나왔다 — Whisper 쪽 화면이
+  /// 그동안 거의 비어 보이는 사고로 이어졌다(실시간 쪽은 정상, 소리도 정상이었다).
+  /// 정상 문장(20~80자 대)보다는 크게 잡아 마침표로 끝나는 보통 문장엔 전혀 영향이
+  /// 없게 하면서도, forceFlushCharLimit(400) 까지 가서 뭉텅이로 풀리기 전에 쉼표
+  /// 자리에서 한 번은 끊어 화면에 더 자주, 더 작은 단위로 나오게 한다.
+  private static let commaFallbackCharLimit = 150
+
   /// 새 Whisper 줄들이 도착했을 때 부른다. 확정된 문장들을 시간순으로 반환한다 —
   /// 마침표로 안 끝난 꼬리는 내부 버퍼에 남기고 다음 호출(또는 `finalize()`)을 기다린다.
   func reconstruct(_ lines: [WhisperLive.Line]) -> [WhisperLive.Line] {
@@ -48,7 +59,11 @@ final class SentenceReconstructor: @unchecked Sendable {
         var piece = Piece(start: line.start, end: line.end, text: line.text)
         while true {
           guard !piece.text.isEmpty else { break }
-          guard let markIndex = piece.text.firstIndex(where: { $0 == "." || $0 == "?" || $0 == "!" }) else {
+          let pendingLen = pending.reduce(0) { $0 + $1.text.count }
+          let acceptComma = pendingLen + piece.text.count > Self.commaFallbackCharLimit
+          guard let markIndex = piece.text.firstIndex(where: {
+            $0 == "." || $0 == "?" || $0 == "!" || (acceptComma && $0 == ",")
+          }) else {
             pending.append(piece)
             break
           }

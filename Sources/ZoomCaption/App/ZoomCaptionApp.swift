@@ -552,9 +552,9 @@ final class ZoomCaptionApp: @unchecked Sendable {
 
   /// 재구성된 Whisper 문장을 저장하고, 문단을 갱신하고, 화면에 알린다.
   /// `onLines` 콜백과 `stop()`의 마지막 꼬리 처리가 이 로직을 그대로 같이 쓴다.
-  private func ingestWhisperLines(_ lines: [WhisperLive.Line]) {
+  private func ingestWhisperLines(_ lines: [WhisperLive.Line], rawTokens: [Whisper.Token] = []) {
     guard !lines.isEmpty else { return }
-    let added = store.appendWhisper(lines)
+    let added = store.appendWhisper(lines, rawTokens: rawTokens)
     for seg in added {
       // 그 시각에 실제로 소리가 있었는지 대조한다. 지우지 않고 알리기만 한다 —
       // 아직 근거가 환각 6건뿐이라, 오탐이 없는지 확인하는 단계다.
@@ -667,8 +667,10 @@ final class ZoomCaptionApp: @unchecked Sendable {
             onLines: { [weak self] lines in
               guard let self else { return }
               // Whisper 청크가 끊어 준 줄을 그대로 쓰지 않고, 마침표 기준 문장으로
-              // 다시 짜 맞춘 뒤에 저장한다(SentenceReconstructor 헤더 참고).
-              self.ingestWhisperLines(reconstructor.reconstruct(lines))
+              // 다시 짜 맞춘 뒤에 저장한다(SentenceReconstructor 헤더 참고). 토큰
+              // (확신도)은 재구성 전 원본 줄에만 있으므로 따로 모아 같이 넘긴다.
+              self.ingestWhisperLines(reconstructor.reconstruct(lines),
+                                      rawTokens: lines.flatMap(\.tokens))
             },
             onProgress: { [weak self] done, total in
               self?.live.broadcast(event: "whisperLive",

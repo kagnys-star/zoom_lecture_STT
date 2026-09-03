@@ -21,6 +21,30 @@ struct WordTime: Codable, Sendable, Equatable {
   var end: Double
 }
 
+/// Whisper 토큰 하나의 확신도 표시. 전부가 아니라 확률이 낮은 것만 골라 담는다 —
+/// 교안 용어와 대조할 후보를 고르는 용도라, 나머지(대다수)는 저장할 값어치가 없다.
+///
+/// WordTime 과 같은 이유로 오프셋+길이를 쓴다 — 텍스트를 중복 저장하지 않고
+/// `Segment.text` 안의 위치만 가리킨다.
+///
+/// start/end 정정 2번째(2026-09-03): DTW 유무는 무관하다는 확인은 여전히 맞다
+/// (45초 전체, 모든 토큰 offsets 가 DTW on/off 무관하게 동일). 근데 그날 이후
+/// 별개의 진짜 문제를 하나 더 찾았다 — VAD 를 켜면(기본값) 세그먼트 경계는
+/// 원래 시간으로 되돌려 주는데, **토큰 하나하나의 offsets 는 무음을 잘라 이어
+/// 붙인 내부 시간축 값 그대로 나온다.** Whisper.parseTokens 에서 세그먼트 시작
+/// 기준으로 보정하도록 고쳤다(그 함수 주석 참고) — 그 보정을 거친 값이 지금
+/// 여기 들어온다. offset/length(글자 위치)는 텍스트 매칭이라 이 문제와 무관하게
+/// 원래부터 정상이었다.
+struct TokenFlag: Codable, Sendable, Equatable {
+  var offset: Int        // Segment.text 안에서의 글자 위치 — 낱말 전체 길이만큼
+  var length: Int
+  /// 이 낱말을 이룬 whisper 서브워드 토큰들 중 **최솟값**(가장 낮은 확률).
+  /// 왜 최솟값인지는 Store.groupWords 주석 참고.
+  var p: Double
+  var start: Double?
+  var end: Double?
+}
+
 struct Segment: Codable, Sendable, Identifiable {
   var id: Int
   var track: Track
@@ -36,6 +60,10 @@ struct Segment: Codable, Sendable, Identifiable {
   /// 최근 줄(문맥이 덜 쌓인 꼬리)은 nil — 그 줄은 화면에서 원래대로 따로 보인다.
   /// 마찬가지로 반드시 Optional 이어야 한다 — words 와 같은 이유.
   var paragraph: Int?
+  /// 확신도 낮은 토큰(Whisper 줄에만 있다). words/paragraph 와 같은 이유로 Optional.
+  /// `edited == true` 인 세그먼트는 원문이 바뀌었을 수 있으니 이 값을 신뢰하지 않는다
+  /// (오프셋이 지금 text 를 가리키는지 쓰기 전에 반드시 확인 — applyCorrection 참고).
+  var flags: [TokenFlag]?
 }
 
 /// 디스크에 저장되는 세션 원본. .md/.srt 는 이걸로부터 파생된다.
@@ -379,17 +407,82 @@ final class TranscriptStore: @unchecked Sendable {
 
   // MARK: - Whisper 재전사
 
+  /// 확률이 이보다 낮은 토큰만 flags 후보로 본다. 아직 실측 튜닝 전 자리표시자다 —
+  /// 정상 인식인데도 흔한 단어(그/뭐/없어요 등)가 p 0.03~0.4 로 나오는 걸 실측했으므로
+  /// (2026-09-03), 이 값 하나로 오인식을 가려낼 수 있다고 보면 안 된다. 교안 용어
+  /// 발음 유사도 등 다른 신호와 같이 써야 오탐이 줄어든다 — 그 전까지는 낮게 잡아
+  /// 가장 의심스러운 자리만 후보로 남긴다.
+  private static let lowConfidenceThreshold = 0.15
+
+  // 기록(2026-09-03, 아직 미반영): VAD 를 켜면 whisper 가 무음 구간을 잘라내고
+  // 남은 조각들을 이어붙여서 인코더에 넣는다(--vad, AudioArchive 의 VADBoundary
+  // 와는 다른 층위 — 이건 whisper.cpp 자체 내부 VAD). 그 이음매 자리(원래 안
+  // 붙어 있던 두 소리가 갑자기 이어지는 지점)에 걸린 낱말은 실측에서 확률이
+  // 낮게 나오는 경향이 보였다(9개 중 2개가 VAD 구간 시작 0.1초 이내). 즉 낮은
+  // 확률이 "잘못 들음"이 아니라 "이음매 아티팩트"일 수도 있다는 뜻 — 지금은
+  // 이 구분을 못 한다(VAD 구간 경계 정보를 안 들고 있음). 나중에 flags 오탐을
+  // 줄일 때 후보로 고려할 것.
+
+  /// whisper 토큰(서브워드)을 낱말(어절) 단위로 묶는다 — `startsWord` 가 참인
+  /// 토큰에서 새 낱말을 시작하고, 거짓인 토큰은 직전 낱말에 이어 붙인다.
+  ///
+  /// 확률은 **최솟값**으로 묶는다. 실측(2026-09-03, "남궁도" 예시 — 남 0.39,
+  /// 궁 0.14, 도 0.78)해 보니 평균(0.44)도 길이가중평균(0.33)도 기하평균(0.35)도
+  /// 다 문턱값(0.15)을 못 넘겨 이 낱말을 놓쳤다 — 세 토큰 중 둘이 멀쩡해서
+  /// 나머지 하나(궁)의 낮은 확률을 희석시켰기 때문이다. 최솟값만 그 하나를 그대로
+  /// 보존한다. "낱말 하나가 의심스러우려면 그 안의 어느 한 조각만 의심스러우면
+  /// 충분하다"는 이 기능의 목적에는 평균류보다 최솟값이 맞다.
+  private func groupWords(_ tokens: [Whisper.Token]) -> [(text: String, p: Double, start: Double, end: Double)] {
+    var words: [(text: String, p: Double, start: Double, end: Double)] = []
+    for tok in tokens {
+      if tok.startsWord || words.isEmpty {
+        words.append((text: tok.text, p: tok.p, start: tok.start, end: tok.end))
+      } else {
+        let i = words.count - 1
+        words[i].text += tok.text
+        words[i].p = min(words[i].p, tok.p)
+        words[i].end = tok.end
+      }
+    }
+    return words
+  }
+
+  /// 확률 낮은 낱말 중, 이 문장의 최종 텍스트 안에서 실제로 찾아지는 것만
+  /// TokenFlag 로 만든다. SentenceReconstructor 가 줄을 잘라 붙이며 공백을 살짝
+  /// 바꿀 수 있어 못 찾는 낱말이 가끔 생기는데, 그건 조용히 버린다 — 있으면 좋고
+  /// 없어도 되는 부품이라는 이 코드베이스의 원칙(VAD, 무음판정과 같다)을 따른다.
+  private func computeFlags(text: String, tokens: [Whisper.Token]) -> [TokenFlag] {
+    var flags: [TokenFlag] = []
+    var searchFrom = text.startIndex
+    for word in groupWords(tokens) where word.p < Self.lowConfidenceThreshold {
+      guard searchFrom < text.endIndex,
+            let range = text.range(of: word.text, range: searchFrom..<text.endIndex)
+      else { continue }
+      let offset = text.distance(from: text.startIndex, to: range.lowerBound)
+      let length = text.distance(from: range.lowerBound, to: range.upperBound)
+      flags.append(TokenFlag(offset: offset, length: length, p: word.p,
+                             start: word.start, end: word.end))
+      searchFrom = range.upperBound   // 같은 낱말이 여러 번 나와도 순서대로 매칭
+    }
+    return flags
+  }
+
   /// 녹음 중 Whisper 가 조각을 끝낼 때마다 붙인다. 시간순을 유지한다.
+  /// `rawTokens` 는 이 lines 를 만든 원본 whisper 줄들의 토큰(확신도) — 문장
+  /// 재구성 전 시각 기준이라, 각 문장의 [start,end) 안에 시작하는 것만 그 문장 몫이다.
   @discardableResult
-  func appendWhisper(_ lines: [WhisperLive.Line]) -> [Segment] {
+  func appendWhisper(_ lines: [WhisperLive.Line], rawTokens: [Whisper.Token] = []) -> [Segment] {
     guard !lines.isEmpty else { return [] }
     return lock.withLock {
       var added: [Segment] = []
       for line in lines {
         let text = line.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, text.rangeOfCharacter(from: .alphanumerics) != nil else { continue }
+        let candidates = rawTokens.filter { $0.start >= line.start && $0.start < line.end }
+        let flags = computeFlags(text: text, tokens: candidates)
         let seg = Segment(id: nextWhisperID, track: .lecture,
-                          start: line.start, end: line.end, text: text)
+                          start: line.start, end: line.end, text: text,
+                          flags: flags.isEmpty ? nil : flags)
         nextWhisperID += 1
         whisperSegments.append(seg)
         added.append(seg)

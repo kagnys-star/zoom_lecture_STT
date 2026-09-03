@@ -112,6 +112,25 @@ enum Whisper {
     var start: Double
     var end: Double
     var text: String
+    /// 이 줄을 이룬 whisper 토큰들(원 순서대로). 확신도 낮은 곳을 나중에
+    /// 골라내는 데 쓴다 — 문장 재구성(SentenceReconstructor)은 이걸 안 쓰고
+    /// 텍스트만 보므로, 기본값을 둬서 그쪽 생성자엔 영향이 없게 한다.
+    var tokens: [Token] = []
+  }
+
+  /// whisper 토큰 하나 — 확률(p)이 낮을수록 모델이 자신 없어 한 자리다.
+  /// (실측 2026-09-03: 정상 인식인데도 흔한 단어는 p 가 0.03~0.4 로 낮게
+  /// 나오기도 한다 — 이 값 하나만으로 오인식을 단정하면 안 된다.)
+  struct Token: Sendable, Equatable {
+    var text: String
+    var start: Double
+    var end: Double
+    var p: Double
+    /// 이 토큰이 새 낱말(어절)의 시작인가. whisper 토큰은 낱말이 시작할 때만
+    /// 텍스트 앞에 공백을 붙여 준다("남"/"궁"/"도" 세 토큰이 "남궁도" 한
+    /// 낱말이면 "남"만 참) — 트리밍하기 전에 검사해야 한다(트리밍하면 이 신호가
+    /// 사라진다). 여러 토큰을 낱말 단위로 묶을 때 경계로 쓴다(Store.computeFlags).
+    var startsWord: Bool
   }
 
   /// WAV 하나를 통째로 다시 전사한다.
@@ -131,7 +150,7 @@ enum Whisper {
       "-m", model.path,
       "-f", wav.path,
       "-l", locale,
-      "-oj", "-of", stem.path,
+      "-ojf", "-of", stem.path,                      // -ojf: 토큰별 확률(p)까지 JSON 에 포함
       "-pp",                                        // 진행률을 stderr 로 흘린다
       "-t", String(min(8, ProcessInfo.processInfo.activeProcessorCount)),
     ]
@@ -221,7 +240,43 @@ enum Whisper {
       let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
       // 무음 구간에서 Whisper 가 흘리는 상투어를 버린다.
       guard !text.isEmpty, text.rangeOfCharacter(from: .alphanumerics) != nil else { return nil }
-      return Line(start: from / 1000, end: to / 1000, text: text)
+      let tokens = parseTokens(item["tokens"] as? [[String: Any]] ?? [], segmentFromMs: from)
+      return Line(start: from / 1000, end: to / 1000, text: text, tokens: tokens)
+    }
+  }
+
+  /// `-ojf` 가 세그먼트마다 붙여 주는 토큰 목록을 읽는다. `[_BEG_]`, `[_TT_380]` 같은
+  /// 특수 토큰(실제 발화가 아니라 디코더 내부 표식)은 뺀다.
+  ///
+  /// **VAD 시간축 보정(실측 2026-09-03).** VAD 를 켜면(기본값) whisper 가 무음을
+  /// 잘라 이어붙인 내부 시간축으로 디코딩한다. 세그먼트 경계(위 `parse` 의
+  /// `offsets.from/to`)는 원래 시간으로 되돌려 주지만, **토큰 하나하나의 offsets 는
+  /// 그 되돌리기를 안 거친 값 그대로 나온다** — VAD 끄고 같은 오디오를 다시 돌려
+  /// "세그먼트 시작 == 그 세그먼트의 첫 토큰 offsets.from" 이 되는 것으로 확인했다
+  /// (VAD 있으면 어긋나고, 뒤로 갈수록 더 벌어진다 — 누적된 무음만큼). 한 세그먼트
+  /// 안에서는 이 어긋난 정도가 거의 일정하므로("세그먼트의 진짜 시작" −
+  /// "그 세그먼트 원시 토큰의 첫 offsets.from")를 보정값으로 구해 모든 토큰에 같이
+  /// 더한다.
+  private static func parseTokens(_ raw: [[String: Any]], segmentFromMs: Double) -> [Token] {
+    guard let firstRawFrom = raw.first.flatMap({ t -> Double? in
+      (t["offsets"] as? [String: Any]).flatMap { o in
+        o["from"] as? Double ?? (o["from"] as? Int).map(Double.init)
+      }
+    }) else { return [] }
+    let correction = segmentFromMs - firstRawFrom
+
+    return raw.compactMap { t -> Token? in
+      guard let text = t["text"] as? String, !text.hasPrefix("[_"),
+            let offsets = t["offsets"] as? [String: Any],
+            let from = offsets["from"] as? Double ?? (offsets["from"] as? Int).map(Double.init),
+            let to = offsets["to"] as? Double ?? (offsets["to"] as? Int).map(Double.init),
+            let p = t["p"] as? Double
+      else { return nil }
+      let startsWord = text.hasPrefix(" ")   // 트리밍 전에 검사 — 공백이 낱말 경계 신호다
+      let trimmed = text.trimmingCharacters(in: .whitespaces)
+      guard !trimmed.isEmpty else { return nil }
+      return Token(text: trimmed, start: (from + correction) / 1000, end: (to + correction) / 1000,
+                  p: p, startsWord: startsWord)
     }
   }
 }

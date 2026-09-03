@@ -18,6 +18,10 @@ final class WhisperLive: @unchecked Sendable {
     var start: Double
     var end: Double
     var text: String
+    /// 세션 절대시각으로 옮긴 토큰들. SentenceReconstructor 는 이걸 안 읽는다
+    /// (텍스트만 보고 문장을 다시 짜므로) — ingestWhisperLines 가 원본 줄에서
+    /// 따로 모아 확신도 표시(Segment.flags)를 만드는 데만 쓴다.
+    var tokens: [Whisper.Token] = []
   }
 
   private let prompt: String
@@ -69,9 +73,14 @@ final class WhisperLive: @unchecked Sendable {
       if let lines, !lines.isEmpty {
         // 조각 경계가 이제 VAD 로 찾은 쉬는 지점이라(AudioArchive 참고) 문장이 안 걸린다.
         // 그래서 예전처럼 겹침 구간에서 나온 걸 걸러낼 필요가 없다 — 조각 안의 시각을
-        // 세션 타임라인으로 옮기기만 하면 된다.
-        onLines(lines.map { Line(start: $0.start + job.start,
-                                 end: $0.end + job.start, text: $0.text) })
+        // 세션 타임라인으로 옮기기만 하면 된다. 토큰의 시각도 같은 기준으로 옮긴다.
+        onLines(lines.map { line in
+          Line(start: line.start + job.start, end: line.end + job.start, text: line.text,
+               tokens: line.tokens.map {
+                 Whisper.Token(text: $0.text, start: $0.start + job.start,
+                              end: $0.end + job.start, p: $0.p, startsWord: $0.startsWord)
+               })
+        })
       }
 
       let snapshot: (Int, Int) = lock.withLock { _done += 1; return (_done, _queued) }

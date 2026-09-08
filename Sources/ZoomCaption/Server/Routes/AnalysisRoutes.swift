@@ -158,7 +158,7 @@ extension ZoomCaptionApp {
 
     case ("GET", "/api/gold/all"):
       // 수업이 쌓일수록 이 숫자가 믿을 만해진다.
-      let all = GoldScore.collectAll(baseDir: options.baseDir)
+      let all = GoldScore.collectAll(baseDir: effectiveBaseDir)
       let flat = all.flatMap(\.samples)
       return .response(.json([
         "sessions": all.map { ["name": $0.session, "count": $0.samples.count] },

@@ -38,7 +38,7 @@ extension ZoomCaptionApp {
       }
       let r = req.json(SaveSummaryRequest.self)
       let dir = (r?.dir?.isEmpty == false) ? URL(fileURLWithPath: r!.dir!)
-                                           : (store.sessionDir ?? options.baseDir)
+                                           : (store.sessionDir ?? effectiveBaseDir)
       var name = SessionStore.sanitize(r?.filename ?? "")
       if name.isEmpty || name == "수업" { name = "\(SessionStore.sanitize(store.title))_요약" }
       if !name.lowercased().hasSuffix(".md") { name += ".md" }

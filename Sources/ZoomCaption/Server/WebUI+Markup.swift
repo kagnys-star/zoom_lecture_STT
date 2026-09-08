@@ -250,6 +250,9 @@ extension WebUI {
       <div class="field">
         <label>저장된 수업 — 눌러서 이어 적기</label>
         <div id="sessionList"><div class="hint">아직 저장된 수업이 없습니다.</div></div>
+        <div class="row" style="margin-top:9px">
+          <button id="btnOpenElsewhere" class="sm" style="flex:0 0 auto">다른 위치에서 열기…</button>
+        </div>
       </div>
     </div>
 

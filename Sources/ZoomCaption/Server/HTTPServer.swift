@@ -1,6 +1,42 @@
 import Foundation
 import Network
 
+private enum HTTPServerStartError: LocalizedError {
+  case timedOut(UInt16)
+  case cancelled(UInt16)
+
+  var errorDescription: String? {
+    switch self {
+    case .timedOut(let port): return "포트 \(port) 서버 준비가 시간 안에 끝나지 않았습니다."
+    case .cancelled(let port): return "포트 \(port) 서버가 준비되기 전에 취소되었습니다."
+    }
+  }
+}
+
+/// NWListener 의 바인드 결과는 start() 호출이 아니라 stateUpdateHandler 로 비동기 전달된다.
+/// 시작 호출자에게 그 결과를 한 번만 돌려주기 위한 작은 동기화 상자다.
+private final class ListenerStartup: @unchecked Sendable {
+  private let lock = NSLock()
+  private let semaphore = DispatchSemaphore(value: 0)
+  private var result: Result<Void, Error>?
+
+  func resolve(_ value: Result<Void, Error>) {
+    let shouldSignal = lock.withLock { () -> Bool in
+      guard result == nil else { return false }
+      result = value
+      return true
+    }
+    if shouldSignal { semaphore.signal() }
+  }
+
+  func wait(seconds: Double, port: UInt16) -> Result<Void, Error> {
+    guard semaphore.wait(timeout: .now() + seconds) == .success else {
+      return .failure(HTTPServerStartError.timedOut(port))
+    }
+    return lock.withLock { result ?? .failure(HTTPServerStartError.cancelled(port)) }
+  }
+}
+
 struct HTTPRequest {
   var method: String
   var path: String
@@ -71,8 +107,38 @@ final class HTTPServer: @unchecked Sendable {
     params.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: port)
 
     let l = try NWListener(using: params)
+    let startup = ListenerStartup()
+    let portValue = port.rawValue
     l.newConnectionHandler = { [weak self] conn in self?.accept(conn) }
+    l.stateUpdateHandler = { state in
+      switch state {
+      case .ready:
+        startup.resolve(.success(()))
+      case .failed(let error):
+        startup.resolve(.failure(error))
+      case .cancelled:
+        startup.resolve(.failure(HTTPServerStartError.cancelled(portValue)))
+      default:
+        break
+      }
+    }
     l.start(queue: queue)
+
+    // 주소 사용 중 같은 실제 바인드 실패는 start()가 throw하지 않고 위 상태 콜백으로
+    // 온다. ready를 확인한 뒤에만 bindServer()에 성공을 돌려줘야 다음 포트 재시도와
+    // 중복 인스턴스 감지가 제대로 작동한다.
+    switch startup.wait(seconds: 3, port: port.rawValue) {
+    case .success:
+      break
+    case .failure(let error):
+      l.cancel()
+      throw error
+    }
+    l.stateUpdateHandler = { state in
+      if case .failed(let error) = state {
+        logError("웹 서버가 실행 중 실패했습니다: \(error.localizedDescription)")
+      }
+    }
     listener = l
 
     let timer = DispatchSource.makeTimerSource(queue: queue)

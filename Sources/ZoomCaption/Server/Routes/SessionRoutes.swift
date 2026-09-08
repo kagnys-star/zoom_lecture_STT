@@ -9,7 +9,7 @@ extension ZoomCaptionApp {
     switch (req.method, req.path) {
     // ── 세션 ──
     case ("GET", "/api/sessions"):
-      return .response(.json(["sessions": SessionStore.list(base: options.baseDir)]))
+      return .response(.json(["sessions": SessionStore.list(base: effectiveBaseDir, limit: 5)]))
 
     case ("POST", "/api/session/open"):
       guard let path = req.json(OpenRequest.self)?.path, !path.isEmpty else {
@@ -35,18 +35,44 @@ extension ZoomCaptionApp {
       store.reset(title: "Zoom 수업")
       return .response(.json(["ok": true, "state": await stateJSON()]))
 
+    case ("POST", "/api/session/delete"):
+      guard let path = req.json(OpenRequest.self)?.path, !path.isEmpty else {
+        return .response(.json(["ok": false, "error": "경로가 없습니다."]))
+      }
+      if stateLock.withLock({ running }) {
+        return .response(.json(["ok": false, "error": "녹음 중에는 지울 수 없습니다."]))
+      }
+      if path == store.sessionDir?.path {
+        return .response(.json(["ok": false, "error": "지금 열려 있는 세션은 지울 수 없습니다. 다른 세션으로 전환한 뒤 지워 주세요."]))
+      }
+      let dir = URL(fileURLWithPath: path)
+      guard FileManager.default.fileExists(atPath: dir.appendingPathComponent(SessionStore.jsonName).path) else {
+        return .response(.json(["ok": false, "error": "세션 폴더가 아닙니다."]))
+      }
+      do {
+        // 완전 삭제(removeItem) 대신 휴지통 — 원본 강의 음성이 같이 들어있어 복구 가능한 쪽을 쓴다.
+        try FileManager.default.trashItem(at: dir, resultingItemURL: nil)
+        return .response(.json(["ok": true]))
+      } catch {
+        return .response(.json(["ok": false, "error": error.localizedDescription]))
+      }
+
     case ("POST", "/api/pickFolder"):
       // osascript 를 띄우고 사용자가 고를 때까지 기다린다. 메인 스레드를 막지 않도록 분리 실행.
-      let start = store.sessionDir?.deletingLastPathComponent() ?? options.baseDir
+      let start = store.sessionDir?.deletingLastPathComponent() ?? effectiveBaseDir
       let picked = await Task.detached { SessionStore.pickFolder(startingAt: start) }.value
       return .response(.json(["ok": picked != nil, "path": picked ?? ""]))
 
+    case ("POST", "/api/settings/storageLocation"):
+      guard let path = req.json(OpenRequest.self)?.path, !path.isEmpty else {
+        return .response(.json(["ok": false, "error": "경로가 없습니다."]))
+      }
+      StorageLocation.current = URL(fileURLWithPath: path)
+      return .response(.json(["ok": true]))
+
     case ("POST", "/api/save"):
       do {
-        if store.sessionDir == nil {
-          let dir = try SessionStore.createDir(base: options.baseDir, name: nil, title: store.title)
-          store.sessionDir = dir
-        }
+        try ensureSessionDir()
         let dir = try SessionStore.save(store)
         return .response(.json(["ok": true, "path": dir?.path ?? ""]))
       } catch {
@@ -61,7 +87,8 @@ extension ZoomCaptionApp {
       // 그대로 통과했다. 그러면 오디오 아카이브도 Whisper 워커도 두 벌이 돌고
       // 세션 폴더는 나중 것으로 덮여, 먼저 것은 아무도 안 보는 폴더에 계속 쓴다.
       let claimed = stateLock.withLock { () -> Bool in
-        if running { return false }
+        if running || starting || stopping { return false }
+        starting = true
         running = true
         return true
       }
@@ -77,10 +104,11 @@ extension ZoomCaptionApp {
                         folder: r.folder,
                         baseDir: r.baseDir,
                         keepAudio: r.keepAudio ?? true)
+        stateLock.withLock { starting = false }
         return .response(.json(["ok": true, "state": await stateJSON()]))
       } catch {
         // 잡아둔 자리를 반드시 놓아준다. 안 그러면 다시는 시작할 수 없다.
-        stateLock.withLock { running = false }
+        stateLock.withLock { running = false; starting = false }
         live.broadcast(event: "status", payload: ["running": false])
         logError("녹음 시작 실패: \(error)")
         return .response(.json(["ok": false, "error": error.localizedDescription]))

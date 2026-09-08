@@ -114,11 +114,22 @@ extension ZoomCaptionApp {
       }
       // 녹음이 안 돌고 있으면 먼저 켠다 — 되먹임만으로는 전사기가 서 있지 않다.
       if !stateLock.withLock({ running }) {
-        stateLock.withLock { running = true; adminFeedPending = true }
+        let claimed = stateLock.withLock { () -> Bool in
+          guard !running, !starting, !stopping else { return false }
+          running = true
+          starting = true
+          adminFeedPending = true
+          return true
+        }
+        guard claimed else {
+          return .response(.json(["ok": false, "error": "녹음 상태가 바뀌는 중입니다. 잠시 뒤 다시 시도하세요."]))
+        }
         do { try await start(title: r.title ?? "관리자 시험", terms: [],
-                             folder: nil, baseDir: nil, keepAudio: true) }
+                             folder: nil, baseDir: nil, keepAudio: true)
+          stateLock.withLock { starting = false }
+        }
         catch {
-          stateLock.withLock { running = false; adminFeedPending = false }
+          stateLock.withLock { running = false; starting = false; adminFeedPending = false }
           return .response(.json(["ok": false,
             "error": "시작하지 못했습니다: \(error.localizedDescription)"]))
         }

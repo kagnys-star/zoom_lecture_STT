@@ -481,7 +481,7 @@ extension WebUI {
 
   function renderSession(s) {
     state = s;
-    if (!$('#baseDir').value) $('#baseDir').placeholder = s.baseDir || '기본 위치';
+    $('#baseDir').value = s.storageLocation || '';
     if (s.sessionName) {
       $('#sessionChip').style.display = ''; $('#sessionChip').textContent = '📁 ' + s.sessionName;
       $('#curName').textContent = s.sessionName;
@@ -522,12 +522,19 @@ extension WebUI {
       const when = new Date(s.updatedAt).toLocaleString('ko-KR', { month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit' });
       return `<div class="card"><div class="meta"><div class="name">${esc(s.title)}</div>` +
              `<div class="sub">${s.segments}줄 · ${clock(s.duration)} · ${when}${s.hasSummary ? ' · 요약 있음' : ''}</div></div>` +
-             `<button class="sm" data-open="${esc(s.path)}">이어 적기</button></div>`;
+             `<button class="sm" data-open="${esc(s.path)}">이어 적기</button>` +
+             `<button class="sm danger" data-del="${esc(s.path)}">삭제</button></div>`;
     }).join('');
     $('#sessionList').querySelectorAll('[data-open]').forEach(b => b.onclick = async () => {
       const r = await post('/api/session/open', { path: b.dataset.open });
       if (!r.ok) { notice('#sesNotice', 'warn', esc(r.error)); return; }
       reloadAll(r.state);
+    });
+    $('#sessionList').querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
+      if (!confirm('이 수업 기록을 지울까요? 휴지통으로 이동합니다.')) return;
+      const r = await post('/api/session/delete', { path: b.dataset.del });
+      if (!r.ok) { notice('#sesNotice', 'warn', esc(r.error)); return; }
+      loadSessions();
     });
   }
 
@@ -1018,11 +1025,23 @@ extension WebUI {
     notice('#sesNotice', r.ok ? 'info' : 'warn', r.ok ? '저장했습니다.' : esc(r.error));
     if (r.ok) { loadSessions(); fetch('/api/state').then(x => x.json()).then(renderSession); }
   };
+  $('#btnOpenElsewhere').onclick = async () => {
+    $('#btnOpenElsewhere').disabled = true;
+    const picked = await post('/api/pickFolder');
+    $('#btnOpenElsewhere').disabled = false;
+    if (!picked.ok || !picked.path) return;          // 취소 — 조용히 무시 (#btnPick과 동일)
+    const r = await post('/api/session/open', { path: picked.path });
+    if (!r.ok) { notice('#sesNotice', 'warn', esc(r.error)); return; }
+    reloadAll(r.state);
+  };
   $('#btnPick').onclick = async () => {
     $('#btnPick').disabled = true;
     const r = await post('/api/pickFolder');
     $('#btnPick').disabled = false;
-    if (r.ok && r.path) $('#baseDir').value = r.path;
+    if (r.ok && r.path) {
+      $('#baseDir').value = r.path;
+      await post('/api/settings/storageLocation', { path: r.path });
+    }
   };
 
   // 교안 업로드

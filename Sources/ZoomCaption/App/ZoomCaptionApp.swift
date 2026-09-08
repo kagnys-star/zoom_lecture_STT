@@ -65,6 +65,10 @@ final class ZoomCaptionApp: @unchecked Sendable {
 
   let stateLock = NSLock()
   var running = false
+  /// start()가 모델·오디오 장치를 준비하는 동안. stop()은 이 단계가 끝난 뒤 정리한다.
+  var starting = false
+  /// 오디오와 Whisper를 닫고 디스크에 저장하는 동안. 새 시작·세션 전환을 막는다.
+  var stopping = false
   private var resolvedLocale: Locale?
   private var analyzerFormat: AVAudioFormat?
   private var userTerms: [String] = []
@@ -76,7 +80,7 @@ final class ZoomCaptionApp: @unchecked Sendable {
 
   func boot() throws {
     logEnvironment()
-    try? FileManager.default.createDirectory(at: options.baseDir, withIntermediateDirectories: true)
+    try? FileManager.default.createDirectory(at: effectiveBaseDir, withIntermediateDirectories: true)
 
     store.onChange = { [weak self] event in
       guard let self else { return }
@@ -107,7 +111,7 @@ final class ZoomCaptionApp: @unchecked Sendable {
     let url = URL(string: "http://127.0.0.1:\(port)/")!
     webURL = url
     log("웹 UI: \(url.absoluteString)")
-    log("기본 저장 위치: \(options.baseDir.path)")
+    log("기본 저장 위치: \(effectiveBaseDir.path)")
     if options.openBrowser { NSWorkspace.shared.open(url) }
 
     startOutputDeviceWatcher()
@@ -513,6 +517,7 @@ final class ZoomCaptionApp: @unchecked Sendable {
       "segments": segs,
       "whisperSegments": whisper,
       "baseDir": options.baseDir.path,
+      "storageLocation": effectiveBaseDir.path,
       "sessionDir": store.sessionDir?.path ?? "",
       "sessionName": store.sessionDir?.lastPathComponent ?? "",
       "elapsed": store.elapsed,
@@ -604,6 +609,22 @@ final class ZoomCaptionApp: @unchecked Sendable {
 
   // MARK: - 세션 제어
 
+  /// 지금 이 순간 "기본 저장 위치"가 어디인지 — 관리자 모드면 --dir, 아니면 영구 설정.
+  var effectiveBaseDir: URL { options.admin ? options.baseDir : StorageLocation.current }
+
+  /// 세션 폴더가 없으면 만들어서 store 에 반영한다. 있으면 그대로 돌려준다.
+  /// created 를 같이 돌려주는 이유: 호출부마다 "새로 만들었을 때만" 로그를 남기던
+  /// 기존 동작을 유지해야 하기 때문 — 무조건 로그를 찍으면 이어 적기 때도 매번
+  /// "세션 폴더: ..." 가 찍혀서 나중에 문제 추적할 때 오히려 헷갈린다.
+  @discardableResult
+  func ensureSessionDir(override: String? = nil, folder: String? = nil) throws -> (url: URL, created: Bool) {
+    if let dir = store.sessionDir { return (dir, false) }
+    let parent = (override?.isEmpty == false) ? URL(fileURLWithPath: override!) : effectiveBaseDir
+    let dir = try SessionStore.createDir(base: parent, name: folder, title: store.title)
+    store.sessionDir = dir
+    return (dir, true)
+  }
+
   func start(title: String?, terms: [String],
                      folder: String?, baseDir: String?, keepAudio: Bool) async throws {
     // 자리는 라우트에서 이미 잡았다(running = true). 여기서 다시 확인하지 않는다.
@@ -623,12 +644,8 @@ final class ZoomCaptionApp: @unchecked Sendable {
     stateLock.withLock { userTerms = terms }
 
     // 이어 적기가 아니면 이번 수업용 폴더를 만든다.
-    if store.sessionDir == nil {
-      let parent = (baseDir?.isEmpty == false) ? URL(fileURLWithPath: baseDir!) : options.baseDir
-      let dir = try SessionStore.createDir(base: parent, name: folder, title: store.title)
-      store.sessionDir = dir
-      log("세션 폴더: \(dir.path)")
-    }
+    let (_, created) = try ensureSessionDir(override: baseDir, folder: folder)
+    if created { log("세션 폴더: \(store.sessionDir!.path)") }
     store.beginRecording()
 
     // 사용자가 적은 용어 + 교안에서 뽑은 용어
@@ -810,19 +827,51 @@ final class ZoomCaptionApp: @unchecked Sendable {
 
   @discardableResult
   func stop() async -> String? {
-    let wasRunning = stateLock.withLock { () -> Bool in
-      let was = running
-      running = false
-      return was
+    // 시작 준비와 정지가 같은 자원을 만지지 않게 직렬화한다. 시작 중 들어온 정지는
+    // start()가 성공하거나 실패해 starting을 내릴 때까지 기다린 뒤 정리한다.
+    while stateLock.withLock({ starting }) {
+      try? await Task.sleep(for: .milliseconds(50))
     }
-    // running 이 어긋나 있어도 캡처가 살아 있거나 기록이 남아 있으면 끝까지 정리하고 저장한다.
-    // 여기서 그냥 빠져나가면 사용자가 정지를 눌러도 녹취가 통째로 사라진다.
-    let hasWork = tap != nil || lectureTranscriber != nil || !store.isEmpty
-    guard wasRunning || hasWork else { return nil }
+
+    let claimed = stateLock.withLock { () -> Bool in
+      guard !stopping else { return false }
+      stopping = true
+      return true
+    }
+    guard claimed else {
+      // 다른 요청이 이미 정리 중이면 같은 자원을 두 번 닫지 않고 그 작업만 기다린다.
+      while stateLock.withLock({ stopping }) {
+        try? await Task.sleep(for: .milliseconds(50))
+      }
+      return nil
+    }
+
+    let wasRunning = stateLock.withLock { running }
+    // startedAt도 본다. 시작 도중 실패해 장치 참조는 사라졌지만 세션 시계가 남은
+    // 경우까지 endRecording()으로 닫아야 한다. 단순히 저장된 기록이 있다는 이유만으로
+    // 이미 끝난 세션을 매번 다시 종료해 timeBase를 늘리지는 않는다.
+    let hasWork = tap != nil || lectureTranscriber != nil || archive != nil
+      || whisperLive != nil || adminFeed.isRunning || store.startedAt != nil
+    guard wasRunning || hasWork else {
+      stateLock.withLock { stopping = false }
+      return nil
+    }
     if !wasRunning { logWarn("running 플래그가 꺼져 있었지만 남은 기록을 정리해 저장합니다.") }
+
+    // running은 저장이 끝날 때까지 true로 유지한다. 그래야 다른 탭의 시작·세션 전환
+    // 요청도 기존 guard에서 계속 막힌다. 새 시작이 끼어들 수 없는 상태에서 stopped
+    // 이벤트를 먼저 보낸 다음 idle로 전환한다.
+    defer {
+      stateLock.withLock { running = false }
+      live.broadcast(event: "status", payload: ["running": false])
+      live.broadcast(event: "volatile",
+                     payload: ["track": Track.lecture.rawValue, "text": ""], durable: false)
+      stateLock.withLock { stopping = false }
+    }
 
     silenceWatchdog?.cancel(); silenceWatchdog = nil
     tap?.stop(); tap = nil
+    adminFeed.stop()
 
     // 탭을 멈춘 뒤에 닫아야 마지막 버퍼까지 들어간다.
     // finish() 안에서 자투리가 마지막 조각으로 나가므로 Whisper 를 기다리는 건 그다음이다.
@@ -859,21 +908,15 @@ final class ZoomCaptionApp: @unchecked Sendable {
     }
 
     await lectureTranscriber?.finish(); lectureTranscriber = nil
+    audioSink = nil
 
     store.endRecording()
-    live.broadcast(event: "status", payload: ["running": false])
-    // 남아 있던 미확정 자막은 화면에서 지운다.
-    live.broadcast(event: "volatile",
-                   payload: ["track": Track.lecture.rawValue, "text": ""], durable: false)
 
     guard !store.isEmpty else { log("기록이 비어 있어 저장하지 않음"); return nil }
     do {
       // 세션 폴더가 없으면(예: 시작 도중 실패) 여기서 만들어서라도 남긴다.
-      if store.sessionDir == nil {
-        let dir = try SessionStore.createDir(base: options.baseDir, name: nil, title: store.title)
-        store.sessionDir = dir
-        log("세션 폴더가 없어 새로 만들었습니다: \(dir.lastPathComponent)")
-      }
+      let (madeDir, created) = try ensureSessionDir()
+      if created { log("세션 폴더가 없어 새로 만들었습니다: \(madeDir.lastPathComponent)") }
       guard let dir = try SessionStore.save(store) else {
         logError("저장 대상 폴더를 정하지 못했습니다")
         return nil

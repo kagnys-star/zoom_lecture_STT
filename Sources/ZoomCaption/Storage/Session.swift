@@ -78,8 +78,8 @@ enum SessionStore {
     return try decoder.decode(SessionFile.self, from: data)
   }
 
-  /// base 아래에서 session.json 을 가진 폴더를 최근 순으로 나열한다.
-  static func list(base: URL) -> [[String: Any]] {
+  /// base 아래에서 session.json 을 가진 폴더를 최근 순으로, 최대 limit 개 나열한다.
+  static func list(base: URL, limit: Int = 5) -> [[String: Any]] {
     let fm = FileManager.default
     guard let entries = try? fm.contentsOfDirectory(at: base, includingPropertiesForKeys: [.isDirectoryKey])
     else { return [] }
@@ -99,7 +99,8 @@ enum SessionStore {
         "domainSource": file.domainSource ?? "",
       ])
     }
-    return out.sorted { ($0["updatedAt"] as? String ?? "") > ($1["updatedAt"] as? String ?? "") }
+    let sorted = out.sorted { ($0["updatedAt"] as? String ?? "") > ($1["updatedAt"] as? String ?? "") }
+    return Array(sorted.prefix(limit))
   }
 
   /// 폴더 선택 다이얼로그.
@@ -108,14 +109,22 @@ enum SessionStore {
   /// osascript 의 `choose folder` 는 별도 프로세스가 자기 창을 띄우므로 안정적으로 동작하고,
   /// 그 대화상자에 "새로운 폴더" 버튼도 들어 있다.
   static func pickFolder(startingAt: URL?) -> String? {
-    let start = startingAt.map { "default location POSIX file \"\($0.path)\" " } ?? ""
+    // 경로를 스크립트 소스에 직접 끼우면 `"` 가 들어간 정상 폴더에서 문법이
+    // 깨지고, 외부에서 받은 경로라면 코드로 해석될 여지도 생긴다. JXA 스크립트는
+    // 고정해 두고 값은 argv로만 건넨다.
     let script = """
-      POSIX path of (choose folder with prompt "수업 기록을 저장할 폴더를 고르세요" \(start))
+      function run(argv) {
+        const app = Application.currentApplication();
+        app.includeStandardAdditions = true;
+        const options = { withPrompt: "수업 기록을 저장할 폴더를 고르세요" };
+        if (argv[0]) options.defaultLocation = Path(argv[0]);
+        return app.chooseFolder(options).toString();
+      }
       """
 
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-    process.arguments = ["-e", script]
+    process.arguments = ["-l", "JavaScript", "-e", script, startingAt?.path ?? ""]
     let out = Pipe()
     process.standardOutput = out
     process.standardError = FileHandle.nullDevice

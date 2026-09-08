@@ -108,12 +108,34 @@ final class SentenceReconstructor: @unchecked Sendable {
   /// 수업이 끝나 더 이상 줄이 안 올 때 마지막으로 부른다. 마침표를 못 찾았어도 남은
   /// 꼬리를 그대로 확정해서 돌려준다 — 안 그러면 마지막 문장이 영영 화면에 안 나온다.
   func finalize() -> [WhisperLive.Line] {
-    lock.withLock {
-      guard let first = pending.first, let last = pending.last else { return [] }
-      let text = pending.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-      pending.removeAll()
-      guard !text.isEmpty else { return [] }
-      return [WhisperLive.Line(start: first.start, end: last.end, text: text)]
-    }
+    lock.withLock { drainPendingSentenceLocked() }
+  }
+
+  /// 녹음은 계속되지만 180초 무음으로 한 강의 단위가 끝났을 때 남은 꼬리를 확정한다.
+  ///
+  /// `finalize()`와 결과는 같지만 이름으로 수명주기 의미를 분리한다. 이 객체를 닫거나
+  /// 재생성하지 않기 때문에 무음 뒤 새 Whisper 줄은 같은 재구성기에 정상적으로 들어온다.
+  /// 이전 강의의 미완성 문장을 다음 강의 첫 문장과 이어 붙이지 않는 것이 이 메서드의
+  /// 핵심이다. 호출부는 Whisper 작업 큐가 비었고 같은 무음이 유지됐는지 확인한 뒤 부른다.
+  func flushPendingForLectureBoundary() -> [WhisperLive.Line] {
+    lock.withLock { drainPendingSentenceLocked() }
+  }
+
+  /// `pending`을 읽고 비우는 공통 구현. 반드시 `lock`을 잡은 상태에서만 호출한다.
+  /// 한 곳에서 비우도록 해야 정지 처리와 긴 무음 처리가 서로 다른 텍스트 결합 규칙을
+  /// 갖게 되는 일을 막을 수 있다.
+  private func drainPendingSentenceLocked() -> [WhisperLive.Line] {
+    guard let firstPendingPiece = pending.first,
+          let lastPendingPiece = pending.last
+    else { return [] }
+
+    let pendingSentenceText = pending.map(\.text)
+      .joined(separator: " ")
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    pending.removeAll()
+    guard !pendingSentenceText.isEmpty else { return [] }
+    return [WhisperLive.Line(start: firstPendingPiece.start,
+                             end: lastPendingPiece.end,
+                             text: pendingSentenceText)]
   }
 }

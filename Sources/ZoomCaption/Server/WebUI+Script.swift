@@ -42,6 +42,7 @@ extension WebUI {
     el.className = 'fline';
     el.dataset.start = seg.start; el.dataset.id = seg.id;
     el.innerHTML = `<span class="t">${clock(seg.start)}</span><span>${esc(seg.text)}</span>`;
+    setLectureBoundaryMarker(el, seg.boundaryAfter);
     fastStream.appendChild(el);
     fastTotal++;
     trimFast(fastCutoff(seg.start));
@@ -74,6 +75,26 @@ extension WebUI {
     t = Math.max(0, Math.floor(t));
     return [t/3600|0, (t%3600)/60|0, t%60].map(n => String(n).padStart(2,'0')).join(':');
   };
+
+  // 강의 종료는 실제 전사 문구가 아니라 Segment의 구조화된 boundaryAfter 값이다.
+  // 같은 렌더 함수를 Whisper 줄과 실시간 폴백 줄에 써야 SSE와 /api/state 재동기화가
+  // 어느 경로로 들어와도 똑같이 보인다. 이미 있는 표식은 갱신하고, 값이 사라지면
+  // DOM에서도 제거해 서버 상태를 유일한 진실로 유지한다.
+  function setLectureBoundaryMarker(lineElement, boundaryAfter) {
+    let marker = lineElement.querySelector('.lectureEndMarker');
+    if (boundaryAfter !== 'lectureEnded') {
+      delete lineElement.dataset.boundaryAfter;
+      if (marker) marker.remove();
+      return;
+    }
+    lineElement.dataset.boundaryAfter = boundaryAfter;
+    if (!marker) {
+      marker = document.createElement('span');
+      marker.className = 'lectureEndMarker';
+      lineElement.appendChild(marker);
+    }
+    marker.textContent = '강의 종료';
+  }
   // "12:34" / "1:02:03" / "755" 모두 초로 바꾼다. 빈 값이면 null(=전체).
   const parseClock = v => {
     v = (v || '').trim();
@@ -284,7 +305,6 @@ extension WebUI {
 
   function addSegment(seg, fresh) {
     empty.style.display = 'none';
-    if (fresh) setLive('');   // 확정된 줄이 올라왔으면 받아쓰던 줄은 비운다
     extendCoverage(seg.end); // 이 구간은 이제 Whisper 가 처리했다 — 아래 칸에서 겹치는 줄을 뺀다
     const el = document.createElement('div');
     el.className = 'line' + (fresh ? ' fresh' : '') + (seg.edited ? ' wasEdited' : '');
@@ -295,6 +315,7 @@ extension WebUI {
       `<span class="ts">${clock(seg.start)}</span>` +
       `<span class="txt">${esc(seg.text)}</span>` +
       `<button class="del" title="이 줄 삭제">✕</button>`;
+    setLectureBoundaryMarker(el, seg.boundaryAfter);
 
     // 시간순 삽입 (이어 적기·정지 후 재개에서도 순서 유지)
     let ref = null;
@@ -555,6 +576,7 @@ extension WebUI {
       const el = document.createElement('div');
       el.className = 'fline'; el.dataset.start = x.start; el.dataset.id = x.id;
       el.innerHTML = `<span class="t">${clock(x.start)}</span><span>${esc(x.text)}</span>`;
+      setLectureBoundaryMarker(el, x.boundaryAfter);
       fastStream.appendChild(el);
     });
     $('#fastCount').textContent = fastTotal ? fastTotal + '줄 저장됨' : '';
@@ -635,6 +657,7 @@ extension WebUI {
         if (para === undefined) delete el.dataset.para; else el.dataset.para = para;
         markParaBoundary(el);
       }
+      setLectureBoundaryMarker(el, seg.boundaryAfter);
     }
     return { added, removed, changed };
   }
@@ -649,10 +672,15 @@ extension WebUI {
     }
     const have = new Set([...fastStream.children].map(e => e.dataset.id));
     for (const x of want) {
-      if (have.has(String(x.id))) continue;
+      if (have.has(String(x.id))) {
+        const existingLine = fastStream.querySelector(`.fline[data-id="${x.id}"]`);
+        if (existingLine) setLectureBoundaryMarker(existingLine, x.boundaryAfter);
+        continue;
+      }
       const el = document.createElement('div');
       el.className = 'fline'; el.dataset.start = x.start; el.dataset.id = x.id;
       el.innerHTML = `<span class="t">${clock(x.start)}</span><span>${esc(x.text)}</span>`;
+      setLectureBoundaryMarker(el, x.boundaryAfter);
       fastStream.appendChild(el);
     }
     fastTotal = list.length;
@@ -738,6 +766,16 @@ extension WebUI {
     const d = JSON.parse(e.data); if (!seen(d)) return;
     if (lines.has(d.id)) return;   // 이미 그려진 줄 — 다시 만들지 않는다
     addSegment(d, true);
+  });
+  // 180초 무음 처리에서 기존 마지막 문장에 경계 필드만 추가될 때 받는다. 문장
+  // 전체를 다시 삽입하면 중복 줄이 생길 수 있으므로 해당 DOM의 표식만 갱신한다.
+  // 이벤트를 놓쳐도 다음 /api/state 병합이 같은 boundaryAfter 값을 복원한다.
+  es.addEventListener('lectureBoundary', serverEvent => {
+    const boundaryEvent = JSON.parse(serverEvent.data); if (!seen(boundaryEvent)) return;
+    const targetLine = boundaryEvent.collection === 'whisper'
+      ? lines.get(boundaryEvent.id)
+      : fastStream.querySelector(`.fline[data-id="${boundaryEvent.id}"]`);
+    if (targetLine) setLectureBoundaryMarker(targetLine, boundaryEvent.boundaryAfter);
   });
   es.addEventListener('whisperLive', e => {
     const d = JSON.parse(e.data); if (!seen(d)) return;

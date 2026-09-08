@@ -45,6 +45,15 @@ struct TokenFlag: Codable, Sendable, Equatable {
   var end: Double?
 }
 
+/// 문장 뒤에 놓이는 구조화된 기록 경계다.
+///
+/// 강의 종료를 `Segment.text`에 문자열로 합치면 검색·요약·교정 모델이 그 문구를
+/// 실제 발화로 오해한다. 별도 필드로 저장하면 화면과 Markdown에서는 표시하면서
+/// SRT와 음성 텍스트에는 섞지 않을 수 있다. rawValue는 저장 JSON과 SSE가 공유한다.
+enum TranscriptBoundary: String, Codable, Sendable {
+  case lectureEnded
+}
+
 struct Segment: Codable, Sendable, Identifiable {
   var id: Int
   var track: Track
@@ -64,6 +73,23 @@ struct Segment: Codable, Sendable, Identifiable {
   /// `edited == true` 인 세그먼트는 원문이 바뀌었을 수 있으니 이 값을 신뢰하지 않는다
   /// (오프셋이 지금 text 를 가리키는지 쓰기 전에 반드시 확인 — applyCorrection 참고).
   var flags: [TokenFlag]?
+  /// 이 문장 바로 뒤에서 강의 한 단위가 끝났는지 나타낸다. 기존 저장 파일에는 이
+  /// 키가 없으므로 Optional이어야 하며, 그래야 과거 세션도 그대로 디코딩할 수 있다.
+  /// `volatile`의 스키마를 확장하지 않고 영속 문장에만 경계를 두는 것이 핵심이다.
+  var boundaryAfter: TranscriptBoundary?
+}
+
+/// 강의 종료 표식이 어느 기록에 붙었는지 호출부에 알려 주는 결과다. Whisper가 이번
+/// 녹음 구간에 한 줄이라도 있으면 정식 기록인 Whisper를 선택하고, 없을 때만 실시간
+/// 확정 기록으로 폴백한다. 숫자 ID 범위에 기대지 않고 명시적인 목록 이름을 전달한다.
+struct TranscriptBoundaryUpdate: Sendable {
+  enum Collection: String, Sendable {
+    case live
+    case whisper
+  }
+
+  let collection: Collection
+  let segment: Segment
 }
 
 /// 디스크에 저장되는 세션 원본. .md/.srt 는 이걸로부터 파생된다.
@@ -141,6 +167,10 @@ final class TranscriptStore: @unchecked Sendable {
   private var paragraphVectors: [Int: [Double]] = [:]
   private var paragraphOf: [Int: Int] = [:]
   private var nextParagraphNumber = 1
+  /// 180초 무음으로 한 강의를 닫은 뒤 처음 생성될 Whisper 문장 ID다. 단순 Boolean을
+  /// 쓰면 문단 모델 준비가 늦었을 때 아직 번호 없는 과거 문장에 경계가 잘못 적용될
+  /// 수 있다. ID 하한을 기억하면 모델 로딩 시점과 무관하게 정확한 새 문장에서 끊긴다.
+  private var firstWhisperIDAfterLectureBoundary: Int?
 
   /// 저장·요약·내보내기의 기준이 되는 기록.
   /// Whisper 가 있으면 그쪽이다 — 실측에서 영문 식별자를 24종 살려내는 동안
@@ -180,6 +210,7 @@ final class TranscriptStore: @unchecked Sendable {
       paragraphVectors = [:]
       paragraphOf = [:]
       nextParagraphNumber = 1
+      firstWhisperIDAfterLectureBoundary = nil
     }
   }
 
@@ -211,6 +242,10 @@ final class TranscriptStore: @unchecked Sendable {
       paragraphOf = Dictionary(uniqueKeysWithValues:
         whisperSegments.compactMap { seg in seg.paragraph.map { (seg.id, $0) } })
       nextParagraphNumber = (paragraphOf.values.max() ?? 0) + 1
+      // 저장된 강의 종료 표식은 데이터에 이미 남아 있다. 이어 적기를 시작하면 첫
+      // Whisper 문장이 독립 문단이 되도록 별도 플래그를 다시 들고 갈 필요는 없다.
+      // adopt의 nextParagraphNumber 자체가 기존 최댓값 다음 번호를 가리킨다.
+      firstWhisperIDAfterLectureBoundary = nil
       // 마지막 발화 끝 + 2초 여백부터 이어 붙인다. 두 목록 모두 본다.
       timeBase = max(file.duration, lastEndLocked()) + 2
     }
@@ -270,6 +305,17 @@ final class TranscriptStore: @unchecked Sendable {
   func setVolatile(track: Track, text: String) {
     lock.withLock { volatile[track] = text }
     onChange?(.volatile(track, text))
+  }
+
+  /// 180초 강의 경계를 확정한 뒤에만 화면의 임시 받아쓰기 문구를 비운다.
+  ///
+  /// SpeechTranscriber의 final 이벤트마다 빈 문자열을 방송하지 않는 이유는 final과
+  /// volatile 콜백의 도착 순서가 항상 같다고 보장할 수 없기 때문이다. 오래된 final이
+  /// 새 volatile을 지우면 사용자가 지금 말하는 문장이 순간적으로 사라진다. 반면 이
+  /// 메서드는 앱이 같은 180초 무음을 재검증한 직후 한 번만 호출하므로 안전하다.
+  func clearVolatileAtLectureBoundary(track: Track) {
+    lock.withLock { volatile[track] = "" }
+    onChange?(.volatile(track, ""))
   }
 
   // MARK: - 편집
@@ -507,6 +553,20 @@ final class TranscriptStore: @unchecked Sendable {
   @discardableResult
   func finalizeParagraphs() -> [Segment] { assignParagraphs(finalize: true) }
 
+  /// 긴 무음 직전의 문단 꼬리를 확정하고, 무음 뒤 첫 문장을 새 문단으로 예약한다.
+  /// `finalizeParagraphs()`와 달리 녹음 세션 자체는 끝내지 않는다. 따라서 Whisper와
+  /// SpeechTranscriber는 살아 있는 채로 다음 강의를 계속 받을 수 있다.
+  @discardableResult
+  func finalizeParagraphsForLectureBoundary() -> [Segment] {
+    let finalizedSegments = assignParagraphs(finalize: true)
+    lock.withLock {
+      // 지금 큐는 유휴이고 기존 pending 문장도 저장된 뒤라 nextWhisperID가 곧 무음
+      // 뒤 첫 문장의 ID다. Paragraph 모델이 아직 준비되지 않았어도 이 경계는 보존한다.
+      firstWhisperIDAfterLectureBoundary = nextWhisperID
+    }
+    return finalizedSegments
+  }
+
   /// 임베딩 계산(모델 추론)은 락 밖에서 한다 — 락을 쥔 채로 추론을 돌리면 그동안
   /// 다른 스레드가 store 를 못 건드린다. 이미 번호가 있는 문장은 다시 계산하지 않는다.
   ///
@@ -532,6 +592,18 @@ final class TranscriptStore: @unchecked Sendable {
       for i in segs.indices {
         let seg = segs[i]
         if paragraphOf[seg.id] != nil { continue }
+        if let firstWhisperIDAfterLectureBoundary,
+           seg.id >= firstWhisperIDAfterLectureBoundary {
+          // `nextParagraphNumber`는 새 세션에서는 현재 문단을, 저장 세션을 이어받은
+          // 직후에는 다음 번호를 가리킬 수 있다. 이미 쓴 최댓값을 기준으로 올리면
+          // 어느 경로에서도 번호를 중복하거나 불필요하게 한 칸 더 건너뛰지 않는다.
+          let highestAssignedParagraph = paragraphOf.values.max() ?? 0
+          nextParagraphNumber = max(nextParagraphNumber, highestAssignedParagraph + 1)
+          paragraphOf[seg.id] = nextParagraphNumber
+          self.firstWhisperIDAfterLectureBoundary = nil
+          changedIDs.insert(seg.id)
+          continue
+        }
         if i == 0 {
           paragraphOf[seg.id] = nextParagraphNumber
           changedIDs.insert(seg.id)
@@ -551,6 +623,31 @@ final class TranscriptStore: @unchecked Sendable {
         if changedIDs.contains(whisperSegments[i].id) { changed.append(whisperSegments[i]) }
       }
       return changed
+    }
+  }
+
+  /// 이번 녹음 구간의 마지막 영속 문장 뒤에 강의 종료 표식을 붙인다.
+  ///
+  /// Whisper가 이번 구간에 존재하면 정식 기록을 선택하고, 아직 Whisper 문장이 하나도
+  /// 만들어지지 않았으면 실시간 확정 기록을 선택한다. `recordingStartOffset` 검사는
+  /// 이어 적기 직후 아무 말도 없었던 경우 과거 수업의 마지막 문장에 표식이 붙는 것을
+  /// 막는다. 같은 무음 구간에서 재호출돼도 이미 표식이 있으면 변경하지 않는다.
+  @discardableResult
+  func markLatestSegmentAsLectureEnded(after recordingStartOffset: Double) -> TranscriptBoundaryUpdate? {
+    lock.withLock {
+      if let whisperIndex = whisperSegments.lastIndex(where: { $0.end >= recordingStartOffset }) {
+        guard whisperSegments[whisperIndex].boundaryAfter != .lectureEnded else { return nil }
+        whisperSegments[whisperIndex].boundaryAfter = .lectureEnded
+        return TranscriptBoundaryUpdate(collection: .whisper,
+                                        segment: whisperSegments[whisperIndex])
+      }
+
+      if let liveIndex = segments.lastIndex(where: { $0.end >= recordingStartOffset }) {
+        guard segments[liveIndex].boundaryAfter != .lectureEnded else { return nil }
+        segments[liveIndex].boundaryAfter = .lectureEnded
+        return TranscriptBoundaryUpdate(collection: .live, segment: segments[liveIndex])
+      }
+      return nil
     }
   }
 
@@ -652,6 +749,9 @@ final class TranscriptStore: @unchecked Sendable {
     out += "- 이 파일은 대조용입니다. 정식 기록은 transcript.md 입니다.\n\n"
     for seg in allSegments {
       out += "**[\(Self.clock(seg.start))] \(seg.track.label)** — \(seg.text)\n\n"
+      if seg.boundaryAfter == .lectureEnded {
+        out += "> **강의 종료**\n\n"
+      }
     }
     return out
   }
@@ -705,15 +805,20 @@ final class TranscriptStore: @unchecked Sendable {
       let seg = segs[i]
       if let p = seg.paragraph {
         var texts = [seg.text]
+        var hasLectureEndingBoundary = seg.boundaryAfter == .lectureEnded
         var j = i + 1
         while j < segs.count, segs[j].paragraph == p {
           texts.append(segs[j].text)
+          hasLectureEndingBoundary = hasLectureEndingBoundary
+            || segs[j].boundaryAfter == .lectureEnded
           j += 1
         }
         out += "**[\(Self.clock(seg.start))] \(seg.track.label)** — \(texts.joined(separator: " "))\n\n"
+        if hasLectureEndingBoundary { out += "> **강의 종료**\n\n" }
         i = j
       } else {
         out += "**[\(Self.clock(seg.start))] \(seg.track.label)** — \(seg.text)\n\n"
+        if seg.boundaryAfter == .lectureEnded { out += "> **강의 종료**\n\n" }
         i += 1
       }
     }

@@ -76,6 +76,60 @@ final class AudioArchive: @unchecked Sendable {
   var duration: Double { lock.withLock { Double(_frames) / 16_000 } }
   var byteCount: Int64 { lock.withLock { _frames * 2 } }
 
+  /// 현재 진행 중인 VAD 분할과 조각 방출이 끝날 때까지만 기다린다. 아카이브 파일을
+  /// 닫거나 새 오디오 입력을 막지는 않는다. 180초 강의 경계에서 Whisper 큐가 비어
+  /// 보여도 바로 앞의 분할 작업이 아직 onChunk를 호출하기 전일 수 있으므로, 이 단계를
+  /// 먼저 확인해야 마지막 실제 발화가 문장 flush 뒤늦게 도착하는 경합을 막을 수 있다.
+  func waitUntilChunkingIdle(timeout: TimeInterval) async -> Bool {
+    let chunkingDeadline = Date().addingTimeInterval(timeout)
+    while Date() < chunkingDeadline {
+      if Task.isCancelled { return false }
+      if lock.withLock({ !cutting }) { return true }
+      try? await Task.sleep(for: .milliseconds(100))
+    }
+    return false
+  }
+
+  /// 녹음을 닫지 않고 현재 `pending` 오디오를 Whisper 후보 조각으로 방출한다.
+  ///
+  /// 시스템 탭은 무음 PCM도 계속 보내므로 평소에는 90초 trigger가 남은 발화까지
+  /// 자동으로 밀어낸다. 하지만 관리자 파일 되먹임이나 일시적인 입력 중단은 마지막
+  /// 버퍼 뒤에 아무 프레임도 보내지 않는다. 그 경우 큐가 유휴여도 마지막 발화가
+  /// `pending`에만 남을 수 있어, 180초 경계가 Whisper보다 먼저 확정된다. 이 메서드는
+  /// 파일을 닫지 않은 채 그 자투리만 `flushChunk`로 넘겨 이후 입력을 계속 받을 수 있게 한다.
+  ///
+  /// - Returns: 진행 중 분할이 제한 시간 안에 끝나 안전하게 방출했으면 true. false이면
+  ///   호출부가 문장 경계를 건드리지 않고 다음 감시 주기에 다시 시도해야 한다.
+  func flushPendingForLectureBoundary(timeout: TimeInterval) async -> Bool {
+    guard await waitUntilChunkingIdle(timeout: timeout) else { return false }
+
+    let extractionResult: (
+      safeToFinalize: Bool,
+      chunk: (samples: [Int16], startSample: Int, index: Int)?
+    ) = lock.withLock {
+      // wait가 반환된 직후 새 오디오 콜백이 정규 분할을 시작했을 수 있다. 같은 pending을
+      // 두 작업이 떼지 않도록 락 안에서 한 번 더 확인하고, 겹치면 다음 틱에 맡긴다.
+      guard !cutting else { return (false, nil) }
+      guard pending.count >= Int(2 * Self.rate) else { return (true, nil) }
+
+      let samplesForWhisper = pending
+      let chunkStartSample = emitted
+      let reservedChunkIndex = chunkIndex
+      pending.removeAll()
+      emitted += samplesForWhisper.count
+      chunkIndex += 1
+      return (true, (samplesForWhisper, chunkStartSample, reservedChunkIndex))
+    }
+
+    guard extractionResult.safeToFinalize else { return false }
+    if let pendingChunk = extractionResult.chunk {
+      flushChunk(pendingChunk.samples,
+                 startSample: pendingChunk.startSample,
+                 index: pendingChunk.index)
+    }
+    return true
+  }
+
   init(dir: URL, startOffset: Double) throws {
     self.startOffset = startOffset
     let name = String(format: "audio_%06d.wav", Int(startOffset.rounded()))

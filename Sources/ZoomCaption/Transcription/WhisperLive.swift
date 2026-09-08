@@ -91,14 +91,29 @@ final class WhisperLive: @unchecked Sendable {
   /// 더 받지 않는다. 이미 큐에 있는 건 끝까지 처리한다.
   func seal() { lock.withLock { } }
 
-  /// 남은 조각까지 다 끝날 때까지 기다린다. 정지 직후 저장 전에 부른다.
-  func finish(timeout: TimeInterval = 180) async {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-      let idle: Bool = lock.withLock { queue.isEmpty && !draining }
-      if idle { return }
+  /// 워커를 닫지 않고 현재 큐만 모두 처리될 때까지 기다린다.
+  ///
+  /// 180초 무음에서는 녹음과 Whisper를 종료하면 안 된다. 이미 들어온 조각의 콜백까지
+  /// 끝났다는 사실만 확인한 뒤 문장 꼬리를 확정해야 하므로 `finish()`와 별도 메서드가
+  /// 필요하다. `draining == false`까지 함께 확인하는 이유는 큐에서 작업을 꺼낸 직후에는
+  /// `queue`가 비어 있어도 whisper-cli가 아직 실행 중일 수 있기 때문이다.
+  ///
+  /// - Returns: 제한 시간 안에 유휴 상태가 됐으면 true. false이면 호출부는 문장·문단을
+  ///   건드리지 않고 다음 감시 주기에 재시도해, 실행 중 결과를 강의 경계 뒤로 밀지 않는다.
+  func waitUntilIdle(timeout: TimeInterval) async -> Bool {
+    let idleDeadline = Date().addingTimeInterval(timeout)
+    while Date() < idleDeadline {
+      if Task.isCancelled { return false }
+      let hasNoPendingOrRunningJob = lock.withLock { queue.isEmpty && !draining }
+      if hasNoPendingOrRunningJob { return true }
       try? await Task.sleep(for: .milliseconds(200))
     }
+    return false
+  }
+
+  /// 남은 조각까지 다 끝날 때까지 기다린다. 정지 직후 저장 전에 부른다.
+  func finish(timeout: TimeInterval = 180) async {
+    if await waitUntilIdle(timeout: timeout) { return }
     logWarn("Whisper 조각 처리가 \(Int(timeout))초 안에 끝나지 않아 남은 것은 버립니다.")
     lock.withLock { stopped = true; queue.removeAll() }
   }

@@ -156,6 +156,20 @@ extension WebUI {
   .txt mark { background: color-mix(in srgb, var(--accent) 30%, transparent); border-radius: 3px; padding: 0 2px; }
   .line.wasEdited .ts::after { content: "✎"; margin-left: 4px; color: var(--accent); }
 
+  /* 실제 발화 텍스트와 섞지 않는 구조화된 강의 종료 표식. line 안의 마지막 grid
+     행으로 두면 문단 탐색(previousElementSibling)은 자막 줄끼리만 비교할 수 있고,
+     편집·검색·요약 대상인 .txt에도 이 문구가 들어가지 않는다. */
+  .lectureEndMarker {
+    grid-column: 2 / -1; display: flex; align-items: center; gap: 9px;
+    margin: 8px 0 2px; color: var(--muted); font-size: 12px; font-weight: 700;
+    letter-spacing: .04em;
+  }
+  .lectureEndMarker::before, .lectureEndMarker::after {
+    content: ""; height: 1px; background: var(--line);
+  }
+  .lectureEndMarker::before { width: 18px; }
+  .lectureEndMarker::after { flex: 1; }
+
   /* 갈린 자리 — 색을 칠하면 글이 안 읽힌다. 점선만 긋는다. */
   .dv { background: none; border-bottom: 2px dotted var(--warn); cursor: pointer;
         border-radius: 2px; }
@@ -200,6 +214,9 @@ extension WebUI {
                        padding: 3px 0; font-size: 14px; line-height: 1.5; color: var(--muted); }
   #fastStream .fline .t { font-size: 11.5px; font-variant-numeric: tabular-nums; padding-top: 3px; }
   #fastStream .fline:last-child { color: var(--ink); }
+  /* Whisper 문장이 하나도 없을 때는 실시간 확정 기록이 정식 기록이므로, 같은 표식을
+     아래 칸에도 표시한다. 두 열 전체를 차지해 앞 문장의 일부처럼 보이지 않게 한다. */
+  #fastStream .fline .lectureEndMarker { grid-column: 1 / -1; }
   #fastStream:empty::before { content: "시작하면 여기에 실시간 자막이 흐릅니다.";
                               font-size: 12.5px; color: var(--muted); }
 

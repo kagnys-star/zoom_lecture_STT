@@ -107,6 +107,127 @@ enum CoreAudioInfo {
 
 // MARK: - 시스템 오디오 탭
 
+/// 시스템 탭과 관리자 파일 되먹임이 함께 쓰는 오디오 활동 시계다.
+///
+/// 이 상태를 `SystemAudioTap` 안에만 두면 실제 장치를 거치지 않는 `AdminFeed`에서는
+/// 180초 무음 동작을 재현할 수 없다. 그래서 오디오를 전사 파이프라인에 넣기 직전에
+/// 같은 시계를 갱신하도록 분리했다. 새 타이머를 따로 증가시키지 않고, 기존 구현처럼
+/// **마지막으로 유효한 소리를 본 절대 시각** 하나만 저장한 뒤 필요할 때 경과 시간을
+/// 계산한다. 시스템 절전이나 타이머 지연이 있어도 누적 오차가 생기지 않는 이유다.
+final class AudioActivityClock: @unchecked Sendable {
+  /// 한 무음 구간을 식별하는 불변 스냅샷이다. 비동기 Whisper 대기를 마친 뒤에도
+  /// `lastNonSilentAt`이 같아야 같은 무음이 계속된 것으로 인정한다. 그 사이 새 소리가
+  /// 한 번이라도 들어오면 시각이 달라지므로 오래된 작업이 `volatile`을 지우지 못한다.
+  struct SilencePeriod: Sendable {
+    let lastNonSilentAt: Date
+    let measuredAt: Date
+
+    var duration: TimeInterval { measuredAt.timeIntervalSince(lastNonSilentAt) }
+  }
+
+  /// 캡처 이상 알림에 쓰는 짧은 기준이다. 강의 종료 경계(180초)는 앱 수명주기에서
+  /// 별도로 적용한다. 서로 목적이 다른 두 기준을 같은 상수로 묶으면 한쪽 조정이
+  /// 다른 동작까지 바꾸므로 분리해 둔다.
+  static let recentSoundWindow: TimeInterval = 30
+
+  private let lock = NSLock()
+  private var framesObserved = 0
+  private var lastNonSilentAt: Date?
+  private var maximumPeakLevel: Float = 0
+  private var accumulatedSquaredSamples: Double = 0
+  private var measuredSampleCount = 0
+
+  /// 버퍼를 한 번 관측해 마지막 유효 소리 시각과 입력 레벨 통계를 함께 갱신한다.
+  /// 오디오 콜백을 오래 막지 않도록 4샘플마다 하나만 읽는다. Float32와 Int16을 모두
+  /// 처리하므로 시스템 탭뿐 아니라 서로 다른 포맷의 관리자 시험 WAV에도 동작한다.
+  func observe(_ buffer: AVAudioPCMBuffer, observedAt: Date = Date()) {
+    let frameCount = Int(buffer.frameLength)
+    guard frameCount > 0 else { return }
+
+    let channelCount = Int(buffer.format.channelCount)
+    let samplesPerChannel = buffer.format.isInterleaved ? frameCount * channelCount : frameCount
+    var containsAudibleSample = false
+    var bufferPeakLevel: Float = 0
+    var bufferSquaredSampleSum = 0.0
+    var bufferMeasuredSampleCount = 0
+
+    if buffer.format.commonFormat == .pcmFormatFloat32, let channelData = buffer.floatChannelData {
+      let samples = channelData[0]
+      for sampleIndex in stride(from: 0, to: samplesPerChannel, by: 4) {
+        let absoluteLevel = abs(samples[sampleIndex])
+        if absoluteLevel > 1e-5 { containsAudibleSample = true }
+        bufferPeakLevel = max(bufferPeakLevel, absoluteLevel)
+        bufferSquaredSampleSum += Double(absoluteLevel) * Double(absoluteLevel)
+        bufferMeasuredSampleCount += 1
+      }
+    } else if buffer.format.commonFormat == .pcmFormatInt16,
+              let channelData = buffer.int16ChannelData {
+      let samples = channelData[0]
+      for sampleIndex in stride(from: 0, to: samplesPerChannel, by: 4) {
+        // Int16.min의 절댓값은 Int16 범위를 넘으므로 먼저 Int로 넓힌다.
+        let absoluteIntegerLevel = abs(Int(samples[sampleIndex]))
+        let normalizedLevel = Float(absoluteIntegerLevel) / Float(Int16.max)
+        if normalizedLevel > 1e-5 { containsAudibleSample = true }
+        bufferPeakLevel = max(bufferPeakLevel, normalizedLevel)
+        bufferSquaredSampleSum += Double(normalizedLevel) * Double(normalizedLevel)
+        bufferMeasuredSampleCount += 1
+      }
+    }
+
+    lock.withLock {
+      framesObserved += frameCount
+      if containsAudibleSample { lastNonSilentAt = observedAt }
+      maximumPeakLevel = max(maximumPeakLevel, bufferPeakLevel)
+      accumulatedSquaredSamples += bufferSquaredSampleSum
+      measuredSampleCount += bufferMeasuredSampleCount
+    }
+  }
+
+  var framesSeen: Int { lock.withLock { framesObserved } }
+
+  /// 마지막 유효 소리 이후 현재까지 이어진 무음 구간. 녹음을 시작한 뒤 아직 소리를
+  /// 한 번도 듣지 못했다면 강의가 시작됐다고 볼 근거가 없으므로 nil을 반환한다.
+  var silencePeriod: SilencePeriod? {
+    lock.withLock {
+      guard let lastNonSilentAt else { return nil }
+      return SilencePeriod(lastNonSilentAt: lastNonSilentAt, measuredAt: Date())
+    }
+  }
+
+  var silenceDuration: TimeInterval? { silencePeriod?.duration }
+
+  var isHearingSound: Bool {
+    (silenceDuration ?? .infinity) < Self.recentSoundWindow
+  }
+
+  /// 비동기 작업 전후가 같은 무음 구간인지 원자적으로 재검사한다. 단순히 현재
+  /// `silenceDuration >= 180`만 검사하면, 중간에 소리가 재개됐다가 다시 끊긴 짧은
+  /// 새 무음 구간을 오래된 작업이 잘못 확정할 수 있다.
+  func hasMaintainedSilence(_ expectedPeriod: SilencePeriod,
+                            forAtLeast minimumDuration: TimeInterval) -> Bool {
+    lock.withLock {
+      guard lastNonSilentAt == expectedPeriod.lastNonSilentAt,
+            let lastNonSilentAt
+      else { return false }
+      return Date().timeIntervalSince(lastNonSilentAt) >= minimumDuration
+    }
+  }
+
+  var peakLevel: Float { lock.withLock { maximumPeakLevel } }
+
+  var rmsLevel: Double {
+    lock.withLock {
+      guard measuredSampleCount > 0 else { return 0 }
+      return (accumulatedSquaredSamples / Double(measuredSampleCount)).squareRoot()
+    }
+  }
+
+  var peakDBFS: Double {
+    let normalizedPeakLevel = Double(peakLevel)
+    return normalizedPeakLevel > 0 ? 20 * log10(normalizedPeakLevel) : -.infinity
+  }
+}
+
 /// Core Audio process tap으로 다른 앱(Zoom 등)의 재생 오디오를 가로챈다.
 /// 스피커 출력은 그대로 유지되므로 사용자는 평소처럼 소리를 들으면서 캡처된다.
 final class SystemAudioTap: @unchecked Sendable {
@@ -140,51 +261,6 @@ final class SystemAudioTap: @unchecked Sendable {
 
   private(set) var sourceFormat: AVAudioFormat?
   private let onBuffer: (AVAudioPCMBuffer) -> Void
-
-  /// 캡처된 샘플이 전부 0인지 감시한다. 권한이 없으면 macOS는 에러 대신 무음을 준다.
-  private let silenceLock = NSLock()
-  private var _framesSeen: Int = 0
-  private var _lastNonSilentAt: Date?
-  // 입력 레벨. 정규화(게인 보정)가 필요한지 판단하는 근거로 쓴다.
-  private var _peak: Float = 0
-  private var _sumSquares: Double = 0
-  private var _sampleCount: Int = 0
-
-  /// 무음 판정 기준(초). Whisper 청크 주기(30초)와 맞춰 뒀다 — 나중에 "무음일 때
-  /// Whisper 가 실시간을 따라잡느라 대기만 하고 처리를 안 하는" 문제를 풀 때
-  /// 이 값을 그대로 재사용할 것.
-  static let recentSoundWindow: TimeInterval = 30
-
-  var framesSeen: Int { silenceLock.withLock { _framesSeen } }
-
-  /// 마지막으로 소리를 들은 뒤 지난 시간(초). 계속 듣고 있으면 0에 가깝고,
-  /// 이번 탭을 시작한 뒤로 한 번도 못 들었으면 nil. 기존엔 "이 탭이 시작된 뒤로
-  /// 평생 한 번이라도 들었는지"만 재는 누적 카운터였는데, 그러면 정상적으로
-  /// 잘 듣다가 중간에(예: 이어폰 전환으로) 죽어도 다시는 안 걸렸다. 지금은 시각
-  /// 하나만 들고 있다가 "지금으로부터 얼마나 지났는지"를 매번 다시 재므로,
-  /// 30초든 강의 쉬는 시간(5~8분, 별도 논의)이든 부르는 쪽이 원하는 기준을
-  /// 각자 적용할 수 있다.
-  var silenceDuration: TimeInterval? {
-    silenceLock.withLock {
-      guard let last = _lastNonSilentAt else { return nil }
-      return Date().timeIntervalSince(last)
-    }
-  }
-
-  /// 최근 recentSoundWindow(30초) 안에 소리를 들었는지.
-  var isHearingSound: Bool { (silenceDuration ?? .infinity) < Self.recentSoundWindow }
-
-  /// 지금까지 관측한 최대 진폭 (0~1)
-  var peakLevel: Float { silenceLock.withLock { _peak } }
-  /// 전체 구간 RMS (0~1). 말소리가 섞인 구간 평균이라 대체로 peak 보다 훨씬 작다.
-  var rmsLevel: Double {
-    silenceLock.withLock { _sampleCount > 0 ? (_sumSquares / Double(_sampleCount)).squareRoot() : 0 }
-  }
-  /// dBFS 로 본 peak. -20 dBFS 이하로 계속 머무르면 입력이 작은 편이다.
-  var peakDBFS: Double {
-    let p = Double(peakLevel)
-    return p > 0 ? 20 * log10(p) : -.infinity
-  }
 
   init(onBuffer: @escaping (AVAudioPCMBuffer) -> Void) {
     self.onBuffer = onBuffer
@@ -265,31 +341,8 @@ final class SystemAudioTap: @unchecked Sendable {
     guard let dst = buf.audioBufferList.pointee.mBuffers.mData else { return }
     memcpy(dst, mData, Int(first.mDataByteSize))
 
-    // 무음 감시(권한 미승인 시 프레임은 오지만 값이 전부 0이다)와 레벨 측정을 함께 한다.
-    var nonSilent = false
-    var peak: Float = 0
-    var sumSquares = 0.0
-    var counted = 0
-    if fmt.commonFormat == .pcmFormatFloat32, let ch = buf.floatChannelData {
-      let n = Int(frames) * Int(fmt.isInterleaved ? fmt.channelCount : 1)
-      let p = ch[0]
-      // 오디오 콜백이라 전수 검사는 피하고 4샘플마다 훑는다.
-      for i in stride(from: 0, to: n, by: 4) {
-        let v = abs(p[i])
-        if v > 1e-5 { nonSilent = true }
-        if v > peak { peak = v }
-        sumSquares += Double(v) * Double(v)
-        counted += 1
-      }
-    }
-    silenceLock.lock()
-    _framesSeen += Int(frames)
-    if nonSilent { _lastNonSilentAt = Date() }
-    if peak > _peak { _peak = peak }
-    _sumSquares += sumSquares
-    _sampleCount += counted
-    silenceLock.unlock()
-
+    // 무음 시계는 실제 시스템 탭과 관리자 되먹임이 공유해야 하므로, 이 계층에서는
+    // 샘플을 판정하지 않고 공통 onBuffer 파이프라인에 그대로 넘긴다.
     onBuffer(buf)
   }
 
@@ -307,10 +360,6 @@ final class SystemAudioTap: @unchecked Sendable {
     ioProcID = nil
     aggregateID = AudioObjectID(kAudioObjectUnknown)
     tapID = AudioObjectID(kAudioObjectUnknown)
-    silenceLock.withLock {
-      _framesSeen = 0; _lastNonSilentAt = nil
-      _peak = 0; _sumSquares = 0; _sampleCount = 0
-    }
   }
 
   deinit { stop() }

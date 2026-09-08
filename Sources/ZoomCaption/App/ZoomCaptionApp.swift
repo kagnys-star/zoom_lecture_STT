@@ -23,6 +23,9 @@ final class ZoomCaptionApp: @unchecked Sendable {
   private(set) var webURL: URL?
 
   private var tap: SystemAudioTap?
+  /// 시스템 탭과 관리자 파일 되먹임이 함께 갱신하는 마지막 유효 소리 시계.
+  /// 장치 객체(`tap`)와 분리돼 있어 관리자 시험에서도 180초 무음 경로가 동일하게 돈다.
+  private var audioActivityClock: AudioActivityClock?
   /// 관리자 되먹임. 저장된 WAV 를 실제 탭과 **같은 닫힘**에 밀어 넣어 전체 경로를 시험한다.
   let adminFeed = AdminFeed()
   /// 지금 녹음이 쓰는 오디오 받개. 되먹임이 여기로 들어간다.
@@ -47,6 +50,25 @@ final class ZoomCaptionApp: @unchecked Sendable {
   /// 실시간 재전사가 안 돌고 있다면 그 이유. 위 칸이 왜 비어 있는지 화면에 그대로 띄운다.
   private var whisperLiveNote: String?
   private var silenceWatchdog: DispatchSourceTimer?
+  /// 180초 무음 경계를 처리하는 비동기 작업. 정지 또는 새 녹음 시작 시 이전 작업을
+  /// 취소해, 오래된 작업이 새 세션의 문장이나 volatile을 건드리지 못하게 한다.
+  private var lectureBoundaryTask: Task<Void, Never>?
+  /// 아주 빠르게 끝난 작업과 새로 저장하는 Task 참조가 엇갈리지 않게 식별하는 값.
+  /// 완료 콜백은 자신이 아직 현재 작업일 때만 플래그와 참조를 정리한다.
+  private var lectureBoundaryTaskID: UUID?
+  /// 같은 무음 구간에 타이머가 20초마다 들어와도 경계를 한 번만 만드는 상태다.
+  private var lectureBoundaryProcessing = false
+  /// 마지막으로 처리한 무음 구간을 그 직전 소리 시각으로 식별한다. 단순 Boolean은
+  /// 앱이 잠든 사이 소리가 잠깐 재개돼 타이머가 회복 상태를 못 본 경우 재무장되지
+  /// 않는다. 시각을 비교하면 다음 무음 구간은 감시 틱을 놓쳐도 자동으로 구별된다.
+  private var lastHandledLectureBoundarySoundAt: Date?
+  /// 경계 커밋과 stop의 마지막 문장 정리가 동시에 SentenceReconstructor를 비우지
+  /// 못하게 하는 짧은 임계 구역이다. Whisper 대기에는 잡지 않고 실제 상태 변경에만 쓴다.
+  private let lectureBoundaryMutationLock = NSLock()
+  /// 이어 적기에서 과거 마지막 문장에 강의 종료 표식을 붙이지 않기 위한 이번 시작 오프셋.
+  private var currentRecordingStartOffset: Double = 0
+  /// 비동기 경계 작업이 자신을 시작시킨 녹음과 현재 녹음이 같은지 확인하는 세대 값.
+  private var recordingGeneration = UUID()
   /// 무음 감시가 "직전 틱에도 조용했는지" 기억해 두는 용도. 상태가 바뀔 때만
   /// 로그·알림을 내보내려고 — 20초마다 매번 남기면 강의 쉬는 시간 10분 동안
   /// 30줄씩 쌓인다. stateLock 이 보호한다.
@@ -62,6 +84,16 @@ final class ZoomCaptionApp: @unchecked Sendable {
   /// 내기 시작해도 다시는 확인을 안 하게 된다. 그래서 "조용한 동안은 매 틱 계속
   /// 재확인하되, 한 번 알린 뒤로는 반복하지 않는다"로 따로 뗐다.
   private var silenceNotified = false
+
+  /// 마지막 유효 소리 뒤 이 시간이 지나면 하나의 강의가 끝난 것으로 확정한다.
+  /// 30초 캡처 이상 경고와 목적이 다르므로 AudioActivityClock의 짧은 기준과 분리한다.
+  private static let lectureBoundarySilenceSeconds: TimeInterval = 180
+  /// 긴 무음 시점에는 Whisper가 보통 이미 따라잡아 있다. 그래도 실행 중인 한 조각을
+  /// 중간에서 자르지 않도록 최대 60초 기다리고, 끝나지 않으면 다음 감시 틱에서 재시도한다.
+  private static let lectureBoundaryWhisperWaitSeconds: TimeInterval = 60
+  /// Whisper 큐에 들어오기 직전인 AudioArchive의 VAD 분할도 먼저 기다린다. 평소에는
+  /// 수백 ms지만 외부 분할 작업이 지연될 때 경계를 앞질러 확정하지 않도록 상한을 둔다.
+  private static let lectureBoundaryArchiveWaitSeconds: TimeInterval = 30
 
   let stateLock = NSLock()
   var running = false
@@ -212,16 +244,17 @@ final class ZoomCaptionApp: @unchecked Sendable {
   /// 오디오 입력 진단. 레벨까지 포함해 정규화가 필요한 상태인지 보여 준다.
   func diagJSON() -> [String: Any] {
     var json: [String: Any] = [:]
-    json["framesSeen"] = tap?.framesSeen ?? 0
-    json["heardSound"] = tap?.isHearingSound ?? false
-    json["silenceSeconds"] = tap?.silenceDuration ?? 0
+    let activityClock = stateLock.withLock { audioActivityClock }
+    json["framesSeen"] = activityClock?.framesSeen ?? 0
+    json["heardSound"] = activityClock?.isHearingSound ?? false
+    json["silenceSeconds"] = activityClock?.silenceDuration ?? 0
     json["somethingPlaying"] = CoreAudioInfo.isAnythingPlaying()
     json["sourceFormat"] = tap?.sourceFormat.map { "\($0.sampleRate)Hz ch\($0.channelCount)" } ?? "-"
-    json["peak"] = Double(tap?.peakLevel ?? 0)
-    let db = tap?.peakDBFS ?? -Double.infinity
+    json["peak"] = Double(activityClock?.peakLevel ?? 0)
+    let db = activityClock?.peakDBFS ?? -Double.infinity
     json["peakDBFS"] = db.isFinite ? db : -120
-    json["rms"] = tap?.rmsLevel ?? 0
-    json["levelAdvice"] = Self.levelAdvice(tap)
+    json["rms"] = activityClock?.rmsLevel ?? 0
+    json["levelAdvice"] = Self.levelAdvice(activityClock)
     let procs: [String] = CoreAudioInfo.processes().map(\.bundleID).filter { !$0.isEmpty }
     json["audioProcesses"] = procs
 
@@ -243,10 +276,14 @@ final class ZoomCaptionApp: @unchecked Sendable {
   }
 
   /// 입력 레벨을 보고 정규화(게인 보정)가 필요한 상태인지 한 줄로 알려준다.
-  private static func levelAdvice(_ tap: SystemAudioTap?) -> String {
-    guard let tap, tap.framesSeen > 0 else { return "아직 오디오가 들어오지 않았습니다." }
-    guard tap.isHearingSound else { return "무음만 들어옵니다 — 시스템 오디오 권한을 확인하세요." }
-    let db = tap.peakDBFS
+  private static func levelAdvice(_ activityClock: AudioActivityClock?) -> String {
+    guard let activityClock, activityClock.framesSeen > 0 else {
+      return "아직 오디오가 들어오지 않았습니다."
+    }
+    guard activityClock.isHearingSound else {
+      return "무음만 들어옵니다 — 시스템 오디오 권한을 확인하세요."
+    }
+    let db = activityClock.peakDBFS
     switch db {
     case ..<(-30): return String(format: "입력이 매우 작습니다 (피크 %.1f dBFS). Zoom·시스템 볼륨을 올리면 인식률이 올라갑니다.", db)
     case ..<(-18): return String(format: "입력이 작은 편입니다 (피크 %.1f dBFS).", db)
@@ -490,9 +527,15 @@ final class ZoomCaptionApp: @unchecked Sendable {
   // MARK: - 상태
 
   func stateJSON() async -> [String: Any] {
-    let segs = store.allSegments.map {
-      ["id": $0.id, "start": $0.start, "end": $0.end,
-       "text": $0.text, "edited": $0.edited] as [String: Any]
+    let segs = store.allSegments.map { segment -> [String: Any] in
+      var payload: [String: Any] = [
+        "id": segment.id, "start": segment.start, "end": segment.end,
+        "text": segment.text, "edited": segment.edited,
+      ]
+      if let boundary = segment.boundaryAfter {
+        payload["boundaryAfter"] = boundary.rawValue
+      }
+      return payload
     }
     let isRunning = stateLock.withLock { running }
     let engine = await Summarizer.currentEngine()
@@ -506,6 +549,7 @@ final class ZoomCaptionApp: @unchecked Sendable {
       // paragraph 는 Int? 라 nil 이면 아예 키를 뺀다. JSONSerialization 이
       // Optional<Int> 를 그대로 못 받아서, nil 을 그냥 넣으면 인코딩이 깨진다.
       if let p = seg.paragraph { d["paragraph"] = p }
+      if let boundary = seg.boundaryAfter { d["boundaryAfter"] = boundary.rawValue }
       return d
     }
     var json: [String: Any] = [
@@ -583,8 +627,7 @@ final class ZoomCaptionApp: @unchecked Sendable {
       // 영영 안 뜨는 훨씬 큰 문제가 된다 — 그래서 예전처럼 바로 보여주는 것으로
       // 폴백한다(문단 구분 없이, 문장마다 타임스탬프가 보이는 모양).
       for seg in added {
-        live.broadcast(event: "whisperSegment", payload: [
-          "id": seg.id, "start": seg.start, "end": seg.end, "text": seg.text])
+        live.broadcast(event: "whisperSegment", payload: whisperSegmentPayload(seg))
       }
       autosave()
       return
@@ -600,11 +643,24 @@ final class ZoomCaptionApp: @unchecked Sendable {
     // 순간에만, 이미 최종 모양으로 등장한다. 그동안 그 구간은 아래 칸
     // (실시간)이 계속 보여주고 있으니 화면에 빈 자리가 생기지 않는다.
     for seg in changedParagraphs {
-      guard let p = seg.paragraph else { continue }
-      live.broadcast(event: "whisperSegment", payload: [
-        "id": seg.id, "start": seg.start, "end": seg.end, "text": seg.text, "paragraph": p])
+      guard seg.paragraph != nil else { continue }
+      live.broadcast(event: "whisperSegment", payload: whisperSegmentPayload(seg))
     }
     autosave()
+  }
+
+  /// Whisper 문장을 상태 스냅샷과 SSE에서 같은 모양으로 보낸다. 강의 종료 표식을
+  /// 추가한 뒤 어떤 경로는 필드를 빼먹는 일을 막기 위해 payload 조립을 한곳에 둔다.
+  private func whisperSegmentPayload(_ segment: Segment) -> [String: Any] {
+    var payload: [String: Any] = [
+      "id": segment.id,
+      "start": segment.start,
+      "end": segment.end,
+      "text": segment.text,
+    ]
+    if let paragraph = segment.paragraph { payload["paragraph"] = paragraph }
+    if let boundary = segment.boundaryAfter { payload["boundaryAfter"] = boundary.rawValue }
+    return payload
   }
 
   // MARK: - 세션 제어
@@ -646,7 +702,25 @@ final class ZoomCaptionApp: @unchecked Sendable {
     // 이어 적기가 아니면 이번 수업용 폴더를 만든다.
     let (_, created) = try ensureSessionDir(override: baseDir, folder: folder)
     if created { log("세션 폴더: \(store.sessionDir!.path)") }
+    let recordingStartOffset = store.timeBase
     store.beginRecording()
+
+    // 실제 탭과 관리자 되먹임 모두 아래의 같은 sink를 지나므로, 활동 시계도 여기서
+    // 딱 한 번 관측한다. 탭 내부에서도 재면 프레임 수와 RMS 표본이 두 배로 집계된다.
+    let activityClock = AudioActivityClock()
+    let newRecordingGeneration = UUID()
+    let previousBoundaryTask = stateLock.withLock { () -> Task<Void, Never>? in
+      let previousTask = lectureBoundaryTask
+      lectureBoundaryTask = nil
+      lectureBoundaryTaskID = nil
+      audioActivityClock = activityClock
+      currentRecordingStartOffset = recordingStartOffset
+      recordingGeneration = newRecordingGeneration
+      lectureBoundaryProcessing = false
+      lastHandledLectureBoundarySoundAt = nil
+      return previousTask
+    }
+    previousBoundaryTask?.cancel()
 
     // 사용자가 적은 용어 + 교안에서 뽑은 용어
     let allTerms = Array((terms + store.domainTerms).reduce(into: [String]()) {
@@ -718,9 +792,14 @@ final class ZoomCaptionApp: @unchecked Sendable {
       "done": 0, "total": 0, "note": stateLock.withLock { whisperLiveNote } ?? ""])
     archive = clip
 
-    let sink: @Sendable (AVAudioPCMBuffer) -> Void = { [weak lecture] buf in
-      lecture?.feed(buf)
-      clip?.write(buf)
+    // var인 `clip`을 @Sendable 오디오 콜백에서 직접 잡으면, 이후 값이 바뀔 수 있는
+    // 캡처로 취급된다. 준비가 끝난 이 시점의 아카이브를 의미가 드러나는 let으로
+    // 고정해 콜백 전체가 한 녹음 파일만 쓰게 한다.
+    let recordingAudioArchive = clip
+    let sink: @Sendable (AVAudioPCMBuffer) -> Void = { [weak lecture] audioBuffer in
+      activityClock.observe(audioBuffer)
+      lecture?.feed(audioBuffer)
+      recordingAudioArchive?.write(audioBuffer)
     }
     audioSink = sink
 
@@ -728,6 +807,9 @@ final class ZoomCaptionApp: @unchecked Sendable {
     if stateLock.withLock({ adminFeedPending }) {
       stateLock.withLock { adminFeedPending = false }
       live.broadcast(event: "status", payload: ["running": true, "message": ""])
+      // 관리자 파일 되먹임도 실제 캡처와 같은 180초 무음 감시를 거친다. 시험 파일이
+      // 끝난 뒤 녹음은 계속 살아 있으므로, 마지막 유효 샘플 기준으로 경계가 발생한다.
+      startSilenceWatchdog()
       log("녹음 시작 (관리자 되먹임) — \(store.title)")
       return
     }
@@ -741,6 +823,7 @@ final class ZoomCaptionApp: @unchecked Sendable {
       await lecture.finish()
       lectureTranscriber = nil
       await archive?.finish(); archive = nil
+      audioActivityClock = nil
       throw error
     }
     tap = audioTap
@@ -755,7 +838,7 @@ final class ZoomCaptionApp: @unchecked Sendable {
   /// 소리가 하나도 안 들어오는 상태를 알린다.
   ///
   /// 알리는 조건은 딱 하나다 — **Zoom 은 CoreAudio 상으로 "지금 소리를 낸다"고
-  /// 스스로 보고하는데, 우리 탭은 30초(SystemAudioTap.recentSoundWindow) 넘게
+  /// 스스로 보고하는데, 우리 입력은 30초(AudioActivityClock.recentSoundWindow) 넘게
   /// 아무것도 못 들은 경우.** 이게 권한 문제(macOS 는 에러 대신 무음을 흘려보낸다)나
   /// 이어폰 전환 등으로 탭이 죽었다는 확실한 신호다. Zoom 자체가 조용한 경우(회의에
   /// 안 들어갔거나 발표자가 말을 안 하는 것)는 강의자 쪽 사정이지 이 앱의 문제가
@@ -768,14 +851,24 @@ final class ZoomCaptionApp: @unchecked Sendable {
   /// 20초마다 매번 다시 알리면 강의 쉬는 시간 10분 동안 30번 반복되므로,
   /// **상태가 바뀔 때(조용해질 때 / 돌아올 때)만** 로그·알림을 낸다.
   private func startSilenceWatchdog() {
-    stateLock.withLock { wasSilent = false; silenceNotified = false }   // 새 녹음 구간은 매번 깨끗한 상태에서 시작
+    stateLock.withLock {
+      // 새 녹음 구간은 캡처 이상 알림과 강의 경계 모두 깨끗한 상태에서 시작한다.
+      wasSilent = false
+      silenceNotified = false
+      lectureBoundaryProcessing = false
+      lastHandledLectureBoundarySoundAt = nil
+    }
 
     let timer = DispatchSource.makeTimerSource(queue: .global())
     timer.schedule(deadline: .now() + 12, repeating: 20)
     timer.setEventHandler { [weak self] in
-      guard let self, let tap = self.tap, tap.framesSeen > 0 else { return }
+      guard let self,
+            self.stateLock.withLock({ self.running }),
+            let activityClock = self.stateLock.withLock({ self.audioActivityClock }),
+            activityClock.framesSeen > 0
+      else { return }
 
-      let silentNow = !tap.isHearingSound
+      let silentNow = !activityClock.isHearingSound
       let wasSilentBefore = self.stateLock.withLock { () -> Bool in
         let prev = self.wasSilent
         self.wasSilent = silentNow
@@ -786,16 +879,29 @@ final class ZoomCaptionApp: @unchecked Sendable {
         if wasSilentBefore {   // 방금 회복된 그 틱에서만 한 번
           log("오디오 입력 복구됨 — 다시 소리가 들어오고 있습니다.")
           self.live.broadcast(event: "status", payload: ["silent": false])
-          self.stateLock.withLock { self.silenceNotified = false }   // 다음 무음 구간엔 다시 알릴 수 있게
+          // 강의 경계의 재무장은 아래 beginLectureBoundaryIfNeeded가 마지막 유효
+          // 소리 시각을 비교해 자동 처리한다. 여기서는 캡처 경고 상태만 되돌린다.
+          self.stateLock.withLock { self.silenceNotified = false }
         }
         return
+      }
+
+      // 캡처 이상 경고(30초)와 강의 종료 경계(180초)는 같은 마지막 소리 시각을
+      // 읽지만 서로 독립된 정책이다. 경계 처리는 관리자 되먹임처럼 tap이 없는
+      // 경우에도 실행되며, 내부에서 Whisper 대기 후 같은 무음인지 다시 검증한다.
+      if let silencePeriod = activityClock.silencePeriod,
+         silencePeriod.duration >= Self.lectureBoundarySilenceSeconds {
+        self.beginLectureBoundaryIfNeeded(activityClock: activityClock,
+                                          silencePeriod: silencePeriod)
       }
 
       // 이미 이번 무음 구간에서 알렸으면 반복하지 않는다. 아직이면 조용한 동안
       // 매 틱(20초마다) 계속 재확인한다 — 무음이 시작된 바로 그 틱에 하필
       // 시스템 전체가 조용해서(playing.isEmpty) 판단 근거가 없었어도, 몇 틱 뒤
       // Zoom이 다시 소리를 내기 시작하면 그때 잡아내야 하기 때문이다.
-      guard !(self.stateLock.withLock { self.silenceNotified }) else { return }
+      guard self.tap != nil,
+            !(self.stateLock.withLock { self.silenceNotified })
+      else { return }
 
       // "앱이 떠 있다" 가 아니라 "지금 소리를 내고 있다" 로 판정해야 한다.
       // Zoom 은 회의에 안 들어가 있어도 오디오 프로세스를 들고 있어서, 앱 존재로 재면 늘 참이 된다.
@@ -823,6 +929,165 @@ final class ZoomCaptionApp: @unchecked Sendable {
     }
     timer.resume()
     silenceWatchdog = timer
+  }
+
+  /// 같은 180초 무음에서 하나의 경계 작업만 시작한다. 실제 처리는 비동기로 돌려
+  /// 감시 타이머 큐를 막지 않는다. `recordingGeneration`과 작업 ID를 함께 캡처해
+  /// 정지·재시작 경계에서 오래된 작업이 새 세션을 변경하지 못하게 한다.
+  private func beginLectureBoundaryIfNeeded(activityClock: AudioActivityClock,
+                                            silencePeriod: AudioActivityClock.SilencePeriod) {
+    let boundaryTaskID = UUID()
+    let claimedContext: (generation: UUID, recordingStartOffset: Double)? = stateLock.withLock {
+      guard running, !starting, !stopping,
+            !lectureBoundaryProcessing,
+            lastHandledLectureBoundarySoundAt != silencePeriod.lastNonSilentAt
+      else { return nil }
+
+      lectureBoundaryProcessing = true
+      lectureBoundaryTaskID = boundaryTaskID
+      return (recordingGeneration, currentRecordingStartOffset)
+    }
+    guard let claimedContext else { return }
+
+    let boundaryTask = Task { [weak self] in
+      guard let self else { return }
+      let boundaryWasApplied = await self.applyLectureBoundary(
+        activityClock: activityClock,
+        silencePeriod: silencePeriod,
+        recordingGeneration: claimedContext.generation,
+        recordingStartOffset: claimedContext.recordingStartOffset)
+
+      self.stateLock.withLock {
+        // 이 작업이 끝나는 사이 stop/start가 새 작업을 세웠다면 그 상태는 건드리지 않는다.
+        guard self.lectureBoundaryTaskID == boundaryTaskID else { return }
+        self.lectureBoundaryProcessing = false
+        if boundaryWasApplied {
+          self.lastHandledLectureBoundarySoundAt = silencePeriod.lastNonSilentAt
+        }
+        self.lectureBoundaryTask = nil
+        self.lectureBoundaryTaskID = nil
+      }
+    }
+
+    stateLock.withLock {
+      // 유휴 Whisper라 작업이 매우 빨리 끝난 경우 완료 쪽에서 ID를 이미 지웠을 수 있다.
+      // 그때 완료된 Task 참조를 다시 저장하지 않는다.
+      if lectureBoundaryTaskID == boundaryTaskID {
+        lectureBoundaryTask = boundaryTask
+      } else {
+        boundaryTask.cancel()
+      }
+    }
+  }
+
+  /// 긴 무음 직전의 Whisper 꼬리와 문단을 확정하고 강의 종료 표식을 저장한다.
+  /// 반환값이 false면 어떤 경계 상태도 확정하지 않았다는 뜻이며, 감시 타이머가 다음
+  /// 틱에서 다시 시도할 수 있다.
+  private func applyLectureBoundary(activityClock: AudioActivityClock,
+                                    silencePeriod: AudioActivityClock.SilencePeriod,
+                                    recordingGeneration expectedRecordingGeneration: UUID,
+    recordingStartOffset: Double) async -> Bool {
+    if let recordingArchive = archive {
+      let pendingAudioWasReleased = await recordingArchive.flushPendingForLectureBoundary(
+        timeout: Self.lectureBoundaryArchiveWaitSeconds)
+      guard pendingAudioWasReleased else {
+        if !Task.isCancelled {
+          logWarn("180초 무음 경계 보류 — 남은 오디오 조각을 아직 안전하게 방출할 수 없어 다음 감시 주기에 다시 시도합니다.")
+        }
+        return false
+      }
+    }
+
+    if let whisperWorker = whisperLive {
+      let whisperBecameIdle = await whisperWorker.waitUntilIdle(
+        timeout: Self.lectureBoundaryWhisperWaitSeconds)
+      guard whisperBecameIdle else {
+        if !Task.isCancelled {
+          logWarn("180초 무음 경계 보류 — Whisper가 아직 작업 중이라 다음 감시 주기에 다시 시도합니다.")
+        }
+        return false
+      }
+    }
+
+    return commitLectureBoundary(
+      activityClock: activityClock,
+      silencePeriod: silencePeriod,
+      recordingGeneration: expectedRecordingGeneration,
+      recordingStartOffset: recordingStartOffset)
+  }
+
+  /// 비동기 Whisper 대기 뒤의 실제 상태 변경을 한 임계 구역에서 수행한다. stop도 이
+  /// 락을 통과한 뒤 최종 flush를 시작하므로, 작업 Task 참조가 저장되기 전 stop과
+  /// 엇갈리는 극단적인 경우에도 pending 문장을 두 스레드가 동시에 비우지 않는다.
+  private func commitLectureBoundary(activityClock: AudioActivityClock,
+                                     silencePeriod: AudioActivityClock.SilencePeriod,
+                                     recordingGeneration expectedRecordingGeneration: UUID,
+                                     recordingStartOffset: Double) -> Bool {
+    lectureBoundaryMutationLock.withLock {
+      guard !Task.isCancelled else { return false }
+      let stillCurrentRecording = stateLock.withLock {
+        running && !stopping
+          && recordingGeneration == expectedRecordingGeneration
+          && audioActivityClock === activityClock
+      }
+      guard stillCurrentRecording,
+            activityClock.hasMaintainedSilence(
+              silencePeriod, forAtLeast: Self.lectureBoundarySilenceSeconds)
+      else {
+        // Whisper를 기다리는 동안 새 소리가 들어왔다면 오래된 volatile이나 문단을
+        // 건드리지 않는다. 새 소리가 다시 180초 멎었을 때 새 스냅샷으로 재시도한다.
+        return false
+      }
+
+      // Whisper 워커의 onLines 콜백이 끝나 유휴가 된 뒤이므로, 여기서 pending을
+      // 비우면 무음 전 마지막 조각과 무음 후 새 강의가 한 문장으로 합쳐지지 않는다.
+      if let pendingSentenceLines = sentenceBuffer?.flushPendingForLectureBoundary(),
+         !pendingSentenceLines.isEmpty {
+        ingestWhisperLines(pendingSentenceLines)
+      }
+
+      // 문단 모델이 오른쪽 문맥을 기다리며 숨겨 둔 마지막 문장들도 현재 정보만으로
+      // 확정한다. 다음 Whisper 문장은 Store가 기억한 경계 ID 때문에 새 문단이 된다.
+      for finalizedSegment in store.finalizeParagraphsForLectureBoundary() {
+        guard finalizedSegment.paragraph != nil else { continue }
+        live.broadcast(event: "whisperSegment",
+                       payload: whisperSegmentPayload(finalizedSegment))
+      }
+
+      let boundaryUpdate = store.markLatestSegmentAsLectureEnded(after: recordingStartOffset)
+      if let boundaryUpdate {
+        live.broadcast(event: "lectureBoundary", payload: [
+          "collection": boundaryUpdate.collection.rawValue,
+          "id": boundaryUpdate.segment.id,
+          "boundaryAfter": TranscriptBoundary.lectureEnded.rawValue,
+        ])
+      }
+
+      // 위의 동기 작업 사이에 새 강의가 시작되면 그 새 volatile을 비우면 안 된다.
+      // 180초 경계와 문단 확정은 첫 재검사 시점에 이미 유효했으므로 유지하되, 임시
+      // 문구만 두 번째 재검사 결과가 true일 때 지운다.
+      let sameSilenceStillActive = activityClock.hasMaintainedSilence(
+        silencePeriod, forAtLeast: Self.lectureBoundarySilenceSeconds)
+      if sameSilenceStillActive {
+        store.clearVolatileAtLectureBoundary(track: .lecture)
+      } else {
+        log("강의 경계 확정 직후 새 소리가 들어와 현재 volatile은 유지합니다.")
+      }
+      autosave()
+
+      if boundaryUpdate != nil {
+        log("180초 연속 무음 — Whisper 꼬리와 문단을 확정하고 마지막 문장에 강의 종료 경계를 기록했습니다.")
+      } else {
+        // 유효 소리는 있었지만 두 전사기가 영속 문장을 하나도 만들지 못한 경우다.
+        // 붙일 문장을 임의로 만들지 않고 꼬리 정리와 volatile clear만 수행한다.
+        log("180초 연속 무음 — 영속 문장이 없어 강의 종료 표식은 생략했습니다.")
+      }
+      live.broadcast(event: "status", payload: [
+        "message": "3분 무음으로 강의 한 단위를 마무리했습니다. 녹음은 계속됩니다.",
+        "level": "info",
+      ])
+      return true
+    }
   }
 
   @discardableResult
@@ -870,6 +1135,22 @@ final class ZoomCaptionApp: @unchecked Sendable {
     }
 
     silenceWatchdog?.cancel(); silenceWatchdog = nil
+    let boundaryTaskToCancel = stateLock.withLock { () -> Task<Void, Never>? in
+      let task = lectureBoundaryTask
+      lectureBoundaryTask = nil
+      lectureBoundaryTaskID = nil
+      lectureBoundaryProcessing = false
+      lastHandledLectureBoundarySoundAt = nil
+      audioActivityClock = nil
+      return task
+    }
+    boundaryTaskToCancel?.cancel()
+    // 취소 신호만 보내고 바로 sentenceBuffer를 finalize하면 두 작업이 같은 pending을
+    // 동시에 비울 수 있다. 작업 종료까지 짧게 기다린 뒤 정지 마무리를 시작한다.
+    await boundaryTaskToCancel?.value
+    // beginLectureBoundaryIfNeeded가 Task 참조를 저장하기 직전에 stop과 엇갈린 경우엔
+    // 위에서 기다릴 참조가 없을 수 있다. 실제 변경 임계 구역을 한 번 통과해 그 경로까지 막는다.
+    lectureBoundaryMutationLock.withLock { }
     tap?.stop(); tap = nil
     adminFeed.stop()
 
@@ -901,9 +1182,8 @@ final class ZoomCaptionApp: @unchecked Sendable {
       // 여기서 나오는 줄들은 전부 처음 등장하는 것이다 — 그래서 whisperSegment 로
       // 온전히 보낸다(whisperParagraph 는 이미 떠 있는 줄을 갱신하는 용도라 안 맞는다).
       for seg in store.finalizeParagraphs() {
-        guard let p = seg.paragraph else { continue }
-        live.broadcast(event: "whisperSegment", payload: [
-          "id": seg.id, "start": seg.start, "end": seg.end, "text": seg.text, "paragraph": p])
+        guard seg.paragraph != nil else { continue }
+        live.broadcast(event: "whisperSegment", payload: whisperSegmentPayload(seg))
       }
     }
 

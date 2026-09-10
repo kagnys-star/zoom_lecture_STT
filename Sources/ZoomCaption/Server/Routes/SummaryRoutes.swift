@@ -24,12 +24,31 @@ extension ZoomCaptionApp {
     // ── 요약 ──
     case ("POST", "/api/summarize"):
       let from = req.json(SummarizeRequest.self)?.from
-      guard !store.segments(from: from).isEmpty else {
+      if stateLock.withLock({ running || stopping }) {
         return .response(.json(["ok": false,
-                                "error": from == nil ? "요약할 기록이 없습니다."
-                                                     : "지정한 시각 이후에 기록이 없습니다."]))
+                                "error": "녹음과 Whisper 정리가 끝난 뒤 요약해 주세요."]))
       }
-      Task { await self.runSummary(from: from) }
+      let snapshot = store.whisperSummarySnapshot(from: from)
+      guard !snapshot.isEmpty else {
+        return .response(.json(["ok": false,
+                                "error": from == nil
+                                  ? "Whisper 전사가 아직 준비되지 않았습니다."
+                                  : "지정한 시각 이후의 Whisper 전사가 없습니다."]))
+      }
+      guard case .ollama = await Summarizer.currentEngine() else {
+        return .response(.json(["ok": false,
+                                "error": "쓸 수 있는 Qwen 모델이 없습니다. `ollama pull qwen3:8b`로 내려받으세요."]))
+      }
+      let generation = stateLock.withLock { () -> Int? in
+        guard !isSummarizing else { return nil }
+        isSummarizing = true
+        summaryGeneration += 1
+        return summaryGeneration
+      }
+      guard let generation else {
+        return .response(.json(["ok": false, "error": "요약이 이미 진행 중입니다."]))
+      }
+      Task { await self.runSummary(segments: snapshot, from: from, generation: generation) }
       return .response(.json(["ok": true]))
 
     case ("POST", "/api/summary/save"):

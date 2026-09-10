@@ -127,6 +127,9 @@ final class ZoomCaptionApp: @unchecked Sendable {
 
   let stateLock = NSLock()
   var running = false
+  /// 요약 버튼의 중복 요청과 오래된 비동기 결과 저장을 막는다. stateLock이 보호한다.
+  var isSummarizing = false
+  var summaryGeneration = 0
   /// start()가 모델·오디오 장치를 준비하는 동안. stop()은 이 단계가 끝난 뒤 정리한다.
   var starting = false
   /// 오디오와 Whisper를 닫고 디스크에 저장하는 동안. 새 시작·세션 전환을 막는다.
@@ -605,6 +608,7 @@ final class ZoomCaptionApp: @unchecked Sendable {
       "seq": live.currentSeq,
       "boot": live.bootID,
       "running": isRunning,
+      "summarizing": stateLock.withLock { isSummarizing },
       "title": store.title,
       "segments": segs,
       "whisperSegments": whisper,
@@ -1508,25 +1512,55 @@ final class ZoomCaptionApp: @unchecked Sendable {
 
   // MARK: - 요약
 
-  func runSummary(from: Double?) async {
-    let scoped = store.segments(from: from)
-    let text = store.plainText(from: from)
-    log("요약 시작 — 범위 \(from.map { TranscriptStore.clock($0) + " 이후" } ?? "전체"), "
-      + "\(scoped.count)줄 / \(text.count)자, 교안 용어 \(store.domainTerms.count)개")
-    let glossary = DomainKnowledge.glossary(store.domainTerms)
-    let result = await Summarizer.summarize(transcript: text, title: store.title, glossary: glossary) { done, total in
-      self.live.broadcast(event: "summaryProgress",
-                          payload: ["done": done, "total": total], durable: false)
+  func runSummary(segments: [SummaryInputSegment], from: Double?, generation: Int) async {
+    defer {
+      stateLock.withLock {
+        if summaryGeneration == generation { isSummarizing = false }
+      }
     }
-    store.summary = result
-    let lastAt = scoped.map(\.end).max()
-    store.lastSummarizedAt = lastAt
-    live.broadcast(event: "summaryDone", payload: [
-      "markdown": result,
-      "lastSummarizedAt": lastAt ?? 0,
-      "from": from ?? 0,
-    ])
-    autosave()
-    log("요약 완료 — 마지막 지점 \(lastAt.map(TranscriptStore.clock) ?? "-")")
+    let textCount = segments.reduce(0) { $0 + $1.text.count }
+    log("요약 시작 — 범위 \(from.map { TranscriptStore.clock($0) + " 이후" } ?? "전체"), "
+      + "\(segments.count)줄 / \(textCount)자, 교안 용어 \(store.domainTerms.count)개")
+    let glossary = DomainKnowledge.glossary(store.domainTerms)
+    do {
+      let result = try await Summarizer.summarize(
+        segments: segments, title: store.title, glossary: glossary) { done, total in
+          self.live.broadcast(event: "summaryProgress",
+                              payload: ["done": done, "total": total], durable: false)
+        }
+      let isCurrent = stateLock.withLock {
+        isSummarizing && summaryGeneration == generation
+      }
+      guard isCurrent else {
+        logWarn("오래된 요약 결과를 저장하지 않았습니다 — generation \(generation)")
+        return
+      }
+      store.summary = result
+      let lastAt = segments.map(\.end).max()
+      store.lastSummarizedAt = lastAt
+      autosave()
+      stateLock.withLock {
+        if summaryGeneration == generation { isSummarizing = false }
+      }
+      live.broadcast(event: "summaryDone", payload: [
+        "ok": true,
+        "markdown": result,
+        "lastSummarizedAt": lastAt ?? 0,
+        "from": from ?? 0,
+      ])
+      log("요약 완료 — 마지막 지점 \(lastAt.map(TranscriptStore.clock) ?? "-")")
+    } catch {
+      let isCurrent = stateLock.withLock { () -> Bool in
+        guard summaryGeneration == generation else { return false }
+        isSummarizing = false
+        return true
+      }
+      guard isCurrent else { return }
+      logError("요약 실패: \(error.localizedDescription)")
+      live.broadcast(event: "summaryDone", payload: [
+        "ok": false,
+        "error": error.localizedDescription,
+      ])
+    }
   }
 }

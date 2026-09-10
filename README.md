@@ -5,7 +5,7 @@ Zoom 수업 오디오를 **실시간 한국어 자막**으로 옮기고, 고치�
 
 - 전사: `SpeechAnalyzer` / `SpeechTranscriber` (macOS 26 내장, ko-KR)
 - 오디오: Core Audio process tap — 가상 오디오 드라이버(BlackHole 등) 설치 불필요
-- 요약: 로컬 Ollama 모델(권장) → Apple Intelligence → 추출식 순으로 폴백. 전부 기기 안에서 돕니다
+- 요약: 로컬 Qwen/Ollama로 시간대별 처리. 실패하면 다른 모델로 조용히 대체하지 않습니다
 - 교안 용어: `mecab-ko` 형태소 분석. 없으면 내장 규칙으로 폴백
 - UI: `localhost` 웹 페이지
 
@@ -17,7 +17,7 @@ Zoom 수업 오디오를 **실시간 한국어 자막**으로 옮기고, 고치�
 
 시스템 조건을 확인하고, `mecab-ko`·`mecab-ko-dic`과 Ollama를 설치하고, 앱을 빌드합니다.
 메모리에 맞는 요약 모델(16GB → `qwen3:8b`)을 안내하니 `ollama pull` 로 받아주세요.
-끝나면 안내에 따라 **시스템 오디오 권한**과 **Apple Intelligence**를 켜주세요.
+끝나면 안내에 따라 **시스템 오디오 권한**을 켜주세요.
 
 요구 사항: macOS 26 이상, Apple Silicon, Command Line Tools(`xcode-select --install`).
 
@@ -270,8 +270,8 @@ Whisper 가 이미 크게 앞서 있어서, 잘못 합치면 오히려 나빠집
 | 인식 힌트 용어 | **150개** | 더 넣으면 인식이 흔들립니다 |
 | 요약 용어집 | 40개 | 프롬프트가 길어지면 녹취 요약이 밀려납니다 |
 
-교안 **전문을 요약에 넣지는 않습니다.** Apple 내장 모델은 4K 컨텍스트에 아예 안 들어가고,
-Ollama는 들어가더라도 녹취 요약을 밀어냅니다. 용어만 뽑아 쓰는 이유입니다.
+교안 **전문을 요약에 넣지는 않습니다.** 전문을 함께 넣으면 Qwen의 녹취 입력 공간을
+줄이므로, 철자 교정에 필요한 용어만 뽑아 사용합니다.
 
 **같은 교안은 두 번 분석하지 않습니다.** 파일 *내용* 해시로 결과를 캐시해 두어서, 이름을 바꿔 올려도 같은 파일이면 바로 붙습니다 — 실측 **26.5초 → 7ms**. 앱을 재시작해도 남습니다(`~/Library/Caches/ZoomCaption/domain`). 추출 규칙을 고치면 버전이 올라가 자동으로 무효화되고, **설정 → 교안 캐시 비우기** 로 직접 지울 수도 있습니다. 스캔본은 캐시하지 않습니다(OCR 후 다시 올릴 수 있어야 하니까).
 
@@ -280,28 +280,19 @@ Ollama는 들어가더라도 녹취 요약을 밀어냅니다. 용어만 뽑아 
 
 ## 요약 품질
 
-요약 엔진은 세 단계로 내려갑니다. 어떤 걸 쓰는지는 **요약** 탭 위에 표시됩니다.
+현재 자동 요약 엔진은 로컬 Qwen/Ollama 하나입니다. 사용하는 모델은 **요약** 탭 위에 표시됩니다.
 
 | 엔진 | 컨텍스트 | 특징 |
 |---|---|---|
-| **Ollama (권장)** | 32K | 88분 강의를 **쪼개지 않고 한 번에** 요약. 약 85초 |
-| Apple Intelligence | 4K | 쪼개서 요약하므로 앞뒤가 끊기고 전문 용어 환각이 잦음 |
-| 추출식 | — | 모델 없이 원문 문장을 뽑음. 왜곡은 없지만 구조화 안 됨 |
+| **Qwen/Ollama** | 32K | 쉬는 시간 경계로 나누고, 큰 시간대만 내부 청킹해 순서대로 요약 |
 
-같은 녹취로 비교한 결과입니다.
+Ollama 또는 Qwen 모델이 없거나 호출에 실패하면 Apple·추출식 결과로 조용히 대체하지 않습니다.
+기존 요약을 보존하고 오류를 표시하므로 설치나 모델 상태를 고친 뒤 다시 시도할 수 있습니다.
 
-| 용어 | Apple 내장(~3B) | Ollama qwen3:8b | 녹취 원문 |
-|---|---|---|---|
-| 렐루 | "0보다 크면 1을 반환" ✗ | "양수 구간에서 기울기가 1" ✓ | 기울기가 1 |
-| 패딩 | "데이터를 보호" ✗ | "가장자리에 0을 채워" ✓ | 0을 채우는 것 |
-| 스트라이드 | "이동하는 속도" ✗ | "필터가 움직이는 간격" ✓ | 움직이는 간격 |
-
-Apple 내장 모델은 4K 컨텍스트 탓에 map-reduce로 쪼개야 해서 강의 후반부가 통째로 빠지기도 합니다.
-
-출력 형식은 모델이 아니라 **스키마로 강제**합니다(Ollama는 `format` JSON 스키마, Apple은
-`DynamicGenerationSchema`). 그래서 `한 줄 요약 / 주요 내용 / 핵심 용어 / 과제·공지` 구조가
-매번 동일하게 나옵니다. 공지·과제는 재요약을 거치지 않아 "다음 주 금요일 자정" 같은 기한이
-사라지지 않습니다.
+출력 형식은 모델이 아니라 Ollama의 `format` JSON 스키마와 Swift 렌더러가 정합니다.
+각 시간대는 `구간 요약 / 핵심과 설명 / 핵심 용어`로 표시하며 핵심 개수를 네 개로 강제하지
+않습니다. 과제·공지 섹션은 만들지 않습니다. 화면의 시간 범위는 모델 출력이 아니라 원본
+Whisper 세그먼트의 시각으로 표시합니다.
 
 ### 요약 범위 지정
 
@@ -318,7 +309,7 @@ Apple 내장 모델은 4K 컨텍스트 탓에 map-reduce로 쪼개야 해서 강
 
 ### 모델 고르기
 
-`OllamaClient.preferredModels` 순서대로 설치된 것을 자동 선택합니다.
+설치된 Qwen 계열 중 권장 순서에 맞는 모델을 자동 선택합니다.
 
 ```bash
 ollama pull qwen3:8b     # 16GB RAM 권장 (약 5GB)
@@ -338,7 +329,7 @@ ollama pull qwen3:4b     # 8GB
 그래서 앱은 이렇게 동작합니다.
 
 1. 요약을 누르면 Ollama 서버가 꺼져 있어도 **자동으로 띄웁니다** (`ollama serve` 를 직접 칠 필요 없음).
-2. 요약이 끝나면 `keep_alive: 0` 으로 **모델을 즉시 내립니다.** 기본값인 5분 상주를 쓰지 않습니다.
+2. 여러 시간대를 처리하는 동안에는 모델을 잠시 유지하고, 전체 개요까지 끝나면 **모델을 내립니다.**
 3. 앱을 종료하면 앱이 띄운 서버도 같이 내려갑니다. 직접 띄워둔 서버는 건드리지 않습니다.
 
 모델 재적재는 **1.7초**밖에 안 걸려서 붙들고 있을 이유가 없습니다.
@@ -351,7 +342,8 @@ brew services stop ollama     # 상주 끄기 (앱이 필요할 때 띄움)
 brew services start ollama    # 다시 상주시키기
 ```
 
-모델이 아예 없거나 Ollama가 설치돼 있지 않으면 자동으로 Apple 내장 모델로 내려갑니다.
+모델이 없거나 Ollama가 설치돼 있지 않으면 Qwen 요약과 LLM 다듬기를 사용할 수 없습니다.
+녹취·세션 저장 같은 나머지 기능은 계속 사용할 수 있습니다.
 
 ## 다른 사람에게 주기
 
@@ -366,7 +358,7 @@ brew services start ollama    # 다시 상주시키기
 경고 없이 배포하려면 Apple Developer Program(연 $99)에 가입해 Developer ID로 서명하고
 공증(notarize)해야 합니다. 그 전까지는 소스째 주고 `setup.sh` 로 각자 빌드하는 쪽이 깔끔합니다.
 
-받는 사람 쪽 조건: **macOS 26 이상 + Apple Silicon**. 권한과 Apple Intelligence는 각자 켜야 합니다.
+받는 사람 쪽 조건: **macOS 26 이상 + Apple Silicon**. 시스템 오디오 권한은 각자 켜야 합니다.
 
 ## 문제 해결
 
@@ -485,8 +477,11 @@ Sources/ZoomCaption/
 | `Analysis/Gold.swift` | 정답지 저장·CER 계산 |
 | `Analysis/DomainKnowledge.swift` | PDF 텍스트 추출, mecab-ko 용어 추출 (+ 규칙 폴백) |
 | `Analysis/DomainCache.swift` | 교안 분석 결과 캐시 (내용 해시 기준) |
-| `Summary/Summarizer.swift` | 엔진 선택(Ollama→Apple→추출식), 스키마 정의, 마크다운 렌더 |
-| `Summary/OllamaClient.swift` | 로컬 Ollama 호출, JSON 스키마 구조화 출력 |
+| `Summary/Summarizer.swift` | Qwen 시간대별 요약 오케스트레이션과 오류 처리 |
+| `Summary/SummaryChunker.swift` | 강의 경계 분리와 과대 시간대 내부 청킹 |
+| `Summary/SummaryRenderer.swift` | 시간대·핵심·용어 Markdown 렌더링 |
+| `Summary/OllamaQwenSummaryClient.swift` | Qwen 프롬프트와 JSON 스키마 구조화 출력 |
+| `Summary/OllamaClient.swift` | 로컬 Ollama 서버 관리와 기존 LLM 다듬기 |
 | `Storage/Store.swift` | 자막 저장소, 편집, 이어 적기 오프셋, SRT/MD 내보내기 |
 | `Storage/Session.swift` | 세션 폴더 생성·목록·저장·불러오기, 폴더 선택 다이얼로그 |
 | `Support/Logger.swift` | 파일 로깅, 일자별 회전, 14일 보관 |

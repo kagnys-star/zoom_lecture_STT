@@ -1,10 +1,6 @@
 import Foundation
 
 /// 로컬에서 도는 Ollama 서버에 붙는다.
-///
-/// Apple 내장 모델(~3B, 컨텍스트 4K)은 한국어 전문 용어에서 환각이 잦고,
-/// 4K 제약 때문에 긴 강의를 쪼개 요약할 수밖에 없어 앞뒤가 끊긴다.
-/// qwen3:8b 급이면 88분 강의(약 12,000토큰)를 한 번에 넣고 85초에 정리한다.
 enum OllamaClient {
   static let host = "http://127.0.0.1:11434"
 
@@ -20,6 +16,7 @@ enum OllamaClient {
   enum OllamaError: LocalizedError {
     case notRunning
     case noModel
+    case contextExceeded(estimatedTokens: Int, limit: Int)
     case badResponse(String)
 
     var errorDescription: String? {
@@ -28,6 +25,8 @@ enum OllamaClient {
         return "Ollama 서버가 떠 있지 않습니다. 터미널에서 `ollama serve` 를 실행하세요."
       case .noModel:
         return "쓸 수 있는 모델이 없습니다. `ollama pull qwen3:8b` 로 내려받으세요."
+      case .contextExceeded(let estimated, let limit):
+        return "요약 입력이 컨텍스트 한도를 넘습니다(추정 \(estimated)토큰, 한도 \(limit)토큰)."
       case .badResponse(let s):
         return "Ollama 응답을 해석할 수 없습니다: \(s)"
       }
@@ -128,124 +127,19 @@ enum OllamaClient {
     return installed.first
   }
 
-  // MARK: - 요약
-
-  private static let systemPrompt = """
-    너는 대학 수업 녹취를 정리하는 조교다. 한국어로만 답한다.
-
-    규칙:
-    - 녹취에 실제로 나온 내용만 쓴다. 네가 아는 지식을 끌어오지 마라.
-    - 녹취는 음성 인식 결과라 오탈자가 있다. 문맥으로 보정해서 읽되 내용을 바꾸지는 마라.
-    - "어", "자", "음" 같은 군더더기와 인사말, 음향 확인은 버린다.
-    - oneLine: 주제를 나열하지 말고, 이 수업이 무엇을 다뤘는지 한 문장으로.
-    - terms: 녹취에 나온 설명만으로 정의를 쓴다.
-      meaning 은 40자 안팎으로 짧게 쓰고, 용어 이름을 다시 말하지 말고 바로 정의부터 써라.
-      좋은 예 — term: "스트라이드", meaning: "필터가 움직이는 간격"
-      나쁜 예 — term: "스트라이드", meaning: "스트라이드는 필터가 움직이는 간격으로 출력 크기를 줄인다"
-      한 용어에 여러 개념을 몰아넣지 마라.
-    - keyPoints: 수업 흐름 순서대로. 앞부분에 몰리지 말고 끝까지 고르게 담아라.
-      공지·과제는 여기 넣지 마라. announcements 에만 쓴다.
-      같은 내용을 표현만 바꿔 되풀이하지 마라. 다룬 내용이 적으면 항목도 적게 써라.
-      억지로 개수를 채우지 마라.
-    - announcements: 휴강·보강·시험·과제·제출기한·교재 범위. 날짜와 조건을 그대로 옮겨라.
-    """
-
-  // terms 를 keyPoints 앞에 두면(= 복사할 문장이 아직 없게 하면) 복붙이 사라지지만,
-  // A/B 결과 프롬프트의 좋은 예/나쁜 예만으로도 복붙이 0이 되고 이 순서가 35초 더 빨랐다.
-  // maxLength 는 llama.cpp 문법 변환에서 실제로 강제되는지 확인하지 못했다. 프롬프트가 실질적인 제약이다.
-  private static let schema: [String: Any] = [
-    "type": "object",
-    "properties": [
-      "oneLine": ["type": "string"],
-      // minItems 를 높게 잡으면 내용이 적을 때 모델이 개수를 채우려고
-      // 같은 말을 표현만 바꿔 반복한다. 하한을 풀고 프롬프트로 조절한다.
-      "keyPoints": ["type": "array", "items": ["type": "string"], "minItems": 1, "maxItems": 12],
-      "terms": [
-        "type": "array",
-        "items": [
-          "type": "object",
-          "properties": [
-            "term": ["type": "string"],
-            "meaning": ["type": "string", "maxLength": 60],
-          ],
-          "required": ["term", "meaning"],
-        ],
-        "maxItems": 8,
-      ],
-      "announcements": ["type": "array", "items": ["type": "string"]],
-    ],
-    "required": ["oneLine", "keyPoints", "terms", "announcements"],
-  ]
-
-  static func summarize(transcript: String,
-                        title: String,
-                        glossary: String,
-                        model: String) async throws -> Summarizer.LectureNote {
-    let glossaryHint = glossary.isEmpty ? "" : """
-
-
-      이 수업 교안의 용어다. 녹취에 비슷하게 들리는 오탈자가 있으면 이 용어로 바로잡아라:
-      \(glossary)
-      """
-
-    // 녹취 전체가 컨텍스트에 들어가도록 num_ctx 를 잡는다. (기본값 4096이라 반드시 지정해야 한다)
-    let estimated = Int(Double(transcript.count) * tokensPerChar) + 1200
-    let numCtx = min(maxContext, max(8192, estimated + 1024))
-
-    let body: [String: Any] = [
-      "model": model,
-      "messages": [
-        ["role": "system", "content": systemPrompt + glossaryHint],
-        ["role": "user", "content": "다음은 「\(title)」 녹취다. 이걸로 복습 노트를 만들어라.\n\n---\n\(transcript)\n---"],
-      ],
-      "stream": false,
-      "format": schema,
-      "think": false,          // qwen3 계열의 사고 과정 출력을 끈다
-      // 요약이 끝나면 모델(약 5.8GB)을 즉시 메모리에서 내린다.
-      // 기본값은 5분 상주. 재적재가 1.7초라 붙들고 있을 이유가 없다.
-      "keep_alive": 0,
-      // Ollama 문서가 구조화 출력에 temperature 0 을 권장한다.
-      // 실제로 0.2 에서는 실행마다 공지 항목이 빠지거나 달라졌다.
-      "options": ["temperature": 0, "num_ctx": numCtx],
-    ]
-
-    guard let url = URL(string: "\(host)/api/chat") else { throw OllamaError.notRunning }
-    var req = URLRequest(url: url)
-    req.httpMethod = "POST"
-    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    req.httpBody = try JSONSerialization.data(withJSONObject: body)
-    req.timeoutInterval = 900   // 3시간짜리 강의도 견디도록 넉넉히
-
-    log("Ollama 요약 요청 — 모델 \(model), 입력 \(transcript.count)자, "
-      + "추정 \(estimated)토큰, num_ctx \(numCtx)"
-      + (estimated > maxContext ? "  ⚠️ 컨텍스트 한계 초과 — 앞부분이 잘릴 수 있음" : ""))
-    let startedAt = Date()
-    let (data, response) = try await URLSession.shared.data(for: req)
-    guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-      throw OllamaError.badResponse(String(data: data.prefix(300), encoding: .utf8) ?? "?")
+  /// 시간대별 요약은 현재 Qwen 계열만 지원한다. 다듬기·용어 정제에서 쓰는
+  /// 기존 pickModel은 다른 로컬 모델과의 호환을 위해 그대로 둔다.
+  static func pickSummaryModel(from installed: [String]) -> String? {
+    let qwen = installed.filter { $0.lowercased().hasPrefix("qwen") }
+    guard !qwen.isEmpty else { return nil }
+    for candidate in preferredModels where candidate.hasPrefix("qwen") {
+      if qwen.contains(candidate) { return candidate }
     }
-    guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-          let message = root["message"] as? [String: Any],
-          let content = message["content"] as? String,
-          let parsed = try JSONSerialization.jsonObject(with: Data(content.utf8)) as? [String: Any]
-    else { throw OllamaError.badResponse(String(data: data.prefix(300), encoding: .utf8) ?? "?") }
-
-    let terms = (parsed["terms"] as? [[String: Any]] ?? []).compactMap { item -> Summarizer.TermDefinition? in
-      guard let t = item["term"] as? String, let m = item["meaning"] as? String,
-            !t.isEmpty, !m.isEmpty else { return nil }
-      return Summarizer.TermDefinition(term: t, meaning: m)
+    for candidate in preferredModels where candidate.hasPrefix("qwen") {
+      let base = candidate.split(separator: ":").first.map(String.init) ?? candidate
+      if let hit = qwen.first(where: { $0.hasPrefix(base) }) { return hit }
     }
-    let keyPoints = (parsed["keyPoints"] as? [String] ?? []).filter { !$0.isEmpty }
-    let announcements = (parsed["announcements"] as? [String] ?? []).filter { !$0.isEmpty }
-    log("Ollama 요약 완료 — \(String(format: "%.1f", Date().timeIntervalSince(startedAt)))초, "
-      + "주요내용 \(keyPoints.count) · 용어 \(terms.count) · 공지 \(announcements.count)")
-    if keyPoints.isEmpty { logWarn("요약 결과의 주요 내용이 비어 있습니다. 입력이 너무 짧거나 잘렸을 수 있습니다.") }
-
-    return Summarizer.LectureNote(
-      oneLine: parsed["oneLine"] as? String ?? "",
-      keyPoints: keyPoints,
-      terms: terms,
-      announcements: announcements)
+    return qwen.first
   }
 
   // MARK: - 교안 용어 정제

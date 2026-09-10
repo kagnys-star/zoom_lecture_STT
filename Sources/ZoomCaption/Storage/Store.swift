@@ -446,6 +446,26 @@ final class TranscriptStore: @unchecked Sendable {
     return base.filter { $0.start >= from }
   }
 
+  /// 시간대별 요약은 품질과 경계 출처를 고정하기 위해 Whisper 기록만 사용한다.
+  /// 배열을 잠금 안에서 값 복사해 모델 호출 중 원본이 바뀌어도 한 작업의 입력은 같다.
+  func whisperSummarySnapshot(from: Double?) -> [SummaryInputSegment] {
+    lock.withLock {
+      whisperSegments
+        .filter { segment in
+          guard let from else { return true }
+          return segment.start >= from
+        }
+        .map {
+          SummaryInputSegment(id: $0.id,
+                              start: $0.start,
+                              end: $0.end,
+                              text: $0.text,
+                              paragraph: $0.paragraph,
+                              boundaryAfter: $0.boundaryAfter)
+        }
+    }
+  }
+
   /// 요약·저장용 평문. 시간순으로 잇는다.
   func plainText(from: Double? = nil, includeTimestamps: Bool = true) -> String {
     segments(from: from).map { seg in

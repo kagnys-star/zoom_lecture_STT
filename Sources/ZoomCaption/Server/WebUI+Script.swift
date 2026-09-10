@@ -517,6 +517,7 @@ extension WebUI {
       $('#curSub').textContent = '시작하면 폴더가 만들어집니다';
     }
     $('#engineLine').textContent = s.summaryEngine ? '요약 엔진: ' + s.summaryEngine : '';
+    $('#btnSummarize').disabled = !!s.summarizing;
     notice('#sesNotice', 'info', s.continuing
       ? `이어 적기 모드입니다. 새 자막은 <b>${clock(s.timeBase)}</b> 이후 시각으로 붙습니다.` : '');
     if (s.domainSource) renderDoc({ name: s.domainSource, terms: s.domainTerms || [] });
@@ -607,8 +608,10 @@ extension WebUI {
     const inline = s => esc(s).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/`(.+?)`/g, '<code>$1</code>');
     for (let raw of lines) {
       const l = raw.trim();
-      if (/^#{1,3}\s/.test(l)) { if (inUl) { out += '</ul>'; inUl = false; }
-        out += `<h2>${inline(l.replace(/^#{1,3}\s/, ''))}</h2>`; continue; }
+      const heading = l.match(/^(#{1,3})\s+(.+)$/);
+      if (heading) { if (inUl) { out += '</ul>'; inUl = false; }
+        const tag = heading[1].length === 1 ? 'h2' : (heading[1].length === 2 ? 'h3' : 'h4');
+        out += `<${tag}>${inline(heading[2])}</${tag}>`; continue; }
       if (/^[-*]\s/.test(l)) { if (!inUl) { out += '<ul>'; inUl = true; }
         out += `<li>${inline(l.replace(/^[-*]\s/, ''))}</li>`; continue; }
       if (inUl) { out += '</ul>'; inUl = false; }
@@ -840,8 +843,17 @@ extension WebUI {
   });
   es.addEventListener('summaryDone', e => {
     const d = JSON.parse(e.data); if (!seen(d)) return;
-    $('#summary').innerHTML = md(d.markdown);
     $('#btnSummarize').disabled = false;
+    if (!d.ok) {
+      notice('#sumNotice', 'warn', esc(d.error || '요약에 실패했습니다.'));
+      $('#summary').innerHTML = state.summary
+        ? md(state.summary)
+        : '<p class="muted-note">요약 결과가 없습니다. 문제를 해결한 뒤 다시 시도해 주세요.</p>';
+      return;
+    }
+    notice('#sumNotice', '', '');
+    state.summary = d.markdown;
+    $('#summary').innerHTML = md(d.markdown);
     $('#btnSummarize').textContent = '요약 다시 생성';
     showLastSummarized(d.lastSummarizedAt);
     $('#saveSummaryBox').style.display = '';

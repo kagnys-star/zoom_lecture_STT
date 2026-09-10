@@ -418,6 +418,8 @@ extension WebUI {
 
   #summary h2 { font-size: 15px; margin: 19px 0 8px; padding-bottom: 5px; border-bottom: 1px solid var(--line); }
   #summary h2:first-child { margin-top: 0; }
+  #summary h3 { font-size: 14px; margin: 18px 0 7px; color: var(--text); }
+  #summary h4 { font-size: 13px; margin: 14px 0 6px; color: var(--muted); }
   #summary ul { padding-left: 19px; margin: 8px 0; }
   #summary li { margin: 5px 0; line-height: 1.65; word-break: keep-all; }
   #summary p { margin: 8px 0; line-height: 1.65; }

@@ -71,10 +71,15 @@ fi
 ok "메모리 ${RAM_GB}GB → 권장 모델 $WANT_MODEL (약 $MODEL_SIZE)"
 
 if ! command -v brew >/dev/null 2>&1; then
-  warn "Homebrew가 없어 Ollama를 설치할 수 없습니다. Apple 내장 모델로 요약합니다."
+  if command -v ollama >/dev/null 2>&1; then
+    warn "Homebrew가 없습니다. 이미 설치된 Ollama를 사용합니다."
+  else
+    warn "Homebrew가 없어 Ollama를 설치할 수 없습니다. Qwen 요약과 LLM 다듬기는 사용할 수 없습니다."
+  fi
 elif ! command -v ollama >/dev/null 2>&1; then
   echo "  → Ollama 설치 중…"
-  brew install ollama >/dev/null 2>&1 && ok "Ollama 설치 완료" || warn "Ollama 설치 실패"
+  brew install ollama >/dev/null 2>&1 && ok "Ollama 설치 완료" \
+    || warn "Ollama 설치 실패 — 설치하기 전까지 Qwen 요약과 LLM 다듬기를 사용할 수 없습니다."
 else
   ok "Ollama 이미 설치됨"
 fi
@@ -87,15 +92,16 @@ if command -v ollama >/dev/null 2>&1; then
   fi
   if curl -s --max-time 3 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
     INSTALLED=$(curl -s http://127.0.0.1:11434/api/tags | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
-    if echo "$INSTALLED" | grep -qE '^(qwen3|exaone|gemma3|qwen2\.5)'; then
-      ok "요약 모델 있음: $(echo "$INSTALLED" | head -1)"
+    if echo "$INSTALLED" | grep -qE '^(qwen3|qwen2\.5)'; then
+      ok "Qwen 요약 모델 있음: $(echo "$INSTALLED" | grep -E '^(qwen3|qwen2\.5)' | head -1)"
     else
-      warn "요약 모델이 없습니다. $WANT_MODEL 를 받으려면 (약 $MODEL_SIZE, 시간이 걸립니다):"
+      warn "Qwen 요약 모델이 없습니다. $WANT_MODEL 를 받으려면 (약 $MODEL_SIZE, 시간이 걸립니다):"
       echo "      ollama pull $WANT_MODEL"
-      warn "받지 않아도 앱은 Apple 내장 모델로 요약합니다."
+      warn "받기 전까지 Qwen 요약을 사용할 수 없습니다. 다른 앱 기능은 계속 사용할 수 있습니다."
     fi
   else
-    warn "Ollama 서버를 띄우지 못했습니다. 모델을 받으려면 'ollama serve' 후 'ollama pull $WANT_MODEL'."
+    warn "Ollama 서버를 띄우지 못했습니다. Qwen 요약과 LLM 다듬기를 사용할 수 없습니다."
+    warn "모델을 받으려면 'ollama serve' 후 'ollama pull $WANT_MODEL'."
   fi
 
   # Ollama 를 로그인 때마다 상주시킬 필요가 없다. 앱이 요약할 때만 알아서 띄운다.
@@ -155,11 +161,7 @@ cat <<'GUIDE'
      ※ 권한이 없으면 macOS가 오류 대신 '무음'을 흘려보내서
         자막이 한 줄도 안 생깁니다. 앱이 이 상태를 감지하면 경고를 띄웁니다.
 
-  ② Apple Intelligence  (권장)
-     시스템 설정 → Apple Intelligence & Siri → 켜기
-     → 요약 품질이 크게 올라갑니다. 꺼져 있으면 추출식 요약으로 대체됩니다.
-
-  ③ 한국어 인식 모델
+  ② 한국어 인식 모델
      앱을 처음 켜면 필요 시 자동으로 내려받습니다. (보통 이미 설치되어 있음)
 GUIDE
 

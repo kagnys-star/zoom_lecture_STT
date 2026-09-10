@@ -274,10 +274,25 @@ extension WebUI {
         </div>
         <div id="adminClips" class="hint" style="margin-top:8px"></div>
         <div id="adminNote"></div>
+        <div style="border-top:1px solid var(--line);margin:14px 0 12px"></div>
+        <label>관리자 — Zoom 캡처 A/B</label>
+        <div class="hint">운영 녹음을 정지한 상태에서 후보 하나씩 측정합니다. 오디오는
+          저장하거나 전사하지 않습니다. 같은 경로를 초기화해 ① 원격만 재생, ② 원격을
+          멈추고 로컬 마이크로 고유 문구 발화 순서로 비교하세요.</div>
+        <div class="row" style="margin-top:9px">
+          <select id="adminProbeProcess" aria-label="A/B 오디오 프로세스"></select>
+          <button id="btnAdminProbeRefresh" class="sm" style="flex:0 0 auto">후보 새로고침</button>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <select id="adminProbeRoute" aria-label="A/B 출력 경로"></select>
+          <button id="btnAdminProbeStart" class="sm primary" style="flex:0 0 auto">측정 시작·초기화</button>
+          <button id="btnAdminProbeStop" class="sm" style="flex:0 0 auto">측정 종료</button>
+        </div>
+        <div id="adminProbeResult" class="hint" style="margin-top:8px"></div>
       </div>
       <div class="field">
         <label>녹음</label>
-        <div class="hint" style="margin-bottom:9px">Zoom 소리를 잡습니다. Zoom이 꺼져 있으면 시스템 전체 오디오로 자동 전환됩니다.</div>
+        <div class="hint" style="margin-bottom:9px">Zoom 소리만 잡습니다. Zoom 회의 오디오 프로세스를 찾지 못하면 다른 앱의 소리를 잡지 않고 시작을 중단합니다.</div>
         <label class="check"><input type="checkbox" id="keepAudio" checked>
           <span>소리도 함께 저장<span class="hint">수업 폴더에 WAV로 남깁니다(<b>시간당 약 110MB</b>).
           나중에 인식이 틀린 곳을 다시 듣거나 재전사하려면 필요합니다.</span></span></label>

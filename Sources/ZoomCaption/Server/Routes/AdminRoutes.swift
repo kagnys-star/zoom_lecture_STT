@@ -88,16 +88,150 @@ extension ZoomCaptionApp {
     // Zoom 이 실제로 소리를 내야만 아무것도 확인할 수 없다는 게 이 앱의 가장 큰 제약이었다.
     // 저장된 WAV 를 같은 파이프라인에 되먹이면 수업 없이도 끝까지 시험할 수 있다.
     case ("GET", "/api/admin"):
+      let currentAudioProbePayload: Any = administratorAudioProbe.snapshot().map {
+        administratorAudioProbePayload($0) as Any
+      } ?? NSNull()
       return .response(.json([
         "enabled": options.admin,
         "feeding": adminFeed.isRunning,
         "note": adminFeed.note,
+        "audioProbe": currentAudioProbePayload,
         "clips": store.sessionDir.map { dir in
           AudioArchive.clips(in: dir).map {
             ["name": $0.url.lastPathComponent, "path": $0.url.path,
              "start": $0.startOffset, "bytes": $0.bytes] as [String: Any]
           }
         } ?? [],
+      ]))
+
+    // ── 관리자 실제 탭 A/B probe ──
+    // 운영 녹음에 들어갈 resolver를 미리 확정하지 않고, 현재 HAL이 노출하는 Zoom
+    // 프로세스·출력 장치·스트림 후보와 각 후보의 PCM 활동만 독립적으로 측정한다.
+    case ("GET", "/api/admin/audio/probe/candidates"):
+      guard options.admin else {
+        return .response(.json(["ok": false, "error": "관리자 모드에서만 사용할 수 있습니다."]))
+      }
+      let zoomRelatedAudioProcesses = CoreAudioInfo.processes().filter {
+        // `contains("zoom")`은 이 앱의 `com.local.zoomcaption`까지 후보로 넣는다.
+        // Zoom 데스크톱 앱 계열의 실제 번들 네임스페이스만 열어 A/B 목록 자체가
+        // 다른 프로세스의 소리를 잘못 측정하도록 유도하지 않게 한다.
+        $0.bundleID.lowercased().hasPrefix("us.zoom.")
+      }
+      let processPayloads: [[String: Any]] = zoomRelatedAudioProcesses.map { audioProcess in
+        let outputDevicePayloads: [[String: Any]] = CoreAudioInfo.outputDevices(
+          usedBy: audioProcess).map { outputDevice in
+            [
+              "objectID": outputDevice.objectID,
+              "uid": outputDevice.uid,
+              "name": outputDevice.name,
+              "streams": outputDevice.streams.map { outputStream in
+                [
+                  "index": outputStream.streamIndex,
+                  "objectID": outputStream.objectID,
+                ] as [String: Any]
+              },
+            ] as [String: Any]
+          }
+        return [
+          "objectID": audioProcess.objectID,
+          "pid": audioProcess.pid,
+          "bundleID": audioProcess.bundleID,
+          "hasActiveOutputIO": CoreAudioInfo.hasActiveOutputIO(audioProcess),
+          "currentlyAllowlisted": SystemAudioTap.zoomBundleIDs.contains(audioProcess.bundleID),
+          "outputDevices": outputDevicePayloads,
+        ]
+      }
+      return .response(.json(["ok": true, "processes": processPayloads]))
+
+    case ("POST", "/api/admin/audio/probe/start"):
+      guard options.admin else {
+        return .response(.json(["ok": false, "error": "관리자 모드에서만 사용할 수 있습니다."]))
+      }
+      // probe와 실제 관리자 녹음을 동시에 돌리면 어느 탭이 만든 레벨인지 사람이
+      // 혼동하기 쉽다. 데이터 격리뿐 아니라 해석 격리를 위해 녹음 중에는 시작하지 않는다.
+      guard !stateLock.withLock({ running || starting || stopping }) else {
+        return .response(.json([
+          "ok": false,
+          "error": "녹음을 정지한 뒤 A/B probe를 실행해 주세요.",
+        ]))
+      }
+      guard let request = req.json(AdministratorAudioProbeStartRequest.self),
+            let requestedProcessObjectID = request.processObjectID,
+            let selectedProcess = CoreAudioInfo.processes().first(where: {
+              $0.objectID == requestedProcessObjectID
+            })
+      else {
+        return .response(.json(["ok": false, "error": "유효한 오디오 프로세스를 선택해 주세요."]))
+      }
+
+      let normalizedDeviceUID = request.deviceUID?.trimmingCharacters(in: .whitespacesAndNewlines)
+      let requestedDeviceUID = normalizedDeviceUID?.isEmpty == false ? normalizedDeviceUID : nil
+      guard (requestedDeviceUID == nil) == (request.streamIndex == nil) else {
+        return .response(.json([
+          "ok": false,
+          "error": "장치와 스트림 순번은 함께 지정하거나 둘 다 비워야 합니다.",
+        ]))
+      }
+
+      var selectedDeviceName: String?
+      var selectedStreamObjectID: AudioStreamID?
+      if let requestedDeviceUID, let requestedStreamIndex = request.streamIndex {
+        guard let selectedOutputDevice = CoreAudioInfo.outputDevices(usedBy: selectedProcess)
+          .first(where: { $0.uid == requestedDeviceUID }),
+          let selectedOutputStream = selectedOutputDevice.streams.first(where: {
+            $0.streamIndex == requestedStreamIndex
+          })
+        else {
+          return .response(.json([
+            "ok": false,
+            "error": "선택한 장치·스트림이 현재 이 프로세스의 출력 경로에 없습니다.",
+          ]))
+        }
+        selectedDeviceName = selectedOutputDevice.name
+        selectedStreamObjectID = selectedOutputStream.objectID
+      }
+
+      let probeSelection = AdministratorAudioProbeSelection(
+        process: selectedProcess,
+        deviceUID: requestedDeviceUID,
+        deviceName: selectedDeviceName,
+        streamIndex: request.streamIndex,
+        streamObjectID: selectedStreamObjectID)
+      do {
+        let initialSnapshot = try administratorAudioProbe.start(selection: probeSelection)
+        return .response(.json([
+          "ok": true,
+          "probe": administratorAudioProbePayload(initialSnapshot),
+        ]))
+      } catch {
+        return .response(.json(["ok": false, "error": error.localizedDescription]))
+      }
+
+    case ("GET", "/api/admin/audio/probe"):
+      guard options.admin else {
+        return .response(.json(["ok": false, "error": "관리자 모드에서만 사용할 수 있습니다."]))
+      }
+      guard let currentSnapshot = administratorAudioProbe.snapshot() else {
+        return .response(.json(["ok": true, "running": false]))
+      }
+      return .response(.json([
+        "ok": true,
+        "running": true,
+        "probe": administratorAudioProbePayload(currentSnapshot),
+      ]))
+
+    case ("POST", "/api/admin/audio/probe/stop"):
+      guard options.admin else {
+        return .response(.json(["ok": false, "error": "관리자 모드에서만 사용할 수 있습니다."]))
+      }
+      let finalSnapshot = administratorAudioProbe.stop()
+      let finalProbePayload: Any = finalSnapshot.map {
+        administratorAudioProbePayload($0) as Any
+      } ?? NSNull()
+      return .response(.json([
+        "ok": true,
+        "running": false,
+        "probe": finalProbePayload,
       ]))
 
     case ("POST", "/api/admin/feed"):
@@ -156,5 +290,29 @@ extension ZoomCaptionApp {
     default:
       return nil
     }
+  }
+
+  /// A/B 시작·조회·정지가 같은 JSON 모양을 쓰게 한다. 피크가 한 번도 없으면
+  /// `-infinity`인데 JSON은 비유한 부동소수점을 표현하지 못하므로 -120dBFS로 제한한다.
+  private func administratorAudioProbePayload(
+    _ snapshot: AdministratorAudioCaptureProbe.Snapshot
+  ) -> [String: Any] {
+    [
+      "bundleID": snapshot.selection.process.bundleID,
+      "pid": snapshot.selection.process.pid,
+      "processObjectID": snapshot.selection.process.objectID,
+      "deviceUID": snapshot.selection.deviceUID ?? NSNull(),
+      "deviceName": snapshot.selection.deviceName ?? NSNull(),
+      "streamIndex": snapshot.selection.streamIndex ?? NSNull(),
+      "streamObjectID": snapshot.selection.streamObjectID ?? NSNull(),
+      "sourceFormat": snapshot.sourceFormatDescription,
+      "elapsedSeconds": snapshot.elapsedSeconds,
+      "secondsSinceBuffer": snapshot.secondsSinceMostRecentBuffer ?? NSNull(),
+      "bufferCount": snapshot.audioBufferCount,
+      "frameCount": snapshot.observedFrameCount,
+      "peakDBFS": snapshot.peakDBFS.isFinite ? snapshot.peakDBFS : -120,
+      "rms": snapshot.rmsLevel,
+      "nonSilentBufferRatio": snapshot.nonSilentBufferRatio,
+    ]
   }
 }

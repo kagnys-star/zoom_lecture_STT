@@ -11,10 +11,27 @@ private func sysAddr(_ sel: AudioObjectPropertySelector) -> AudioObjectPropertyA
                              mElement: kAudioObjectPropertyElementMain)
 }
 
-struct AudioProcessInfo {
+struct AudioProcessInfo: Sendable {
   let objectID: AudioObjectID
   let pid: pid_t
   let bundleID: String
+}
+
+/// 관리자 A/B 진단 화면에만 노출하는 출력 스트림 정보다. `streamIndex`는
+/// CATapDescription의 device/stream 초기화가 요구하는 장치 내 순번이고,
+/// `objectID`는 같은 순번이 실제 어느 HAL 스트림이었는지 로그로 남기기 위한 값이다.
+struct AudioOutputStreamInfo: Sendable {
+  let streamIndex: UInt
+  let objectID: AudioStreamID
+}
+
+/// 한 오디오 프로세스가 현재 출력에 사용하는 장치와 그 출력 스트림 목록이다.
+/// 이 정보는 아직 운영 캡처 경로를 결정하지 않으며 관리자 A/B 후보를 열거하는 데만 쓴다.
+struct AudioProcessOutputDeviceInfo: Sendable {
+  let objectID: AudioDeviceID
+  let uid: String
+  let name: String
+  let streams: [AudioOutputStreamInfo]
 }
 
 enum CoreAudioInfo {
@@ -42,23 +59,116 @@ enum CoreAudioInfo {
     }
   }
 
-  /// 그 프로세스가 **지금 실제로** 소리를 내보내고 있는지.
-  /// 앱이 떠 있는 것과는 다르다 — Zoom 은 회의에 안 들어가 있어도 오디오 프로세스를 갖고 있다.
-  static func isPlaying(_ p: AudioProcessInfo) -> Bool {
+  /// 프로세스가 출력 I/O를 실행하며 활성 출력 스트림을 가지고 있는지 확인한다.
+  ///
+  /// Core Audio의 `kAudioProcessPropertyIsRunningOutput`은 스트림 안에 실제 음성
+  /// 샘플이 있다는 뜻이 아니다. Zoom은 발표자가 침묵해도 0 PCM을 보내면서 출력
+  /// 스트림을 열어 둘 수 있으므로, 이 값을 `isPlaying`처럼 해석하면 정상 무음을
+  /// 캡처 장애로 오인한다. 이 값은 경로 진단의 보조 정보로만 사용해야 한다.
+  static func hasActiveOutputIO(_ audioProcess: AudioProcessInfo) -> Bool {
     var a = sysAddr(kAudioProcessPropertyIsRunningOutput)
     var running: UInt32 = 0
     var s = UInt32(MemoryLayout<UInt32>.size)
-    return AudioObjectGetPropertyData(p.objectID, &a, 0, nil, &s, &running) == noErr && running != 0
+    return AudioObjectGetPropertyData(audioProcess.objectID, &a, 0, nil, &s, &running) == noErr
+      && running != 0
   }
 
-  /// 지금 실제로 소리를 내보내고 있는 프로세스가 하나라도 있는지
-  static func isAnythingPlaying() -> Bool {
-    processes().contains { isPlaying($0) }
+  /// 활성 출력 I/O를 가진 프로세스가 하나라도 있는지 확인한다. 이 반환값만으로
+  /// 시스템에 사람이 들을 수 있는 소리가 재생 중이라고 판단하면 안 된다.
+  static func hasAnyProcessWithActiveOutputIO() -> Bool {
+    processes().contains { hasActiveOutputIO($0) }
   }
 
-  /// 지금 소리를 내고 있는 프로세스들의 번들 ID
-  static func playingBundleIDs() -> [String] {
-    processes().filter { isPlaying($0) }.map(\.bundleID).filter { !$0.isEmpty }
+  /// 활성 출력 I/O를 가진 프로세스들의 번들 ID. 실제 audible sample 목록이 아니라
+  /// HAL 경로 상태 목록이라는 의미가 이름에서 드러나도록 한다.
+  static func activeOutputIOBundleIDs() -> [String] {
+    processes().filter { hasActiveOutputIO($0) }.map(\.bundleID).filter { !$0.isEmpty }
+  }
+
+  /// 관리자가 프로세스별·장치별·스트림별로 실제 음성 출처를 비교할 수 있도록
+  /// 해당 프로세스가 현재 출력에 사용하는 장치를 조회한다. `scopeOutput`을 쓰지
+  /// 않으면 마이크 입력 장치도 같은 목록에 섞여 A/B 결과를 잘못 해석할 수 있다.
+  static func outputDevices(usedBy audioProcess: AudioProcessInfo)
+    -> [AudioProcessOutputDeviceInfo] {
+    var processDevicesAddress = AudioObjectPropertyAddress(
+      mSelector: kAudioProcessPropertyDevices,
+      mScope: kAudioObjectPropertyScopeOutput,
+      mElement: kAudioObjectPropertyElementMain)
+    var processDevicesDataSize: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(
+      audioProcess.objectID, &processDevicesAddress, 0, nil, &processDevicesDataSize) == noErr
+    else { return [] }
+
+    var outputDeviceObjectIDs = [AudioDeviceID](
+      repeating: AudioDeviceID(kAudioObjectUnknown),
+      count: Int(processDevicesDataSize) / MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(
+      audioProcess.objectID,
+      &processDevicesAddress,
+      0,
+      nil,
+      &processDevicesDataSize,
+      &outputDeviceObjectIDs) == noErr
+    else { return [] }
+
+    return outputDeviceObjectIDs.compactMap { outputDeviceObjectID in
+      guard let outputDeviceUID = stringProperty(
+        objectID: outputDeviceObjectID,
+        selector: kAudioDevicePropertyDeviceUID)
+      else { return nil }
+      let outputDeviceName = stringProperty(
+        objectID: outputDeviceObjectID,
+        selector: kAudioObjectPropertyName) ?? "알 수 없는 장치"
+      return AudioProcessOutputDeviceInfo(
+        objectID: outputDeviceObjectID,
+        uid: outputDeviceUID,
+        name: outputDeviceName,
+        streams: outputStreams(of: outputDeviceObjectID))
+    }
+  }
+
+  /// 장치의 출력 스트림을 HAL이 반환한 순서대로 보존한다. CATapDescription은
+  /// AudioStreamID가 아니라 장치 안의 stream index를 받으므로 두 값을 함께 보관한다.
+  private static func outputStreams(of outputDeviceObjectID: AudioDeviceID)
+    -> [AudioOutputStreamInfo] {
+    var outputStreamsAddress = AudioObjectPropertyAddress(
+      mSelector: kAudioDevicePropertyStreams,
+      mScope: kAudioObjectPropertyScopeOutput,
+      mElement: kAudioObjectPropertyElementMain)
+    var outputStreamsDataSize: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(
+      outputDeviceObjectID, &outputStreamsAddress, 0, nil, &outputStreamsDataSize) == noErr
+    else { return [] }
+
+    var outputStreamObjectIDs = [AudioStreamID](
+      repeating: AudioStreamID(kAudioObjectUnknown),
+      count: Int(outputStreamsDataSize) / MemoryLayout<AudioStreamID>.size)
+    guard AudioObjectGetPropertyData(
+      outputDeviceObjectID,
+      &outputStreamsAddress,
+      0,
+      nil,
+      &outputStreamsDataSize,
+      &outputStreamObjectIDs) == noErr
+    else { return [] }
+    return outputStreamObjectIDs.enumerated().map { streamIndex, outputStreamObjectID in
+      AudioOutputStreamInfo(streamIndex: UInt(streamIndex), objectID: outputStreamObjectID)
+    }
+  }
+
+  /// CFString 기반 HAL 속성을 한 방식으로 읽는다. 장치 UID와 표시 이름이 서로 다른
+  /// 메모리 크기·scope를 사용해 어긋나지 않도록 관리자 진단 조회를 이 함수로 모은다.
+  private static func stringProperty(
+    objectID: AudioObjectID,
+    selector: AudioObjectPropertySelector
+  ) -> String? {
+    var propertyAddress = sysAddr(selector)
+    var propertyValue: CFString?
+    var propertyDataSize = UInt32(MemoryLayout<CFString?>.size)
+    guard AudioObjectGetPropertyData(
+      objectID, &propertyAddress, 0, nil, &propertyDataSize, &propertyValue) == noErr
+    else { return nil }
+    return propertyValue as String?
   }
 
   static func defaultOutputUID() -> String? {
@@ -106,6 +216,58 @@ enum CoreAudioInfo {
 }
 
 // MARK: - 시스템 오디오 탭
+
+/// 캡처 범위와 실패 정책을 Boolean 대신 명시한다. 실사용 Zoom 캡처는 대상을 찾지
+/// 못했을 때 시스템 전체로 넓어지면 안 되고, 전역 캡처는 격리된 관리자 시험에서만
+/// 사용해야 한다. 이 타입은 Zoom을 기다리는 비동기 수명주기를 뜻하지 않는다.
+enum AudioCaptureScope: String, Sendable {
+  case zoomMeetingOutput
+  case administratorSystemOutput
+}
+
+/// PCM 내용과 무관하게 Core Audio 콜백 전달 경로가 살아 있는지 측정한다.
+/// `AudioActivityClock`은 마지막 유효 소리 시각을 맡고, 이 객체는 0 PCM을 포함한
+/// 마지막 버퍼 도착 시각만 맡아 정상 침묵과 콜백 중단을 서로 구분한다.
+final class AudioCaptureHeartbeat: @unchecked Sendable {
+  struct Snapshot: Sendable {
+    let hasReceivedAudioBuffer: Bool
+    let secondsSinceMostRecentBufferOrStart: TimeInterval
+  }
+
+  private let lock = NSLock()
+  private let captureStartedAtUptimeNanoseconds: UInt64
+  private var lastAudioBufferArrivalUptimeNanoseconds: UInt64?
+
+  init(captureStartedAtUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds) {
+    self.captureStartedAtUptimeNanoseconds = captureStartedAtUptimeNanoseconds
+  }
+
+  /// 오디오 값이 전부 0이어도 호출한다. 여기서 샘플 크기를 검사하면 다시 콘텐츠
+  /// 무음과 전달 경로 중단을 섞게 되므로, 유효한 버퍼가 도착했다는 사실만 기록한다.
+  func recordAudioBufferArrival(
+    at uptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
+  ) {
+    lock.withLock { lastAudioBufferArrivalUptimeNanoseconds = uptimeNanoseconds }
+  }
+
+  /// 시스템 시각 변경의 영향을 받지 않는 uptime으로 현재 콜백 간격을 반환한다.
+  /// 아직 첫 버퍼가 없다면 캡처 시작 이후 시간을 반환해 시작 직후 영원히 진단이
+  /// 보류되는 일을 막는다.
+  func snapshot(
+    at currentUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
+  ) -> Snapshot {
+    lock.withLock {
+      let referenceUptimeNanoseconds = lastAudioBufferArrivalUptimeNanoseconds
+        ?? captureStartedAtUptimeNanoseconds
+      let elapsedNanoseconds = currentUptimeNanoseconds >= referenceUptimeNanoseconds
+        ? currentUptimeNanoseconds - referenceUptimeNanoseconds
+        : 0
+      return Snapshot(
+        hasReceivedAudioBuffer: lastAudioBufferArrivalUptimeNanoseconds != nil,
+        secondsSinceMostRecentBufferOrStart: Double(elapsedNanoseconds) / 1_000_000_000)
+    }
+  }
+}
 
 /// 시스템 탭과 관리자 파일 되먹임이 함께 쓰는 오디오 활동 시계다.
 ///
@@ -232,6 +394,7 @@ final class AudioActivityClock: @unchecked Sendable {
 /// 스피커 출력은 그대로 유지되므로 사용자는 평소처럼 소리를 들으면서 캡처된다.
 final class SystemAudioTap: @unchecked Sendable {
   enum TapError: LocalizedError {
+    case zoomAudioProcessUnavailable
     case tapCreationFailed(OSStatus)
     case aggregateCreationFailed(OSStatus)
     case ioProcFailed(OSStatus)
@@ -240,6 +403,8 @@ final class SystemAudioTap: @unchecked Sendable {
 
     var errorDescription: String? {
       switch self {
+      case .zoomAudioProcessUnavailable:
+        return "Zoom 회의 오디오 프로세스를 찾지 못했습니다. Zoom 회의에 들어간 뒤 다시 시작해 주세요."
       case .tapCreationFailed(let s): return "오디오 탭 생성 실패 (OSStatus \(s))"
       case .aggregateCreationFailed(let s): return "집합 장치 생성 실패 (OSStatus \(s))"
       case .ioProcFailed(let s): return "오디오 콜백 등록 실패 (OSStatus \(s))"
@@ -258,33 +423,67 @@ final class SystemAudioTap: @unchecked Sendable {
   private var aggregateID = AudioObjectID(kAudioObjectUnknown)
   private var ioProcID: AudioDeviceIOProcID?
   private var tapUUID: UUID?
+  /// 실사용 탭을 만들 때 실제로 포함한 Zoom 프로세스들이다. 실행 도중 이 대상이
+  /// 모두 사라졌는지를 판정하는 데만 쓰며, A/B 진단 전에는 특정 프로세스가 최종
+  /// 회의 오디오 경로라고 가정하지 않는다.
+  private var capturedZoomProcesses: [AudioProcessInfo] = []
 
   private(set) var sourceFormat: AVAudioFormat?
+  private(set) var captureScope: AudioCaptureScope?
+  let captureHeartbeat: AudioCaptureHeartbeat
   private let onBuffer: (AVAudioPCMBuffer) -> Void
 
-  init(onBuffer: @escaping (AVAudioPCMBuffer) -> Void) {
+  init(captureHeartbeat: AudioCaptureHeartbeat = AudioCaptureHeartbeat(),
+       onBuffer: @escaping (AVAudioPCMBuffer) -> Void) {
+    self.captureHeartbeat = captureHeartbeat
     self.onBuffer = onBuffer
   }
 
-  /// - Parameter zoomOnly: true면 Zoom 프로세스만, false면 시스템 전체 오디오를 캡처
-  func start(zoomOnly: Bool) throws {
-    let targets = CoreAudioInfo.processes()
-      .filter { Self.zoomBundleIDs.contains($0.bundleID) }
-      .map(\.objectID)
+  /// 값싼 시작 전 검사다. 일반 모드에서 Zoom 후보가 없다는 사실을 전사기와 Whisper를
+  /// 준비하기 전에 알기 위한 것이며, 어느 process/device/stream이 최종 경로인지를
+  /// 결정하지 않는다. 검사 직후 프로세스가 종료될 수 있으므로 `start(scope:)`도 같은
+  /// 조건을 다시 확인해 TOCTOU 경쟁에서 전역 폴백이 생기지 않게 한다.
+  static func validateSourceAvailability(for captureScope: AudioCaptureScope) throws {
+    guard captureScope == .zoomMeetingOutput else { return }
+    let hasZoomAudioCandidate = CoreAudioInfo.processes().contains {
+      Self.zoomBundleIDs.contains($0.bundleID)
+    }
+    guard hasZoomAudioCandidate else { throw TapError.zoomAudioProcessUnavailable }
+  }
 
-    // Zoom이 안 떠 있으면 전체 탭으로 자동 전환한다 (수업 전 미리 켜두는 경우 대비).
-    let desc: CATapDescription = (zoomOnly && !targets.isEmpty)
-      ? CATapDescription(stereoMixdownOfProcesses: targets)
-      : CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+  /// 명시된 범위만 캡처한다. Zoom 대상이 없을 때 시스템 전체 탭으로 넓히지 않고
+  /// 즉시 실패해야 사용자가 Zoom 전용이라고 믿는 녹음에 다른 앱 소리가 섞이지 않는다.
+  func start(scope requestedCaptureScope: AudioCaptureScope) throws {
+    let availableAudioProcesses = CoreAudioInfo.processes()
+    let zoomAudioProcessCandidates = availableAudioProcesses.filter {
+      Self.zoomBundleIDs.contains($0.bundleID)
+    }
+
+    let captureTapDescription: CATapDescription
+    switch requestedCaptureScope {
+    case .zoomMeetingOutput:
+      guard !zoomAudioProcessCandidates.isEmpty else {
+        throw TapError.zoomAudioProcessUnavailable
+      }
+      captureTapDescription = CATapDescription(
+        stereoMixdownOfProcesses: zoomAudioProcessCandidates.map(\.objectID))
+      capturedZoomProcesses = zoomAudioProcessCandidates
+    case .administratorSystemOutput:
+      captureTapDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+      capturedZoomProcesses = []
+    }
+
     let uuid = UUID()
-    desc.name = "ZoomCaption"
-    desc.uuid = uuid
-    desc.isPrivate = true
-    desc.muteBehavior = .unmuted   // 사용자는 계속 소리를 들을 수 있어야 한다
+    captureTapDescription.name = "ZoomCaption"
+    captureTapDescription.uuid = uuid
+    captureTapDescription.isPrivate = true
+    // 이 설정은 캡처 중에도 사용자가 원래 출력을 듣게 하는 동작일 뿐, 로컬
+    // 마이크를 제외하는 필터가 아니다. 출처 분리는 관리자 A/B 결과 뒤에 결정한다.
+    captureTapDescription.muteBehavior = .unmuted
     tapUUID = uuid
 
     var tap = AudioObjectID(kAudioObjectUnknown)
-    let tapErr = AudioHardwareCreateProcessTap(desc, &tap)
+    let tapErr = AudioHardwareCreateProcessTap(captureTapDescription, &tap)
     guard tapErr == noErr else { throw TapError.tapCreationFailed(tapErr) }
     tapID = tap
 
@@ -296,23 +495,28 @@ final class SystemAudioTap: @unchecked Sendable {
     else { throw TapError.formatUnavailable }
     sourceFormat = fmt
 
-    guard let outUID = CoreAudioInfo.defaultOutputUID() else { throw TapError.noOutputDevice }
+    guard let selectedOutputDeviceUID = CoreAudioInfo.defaultOutputUID() else {
+      throw TapError.noOutputDevice
+    }
 
-    let aggDesc: [String: Any] = [
+    let aggregateDeviceDescription: [String: Any] = [
       kAudioAggregateDeviceNameKey: "ZoomCaption Aggregate",
       kAudioAggregateDeviceUIDKey: UUID().uuidString,
-      kAudioAggregateDeviceMainSubDeviceKey: outUID,
+      kAudioAggregateDeviceMainSubDeviceKey: selectedOutputDeviceUID,
       kAudioAggregateDeviceIsPrivateKey: true,
       kAudioAggregateDeviceIsStackedKey: false,
       kAudioAggregateDeviceTapAutoStartKey: true,
-      kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: outUID]],
+      kAudioAggregateDeviceSubDeviceListKey: [[
+        kAudioSubDeviceUIDKey: selectedOutputDeviceUID,
+      ]],
       kAudioAggregateDeviceTapListKey: [[
         kAudioSubTapDriftCompensationKey: true,
         kAudioSubTapUIDKey: uuid.uuidString,
       ]],
     ]
     var agg = AudioObjectID(kAudioObjectUnknown)
-    let aggErr = AudioHardwareCreateAggregateDevice(aggDesc as CFDictionary, &agg)
+    let aggErr = AudioHardwareCreateAggregateDevice(
+      aggregateDeviceDescription as CFDictionary, &agg)
     guard aggErr == noErr else { throw TapError.aggregateCreationFailed(aggErr) }
     aggregateID = agg
 
@@ -325,6 +529,32 @@ final class SystemAudioTap: @unchecked Sendable {
 
     let startErr = AudioDeviceStart(agg, proc)
     guard startErr == noErr else { throw TapError.ioProcFailed(startErr) }
+    captureScope = requestedCaptureScope
+
+    let processesIncludedInTap = requestedCaptureScope == .zoomMeetingOutput
+      ? zoomAudioProcessCandidates
+      : []
+    let capturedProcessDescription = processesIncludedInTap.isEmpty
+      ? "none"
+      : processesIncludedInTap.map {
+          "\($0.bundleID)(pid=\($0.pid),object=\($0.objectID))"
+        }.joined(separator: ",")
+    log("오디오 캡처 경로 — scope=\(requestedCaptureScope.rawValue), "
+      + "processes=\(capturedProcessDescription), "
+      + "defaultOutputUID=\(selectedOutputDeviceUID), "
+      + "systemWideCapture=\(requestedCaptureScope == .administratorSystemOutput), "
+      + "automaticGlobalFallback=false")
+  }
+
+  /// 시작 때 선택했던 Zoom 대상 중 하나라도 현재 남아 있는지 확인한다. 허용 목록에는
+  /// 여러 보조 프로세스가 포함될 수 있어 하나가 종료됐다는 이유만으로 전체 경로를
+  /// 잃었다고 판단하지 않고, 선택 대상이 모두 사라졌을 때만 false를 반환한다.
+  var hasAvailableCapturedTarget: Bool {
+    guard captureScope == .zoomMeetingOutput else { return true }
+    let currentAudioProcessObjectIDs = Set(CoreAudioInfo.processes().map(\.objectID))
+    return capturedZoomProcesses.contains {
+      currentAudioProcessObjectIDs.contains($0.objectID)
+    }
   }
 
   private func handle(_ inData: UnsafePointer<AudioBufferList>) {
@@ -341,8 +571,9 @@ final class SystemAudioTap: @unchecked Sendable {
     guard let dst = buf.audioBufferList.pointee.mBuffers.mData else { return }
     memcpy(dst, mData, Int(first.mDataByteSize))
 
-    // 무음 시계는 실제 시스템 탭과 관리자 되먹임이 공유해야 하므로, 이 계층에서는
-    // 샘플을 판정하지 않고 공통 onBuffer 파이프라인에 그대로 넘긴다.
+    // 샘플이 전부 0이어도 heartbeat는 갱신한다. 콘텐츠 무음은 공통 sink의
+    // AudioActivityClock이 별도로 판정하므로 이 계층에서는 둘을 섞지 않는다.
+    captureHeartbeat.recordAudioBufferArrival()
     onBuffer(buf)
   }
 
@@ -360,6 +591,9 @@ final class SystemAudioTap: @unchecked Sendable {
     ioProcID = nil
     aggregateID = AudioObjectID(kAudioObjectUnknown)
     tapID = AudioObjectID(kAudioObjectUnknown)
+    tapUUID = nil
+    captureScope = nil
+    capturedZoomProcesses = []
   }
 
   deinit { stop() }

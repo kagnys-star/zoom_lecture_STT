@@ -322,7 +322,7 @@ extension WebUI {
   .hint { font-size: 12.5px; color: var(--muted); line-height: 1.55; margin-top: 5px; }
   /* 체크박스·라디오 안의 설명은 제목 아래로 내려야 읽힌다 */
   .check .hint { display: block; margin-top: 2px; font-weight: 400; }
-  .field textarea, .field input[type=text] {
+  .field textarea, .field input[type=text], .field select {
     width: 100%; font: inherit; font-size: 14px; padding: 8px 10px;
     border: 1px solid var(--line); border-radius: 9px; background: var(--bg); color: var(--ink);
   }

@@ -82,7 +82,11 @@ extension WebUI {
   // DOM에서도 제거해 서버 상태를 유일한 진실로 유지한다.
   function setLectureBoundaryMarker(lineElement, boundaryAfter) {
     let marker = lineElement.querySelector('.lectureEndMarker');
-    if (boundaryAfter !== 'lectureEnded') {
+    // 서버의 구조화 경계 값에만 라벨을 연결해야 발화 텍스트를 오염시키지 않고, 알 수
+    // 없는 미래 값도 잘못 표시하는 대신 안전하게 기존 표식을 제거할 수 있다.
+    const boundaryLabels = { lectureEnded: '강의 종료', recordingStopped: '녹음 종료' };
+    const boundaryLabel = boundaryLabels[boundaryAfter];
+    if (!boundaryLabel) {
       delete lineElement.dataset.boundaryAfter;
       if (marker) marker.remove();
       return;
@@ -93,7 +97,7 @@ extension WebUI {
       marker.className = 'lectureEndMarker';
       lineElement.appendChild(marker);
     }
-    marker.textContent = '강의 종료';
+    marker.textContent = boundaryLabel;
   }
   // "12:34" / "1:02:03" / "755" 모두 초로 바꾼다. 빈 값이면 null(=전체).
   const parseClock = v => {
@@ -821,8 +825,9 @@ extension WebUI {
     const d = JSON.parse(e.data); if (!seen(d)) return;
     if (typeof d.running === 'boolean') setRunning(d.running);
     if (d.message !== undefined) notice('#cfgNotice', d.level || 'info', d.message ? esc(d.message) : '');
-    // Zoom 은 소리를 내는데 우리만 못 듣는, 확실한 문제일 때만 뜬다(서버 쪽에서
-    // 이미 걸러서 보낸다) — 그냥 강의자가 조용한 경우는 애초에 이 이벤트 자체가 안 온다.
+    // 서버는 0 PCM이 계속 도착하는 정상 침묵에는 이 배너를 보내지 않는다. 실제
+    // Core Audio 콜백 중단이나 시작 때 선택한 Zoom 대상 소실처럼 캡처 경로 자체가
+    // 비정상일 때만 `silent: true`가 오며, 복구·정지 때 false로 명시적으로 지운다.
     if (d.silent) {
       showSilent(`<b>${esc(d.silentMessage || '오디오 입력에 문제가 있습니다.')}</b>`);
     } else if (d.silent === false) {
@@ -1295,6 +1300,8 @@ extension WebUI {
         `요약 엔진: ${esc(state.summaryEngine || '-')}<br>` +
         `오디오 입력: ${esc(d.levelAdvice || '-')}<br>` +
         (d.framesSeen ? `피크 ${(d.peakDBFS).toFixed(1)} dBFS · RMS ${(d.rms).toFixed(4)}<br>` : '') +
+        `캡처 경로: ${esc(d.captureScope || '-')} · ` +
+          `${d.captureHasReceivedBuffer ? `${Number(d.secondsSinceCaptureBuffer || 0).toFixed(1)}초 전 버퍼 수신` : '버퍼 대기'}<br>` +
         `소리 보관: ${d.audioClips ? `${d.audioClips}개 · ${clock(d.audioSeconds)} · ${d.audioMB.toFixed(0)}MB` : '없음'}<br>` +
         `재전사: ${d.whisperReady ? '' : '<b>불가</b> — '}${esc(d.whisperDetail || '-')}<br>` +
         `교안 캐시: ${d.domainCacheCount}개 · ${d.domainCacheKB}KB<br>` +
@@ -1333,6 +1340,8 @@ extension WebUI {
       '세션: ' + (st.sessionDir || '없음'),
       '오디오 프레임: ' + d.framesSeen + ', 소리 감지: ' + d.heardSound,
       '탭 포맷: ' + d.sourceFormat + ', 피크 ' + (d.peakDBFS||0).toFixed(1) + ' dBFS',
+      '캡처 경로: ' + (d.captureScope || '-') + ', 최근 버퍼: '
+        + (d.captureHasReceivedBuffer ? Number(d.secondsSinceCaptureBuffer || 0).toFixed(1) + '초 전' : '없음'),
       '소리 보관: ' + d.audioClips + '개 / ' + d.audioSeconds + '초 / ' + (d.audioMB||0).toFixed(0) + 'MB',
       'whisper: ' + (d.whisperReady ? 'OK' : '불가') + ' — ' + d.whisperDetail,
       'whisper 실행 파일: ' + (d.whisperBinary || '없음') + ', 재전사 중: ' + d.retranscribing,
@@ -1598,6 +1607,105 @@ extension WebUI {
   }
 
   // ── 관리자 모드 ──
+  let administratorProbeRoutes = new Map();
+  let administratorProbeProcesses = [];
+  let administratorProbePollMilliseconds = 1000;
+  let administratorProbeProcessSelect = $('#adminProbeProcess');
+  let administratorProbeRouteSelect = $('#adminProbeRoute');
+  let administratorProbeResult = $('#adminProbeResult');
+  let administratorProbeStartButton = $('#btnAdminProbeStart');
+  let administratorProbeStopButton = $('#btnAdminProbeStop');
+  let administratorProbeRefreshButton = $('#btnAdminProbeRefresh');
+  let administratorProbePoll = { timer: null };
+
+  function renderAdministratorProbeRoutes() {
+    const selectedProcessObjectID = Number(administratorProbeProcessSelect.value);
+    const selectedProcess = administratorProbeProcesses.find(
+      process => Number(process.objectID) === selectedProcessObjectID);
+    administratorProbeRoutes.clear();
+    administratorProbeRouteSelect.innerHTML = '';
+    if (!selectedProcess) {
+      administratorProbeRouteSelect.innerHTML = '<option value="">출력 경로 없음</option>';
+      return;
+    }
+
+    // 프로세스 전체 측정을 항상 첫 후보로 둔다. 장치/스트림 결과가 이 값과 어떻게
+    // 다른지를 비교해야 로컬 음성이 어느 단계에서 섞였는지 판단할 수 있다.
+    administratorProbeRoutes.set('process-wide', { deviceUID: null, streamIndex: null });
+    administratorProbeRouteSelect.insertAdjacentHTML(
+      'beforeend', '<option value="process-wide">프로세스 전체 출력</option>');
+
+    (selectedProcess.outputDevices || []).forEach((outputDevice, deviceArrayIndex) => {
+      (outputDevice.streams || []).forEach(outputStream => {
+        const routeKey = `device-${deviceArrayIndex}-stream-${outputStream.index}`;
+        administratorProbeRoutes.set(routeKey, {
+          deviceUID: outputDevice.uid,
+          streamIndex: outputStream.index,
+        });
+        administratorProbeRouteSelect.insertAdjacentHTML('beforeend',
+          `<option value="${esc(routeKey)}">${esc(outputDevice.name)} · stream ${outputStream.index}</option>`);
+      });
+    });
+  }
+
+  async function loadAdministratorProbeCandidates() {
+    administratorProbeRefreshButton.disabled = true;
+    try {
+      const response = await fetch('/api/admin/audio/probe/candidates').then(result => result.json());
+      administratorProbeProcesses.splice(0, administratorProbeProcesses.length,
+                                          ...((response && response.processes) || []));
+      administratorProbeProcessSelect.innerHTML = administratorProbeProcesses.length
+        ? administratorProbeProcesses.map(audioProcess =>
+            `<option value="${audioProcess.objectID}">${esc(audioProcess.bundleID)} · pid ${audioProcess.pid}`
+            + `${audioProcess.hasActiveOutputIO ? ' · I/O 활성' : ''}</option>`).join('')
+        : '<option value="">Zoom 오디오 프로세스 없음</option>';
+      renderAdministratorProbeRoutes();
+    } catch {
+      administratorProbeResult.textContent = 'A/B 후보를 읽지 못했습니다.';
+    } finally {
+      administratorProbeRefreshButton.disabled = false;
+    }
+  }
+
+  function renderAdministratorProbeSnapshot(probeSnapshot, isRunning) {
+    if (!probeSnapshot) {
+      administratorProbeResult.textContent = '측정 대기 중';
+      return;
+    }
+    const bufferAge = probeSnapshot.secondsSinceBuffer == null
+      ? '아직 없음'
+      : `${Number(probeSnapshot.secondsSinceBuffer).toFixed(2)}초 전`;
+    const nonSilentPercent = Number(probeSnapshot.nonSilentBufferRatio || 0) * 100;
+    const routeDescription = probeSnapshot.deviceName
+      ? `${probeSnapshot.deviceName} · stream ${probeSnapshot.streamIndex}`
+      : '프로세스 전체 출력';
+    administratorProbeResult.innerHTML =
+      `<b>${isRunning ? '측정 중' : '측정 종료'}</b> — ${esc(probeSnapshot.bundleID)}<br>` +
+      `${esc(routeDescription)} · ${esc(probeSnapshot.sourceFormat || '-')}<br>` +
+      `피크 ${Number(probeSnapshot.peakDBFS ?? -120).toFixed(1)}dBFS · ` +
+      `RMS ${Number(probeSnapshot.rms || 0).toFixed(5)} · ` +
+      `비무음 버퍼 ${nonSilentPercent.toFixed(1)}%<br>` +
+      `콜백 ${probeSnapshot.bufferCount || 0}개 · 최근 버퍼 ${bufferAge}`;
+  }
+
+  function stopAdministratorProbePolling() {
+    if (administratorProbePoll.timer) clearInterval(administratorProbePoll.timer);
+    administratorProbePoll.timer = null;
+  }
+
+  function startAdministratorProbePolling() {
+    stopAdministratorProbePolling();
+    administratorProbePoll.timer = setInterval(async () => {
+      const response = await fetch('/api/admin/audio/probe').then(result => result.json())
+        .catch(() => null);
+      if (!response || !response.running) {
+        stopAdministratorProbePolling();
+        return;
+      }
+      renderAdministratorProbeSnapshot(response.probe, true);
+    }, administratorProbePollMilliseconds);
+  }
+
   async function loadAdmin() {
     const a = await fetch('/api/admin').then(r => r.json()).catch(() => null);
     if (!a || !a.enabled) return;
@@ -1612,6 +1720,11 @@ extension WebUI {
       });
     }
     if (a.feeding) notice('#adminNote', 'info', `되먹이는 중 — ${a.note}`);
+    await loadAdministratorProbeCandidates();
+    if (a.audioProbe) {
+      renderAdministratorProbeSnapshot(a.audioProbe, true);
+      startAdministratorProbePolling();
+    }
   }
   $('#btnAdminFeed').onclick = async () => {
     const r = await post('/api/admin/feed', {
@@ -1629,6 +1742,38 @@ extension WebUI {
     const d = JSON.parse(e.data);
     notice('#adminNote', 'info', `되먹임 ${d.why}. 정지를 누르면 기록이 저장됩니다.`);
   });
+  administratorProbeProcessSelect.onchange = renderAdministratorProbeRoutes;
+  administratorProbeRefreshButton.onclick = loadAdministratorProbeCandidates;
+  administratorProbeStartButton.onclick = async () => {
+    const selectedRoute = administratorProbeRoutes.get(administratorProbeRouteSelect.value);
+    const selectedProcessObjectID = Number(administratorProbeProcessSelect.value);
+    if (!selectedRoute || !selectedProcessObjectID) {
+      administratorProbeResult.textContent = '측정할 프로세스와 출력 경로를 선택해 주세요.';
+      return;
+    }
+    administratorProbeStartButton.disabled = true;
+    const response = await post('/api/admin/audio/probe/start', {
+      processObjectID: selectedProcessObjectID,
+      deviceUID: selectedRoute.deviceUID,
+      streamIndex: selectedRoute.streamIndex,
+    });
+    administratorProbeStartButton.disabled = false;
+    if (!response.ok) {
+      administratorProbeResult.textContent = response.error || 'A/B 측정을 시작하지 못했습니다.';
+      return;
+    }
+    renderAdministratorProbeSnapshot(response.probe, true);
+    startAdministratorProbePolling();
+  };
+  administratorProbeStopButton.onclick = async () => {
+    stopAdministratorProbePolling();
+    const response = await post('/api/admin/audio/probe/stop');
+    if (response && response.probe) {
+      renderAdministratorProbeSnapshot(response.probe, false);
+    } else {
+      administratorProbeResult.textContent = '측정이 종료되었습니다.';
+    }
+  };
 
   // 여러 수업의 표본을 합산한 성적. 한 수업만으로는 표본이 모자란다.
   async function loadGoldAll() {

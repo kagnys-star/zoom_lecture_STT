@@ -52,6 +52,9 @@ struct TokenFlag: Codable, Sendable, Equatable {
 /// SRT와 음성 텍스트에는 섞지 않을 수 있다. rawValue는 저장 JSON과 SSE가 공유한다.
 enum TranscriptBoundary: String, Codable, Sendable {
   case lectureEnded
+  /// 사용자가 직접 녹음을 끝낸 경우의 경계다. 마지막 열린 구간이 독립적으로 요약할
+  /// 만큼 긴 경우에만 붙여, 짧은 오류 복구용 녹음이 별도 강의로 오인되지 않게 한다.
+  case recordingStopped
 }
 
 struct Segment: Codable, Sendable, Identifiable {
@@ -79,9 +82,9 @@ struct Segment: Codable, Sendable, Identifiable {
   var boundaryAfter: TranscriptBoundary?
 }
 
-/// 강의 종료 표식이 어느 기록에 붙었는지 호출부에 알려 주는 결과다. Whisper가 이번
-/// 녹음 구간에 한 줄이라도 있으면 정식 기록인 Whisper를 선택하고, 없을 때만 실시간
-/// 확정 기록으로 폴백한다. 숫자 ID 범위에 기대지 않고 명시적인 목록 이름을 전달한다.
+/// 기록 경계가 어느 기록에 붙었는지 호출부에 알려 주는 결과다. Whisper가 이번 녹음
+/// 구간에 한 줄이라도 있으면 정식 기록인 Whisper를 선택하고, 없을 때만 실시간 확정
+/// 기록으로 폴백해, 경계 이유가 늘어나도 숫자 ID 범위로 목록을 추측하지 않게 한다.
 struct TranscriptBoundaryUpdate: Sendable {
   enum Collection: String, Sendable {
     case live
@@ -626,28 +629,49 @@ final class TranscriptStore: @unchecked Sendable {
     }
   }
 
-  /// 이번 녹음 구간의 마지막 영속 문장 뒤에 강의 종료 표식을 붙인다.
+  /// 이번 녹음 구간의 마지막 영속 문장 뒤에 요청받은 이유의 경계 표식을 붙인다.
   ///
   /// Whisper가 이번 구간에 존재하면 정식 기록을 선택하고, 아직 Whisper 문장이 하나도
   /// 만들어지지 않았으면 실시간 확정 기록을 선택한다. `recordingStartOffset` 검사는
   /// 이어 적기 직후 아무 말도 없었던 경우 과거 수업의 마지막 문장에 표식이 붙는 것을
-  /// 막는다. 같은 무음 구간에서 재호출돼도 이미 표식이 있으면 변경하지 않는다.
+  /// 막는다. 기본 이유를 장시간 무음 종료로 유지해 기존 180초 경계 호출부의 동작을
+  /// 바꾸지 않으며, 같은 이유로 재호출돼도 이미 표식이 있으면 변경하지 않는다.
   @discardableResult
-  func markLatestSegmentAsLectureEnded(after recordingStartOffset: Double) -> TranscriptBoundaryUpdate? {
+  func markLatestSegmentAsLectureEnded(
+    after recordingStartOffset: Double,
+    reason: TranscriptBoundary = .lectureEnded
+  ) -> TranscriptBoundaryUpdate? {
     lock.withLock {
       if let whisperIndex = whisperSegments.lastIndex(where: { $0.end >= recordingStartOffset }) {
-        guard whisperSegments[whisperIndex].boundaryAfter != .lectureEnded else { return nil }
-        whisperSegments[whisperIndex].boundaryAfter = .lectureEnded
+        // 같은 이유로 재호출된 경우에만 건너뛰어야 정지 경계가 기존 종류를 명시적으로
+        // 대체할 수 있고, 중복 SSE는 피하면서도 호출자가 요청한 최종 이유를 보존한다.
+        guard whisperSegments[whisperIndex].boundaryAfter != reason else { return nil }
+        whisperSegments[whisperIndex].boundaryAfter = reason
         return TranscriptBoundaryUpdate(collection: .whisper,
                                         segment: whisperSegments[whisperIndex])
       }
 
       if let liveIndex = segments.lastIndex(where: { $0.end >= recordingStartOffset }) {
-        guard segments[liveIndex].boundaryAfter != .lectureEnded else { return nil }
-        segments[liveIndex].boundaryAfter = .lectureEnded
+        // Whisper가 없는 폴백에서도 같은 멱등성 규칙을 써야 재연결이나 중복 정지
+        // 요청이 화면 표식을 불필요하게 다시 만들지 않는다.
+        guard segments[liveIndex].boundaryAfter != reason else { return nil }
+        segments[liveIndex].boundaryAfter = reason
         return TranscriptBoundaryUpdate(collection: .live, segment: segments[liveIndex])
       }
       return nil
+    }
+  }
+
+  /// 이번 녹음 구간에서 구조화 경계로 이미 닫힌 마지막 기록 단위의 끝을 찾는다.
+  /// 문단 번호는 녹음 중에도 문맥이 쌓일 때마다 계속 확정되므로 마지막 문단을 기준으로
+  /// 삼으면 열린 구간이 늘 몇 초로 줄어든다. 반면 경계는 실제 단위 종료 때만 붙으므로
+  /// 그 끝이어야 10분 정지 기준의 시작점이 유지되며, 오프셋은 이전 녹음을 제외한다.
+  func lastClosedTranscriptUnitEnd(after recordingStartOffset: Double) -> Double? {
+    lock.withLock {
+      whisperSegments.lazy
+        .filter { $0.boundaryAfter != nil && $0.end >= recordingStartOffset }
+        .map(\.end)
+        .max()
     }
   }
 
@@ -747,10 +771,12 @@ final class TranscriptStore: @unchecked Sendable {
     var out = "# \(title) — 실시간 자막 (SpeechTranscriber)\n\n"
     out += "- 일시: \(df.string(from: createdAt))\n"
     out += "- 이 파일은 대조용입니다. 정식 기록은 transcript.md 입니다.\n\n"
-    for seg in allSegments {
-      out += "**[\(Self.clock(seg.start))] \(seg.track.label)** — \(seg.text)\n\n"
-      if seg.boundaryAfter == .lectureEnded {
-        out += "> **강의 종료**\n\n"
+    for segment in allSegments {
+      out += "**[\(Self.clock(segment.start))] \(segment.track.label)** — \(segment.text)\n\n"
+      // 경계 이유를 발화 본문과 분리한 채 표시해야 검색·요약 입력은 오염시키지
+      // 않으면서도 사용자가 종료한 경우와 장시간 무음 종료를 구분할 수 있다.
+      if let boundaryLabel = Self.markdownLabel(for: segment.boundaryAfter) {
+        out += "> **\(boundaryLabel)**\n\n"
       }
     }
     return out
@@ -777,13 +803,13 @@ final class TranscriptStore: @unchecked Sendable {
     df.locale = Locale(identifier: "ko_KR")
     df.dateFormat = "yyyy년 M월 d일 (E) HH:mm"
 
-    let segs = primarySegments
+    let primaryTranscriptSegments = primarySegments
     var out = """
     # \(title)
 
     - 일시: \(df.string(from: createdAt))
     - 길이: \(Self.clock(duration))
-    - 발화 수: \(segs.count)
+    - 발화 수: \(primaryTranscriptSegments.count)
     - 전사: \(hasWhisper ? "Whisper (실시간 자막은 transcript_live.md)" : "실시간 전사기")
 
     """
@@ -800,29 +826,50 @@ final class TranscriptStore: @unchecked Sendable {
     // 문단 번호가 같은 연속 줄은 한 문단으로 묶어 적는다 — Whisper 세그먼트(3~10초 단위)
     // 그대로 한 줄씩 적으면 뚝뚝 끊겨 나중에 다시 읽기 어렵다(문단화 도입 배경).
     // 번호가 없는 줄(문단화 전, 또는 아직 문맥이 안 쌓인 꼬리)은 예전처럼 한 줄씩 적는다.
-    var i = 0
-    while i < segs.count {
-      let seg = segs[i]
-      if let p = seg.paragraph {
-        var texts = [seg.text]
-        var hasLectureEndingBoundary = seg.boundaryAfter == .lectureEnded
-        var j = i + 1
-        while j < segs.count, segs[j].paragraph == p {
-          texts.append(segs[j].text)
-          hasLectureEndingBoundary = hasLectureEndingBoundary
-            || segs[j].boundaryAfter == .lectureEnded
-          j += 1
+    var segmentIndex = 0
+    while segmentIndex < primaryTranscriptSegments.count {
+      let segment = primaryTranscriptSegments[segmentIndex]
+      if let paragraphNumber = segment.paragraph {
+        var paragraphTexts = [segment.text]
+        // 여러 Whisper 문장을 한 문단으로 합쳐도 내부 문장에 붙은 구조화 경계가
+        // 사라지면 안 된다. 비정상적인 복수 경계 데이터에서는 시간상 마지막 값을
+        // 택해야 문단 뒤 표식이 실제로 가장 늦게 끝난 구간을 설명한다.
+        var paragraphBoundary = segment.boundaryAfter
+        var followingSegmentIndex = segmentIndex + 1
+        while followingSegmentIndex < primaryTranscriptSegments.count,
+              primaryTranscriptSegments[followingSegmentIndex].paragraph == paragraphNumber {
+          paragraphTexts.append(primaryTranscriptSegments[followingSegmentIndex].text)
+          if let laterBoundary = primaryTranscriptSegments[followingSegmentIndex].boundaryAfter {
+            paragraphBoundary = laterBoundary
+          }
+          followingSegmentIndex += 1
         }
-        out += "**[\(Self.clock(seg.start))] \(seg.track.label)** — \(texts.joined(separator: " "))\n\n"
-        if hasLectureEndingBoundary { out += "> **강의 종료**\n\n" }
-        i = j
+        out += "**[\(Self.clock(segment.start))] \(segment.track.label)** — \(paragraphTexts.joined(separator: " "))\n\n"
+        if let boundaryLabel = Self.markdownLabel(for: paragraphBoundary) {
+          out += "> **\(boundaryLabel)**\n\n"
+        }
+        segmentIndex = followingSegmentIndex
       } else {
-        out += "**[\(Self.clock(seg.start))] \(seg.track.label)** — \(seg.text)\n\n"
-        if seg.boundaryAfter == .lectureEnded { out += "> **강의 종료**\n\n" }
-        i += 1
+        out += "**[\(Self.clock(segment.start))] \(segment.track.label)** — \(segment.text)\n\n"
+        // 문단 번호가 없는 폴백 경로도 같은 이유별 라벨을 써야 저장 시점의 모델
+        // 준비 여부에 따라 동일한 경계가 서로 다른 문구로 내보내지지 않는다.
+        if let boundaryLabel = Self.markdownLabel(for: segment.boundaryAfter) {
+          out += "> **\(boundaryLabel)**\n\n"
+        }
+        segmentIndex += 1
       }
     }
     return out
+  }
+
+  /// 경계 문구를 한곳에서 결정해야 문단/비문단 Markdown 경로가 새 경계 종류를 서로
+  /// 다르게 처리하는 누락을 막고, nil은 구조화 경계가 없는 발화에 아무것도 섞지 않는다.
+  private static func markdownLabel(for boundary: TranscriptBoundary?) -> String? {
+    switch boundary {
+    case .lectureEnded: "강의 종료"
+    case .recordingStopped: "녹음 종료"
+    case nil: nil
+    }
   }
 }
 

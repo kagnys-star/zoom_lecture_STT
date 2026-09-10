@@ -1,4 +1,5 @@
 import Foundation
+import CoreAudio
 
 /// 웹 UI 가 보내오는 요청 본문들.
 ///
@@ -41,6 +42,15 @@ struct AdminFeedRequest: Decodable {
   var path: String?
   var speed: Double?
   var title: String?
+}
+
+/// 관리자 A/B probe가 측정할 한 Core Audio 후보다. `deviceUID`와 `streamIndex`를
+/// 모두 비우면 프로세스 전체, 둘 다 보내면 해당 장치의 해당 출력 스트림만 측정한다.
+/// 한쪽만 보내는 요청은 서버에서 거절해 서로 다른 경로를 시험했다고 착각하지 않게 한다.
+struct AdministratorAudioProbeStartRequest: Decodable {
+  var processObjectID: AudioObjectID?
+  var deviceUID: String?
+  var streamIndex: UInt?
 }
 
 /// 본문에서 갈린 자리를 바로 고칠 때 오는 요청.

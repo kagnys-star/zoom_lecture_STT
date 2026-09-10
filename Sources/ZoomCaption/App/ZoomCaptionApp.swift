@@ -9,6 +9,14 @@ import AppKit
 /// 라우트 처리는 `Server/Routes/` 아래로 나눠 두었다(같은 타입의 extension 이다).
 /// 그래서 이 파일에는 **수명주기와 상태**만 남는다.
 final class ZoomCaptionApp: @unchecked Sendable {
+  /// 탭이 시작된 뒤 발생할 수 있는 경로 장애만 나타낸다. Zoom이 시작 전에 없는
+  /// 경우는 대기 상태로 만들지 않고 `start()` 오류로 반환하므로 여기에 포함하지 않는다.
+  private enum AudioCaptureIssue: Equatable {
+    case callbackStalled
+    case targetProcessLost
+    case outputRouteChanged
+  }
+
   // 아래 멤버 중 `private` 이 없는 것들은 `Server/Routes/` 의 extension 이 쓴다.
   // Swift 의 `private` 는 **같은 파일 안**까지만이라, extension 을 파일로 나누면 안 보인다.
   // 모듈 밖으로 나가지 않으므로 internal(기본값) 로 두었다.
@@ -26,8 +34,15 @@ final class ZoomCaptionApp: @unchecked Sendable {
   /// 시스템 탭과 관리자 파일 되먹임이 함께 갱신하는 마지막 유효 소리 시계.
   /// 장치 객체(`tap`)와 분리돼 있어 관리자 시험에서도 180초 무음 경로가 동일하게 돈다.
   private var audioActivityClock: AudioActivityClock?
+  /// 실제 Core Audio 탭에서 마지막 버퍼가 도착한 시각을 추적한다. 샘플이 0이어도
+  /// 갱신되므로 정상 침묵과 콜백 중단을 `AudioActivityClock`에 섞지 않고 구분한다.
+  /// 관리자 파일 되먹임은 실제 탭을 우회하므로 이 heartbeat를 사용하지 않는다.
+  private var audioCaptureHeartbeat: AudioCaptureHeartbeat?
   /// 관리자 되먹임. 저장된 WAV 를 실제 탭과 **같은 닫힘**에 밀어 넣어 전체 경로를 시험한다.
   let adminFeed = AdminFeed()
+  /// 운영 녹음과 분리된 관리자 A/B 측정기. 전사·저장을 하지 않고 Zoom 후보별
+  /// 콜백과 레벨만 재므로 최종 캡처 경로를 확정하기 전에 출처를 비교할 수 있다.
+  let administratorAudioProbe = AdministratorAudioCaptureProbeController()
   /// 지금 녹음이 쓰는 오디오 받개. 되먹임이 여기로 들어간다.
   var audioSink: (@Sendable (AVAudioPCMBuffer) -> Void)?
   /// 이번 시작은 탭 없이(되먹임으로) 간다는 표시
@@ -49,7 +64,12 @@ final class ZoomCaptionApp: @unchecked Sendable {
   private var sentenceBuffer: SentenceReconstructor?
   /// 실시간 재전사가 안 돌고 있다면 그 이유. 위 칸이 왜 비어 있는지 화면에 그대로 띄운다.
   private var whisperLiveNote: String?
+  /// 콘텐츠 무음과 180초 강의 경계만 감시한다. 캡처 경로 생존 여부는 아래의 별도
+  /// 타이머가 맡아, 정상적인 강의 침묵이 빨간 장애 경고로 승격되지 않게 한다.
   private var silenceWatchdog: DispatchSourceTimer?
+  /// Core Audio 콜백과 시작 때 선택한 Zoom 프로세스가 살아 있는지 감시한다.
+  /// 콘텐츠의 음량은 읽지 않으므로 0 PCM이 계속 도착하면 정상 경로로 판단한다.
+  private var audioCaptureHealthWatchdog: DispatchSourceTimer?
   /// 180초 무음 경계를 처리하는 비동기 작업. 정지 또는 새 녹음 시작 시 이전 작업을
   /// 취소해, 오래된 작업이 새 세션의 문장이나 volatile을 건드리지 못하게 한다.
   private var lectureBoundaryTask: Task<Void, Never>?
@@ -73,18 +93,21 @@ final class ZoomCaptionApp: @unchecked Sendable {
   /// 로그·알림을 내보내려고 — 20초마다 매번 남기면 강의 쉬는 시간 10분 동안
   /// 30줄씩 쌓인다. stateLock 이 보호한다.
   private var wasSilent = false
+  /// 사용자에게 현재 표시한 캡처 경로 장애 종류다. 같은 장애를 5초마다 반복해서
+  /// 로그·SSE로 보내지 않고, 종류가 바뀌거나 복구될 때만 갱신한다.
+  private var currentAudioCaptureIssue: AudioCaptureIssue?
+  /// 콜백 간격이 기준을 넘은 연속 검사 횟수다. 절전 복귀나 한 번의 스케줄 지연으로
+  /// 빨간 배너가 번쩍이지 않도록 두 번 연속 확인한 뒤에만 중단으로 확정한다.
+  private var consecutiveAudioCallbackStallChecks = 0
+  /// Core Audio 프로세스 목록 조회도 Zoom의 짧은 내부 재시작이나 시스템 부하 때 한
+  /// 번 비어 보일 수 있다. 실제 대상 소실 역시 두 번 연속 확인해야 사용자 오류로
+  /// 승격해, 정상 녹음 중 순간적인 조회 실패가 빨간 배너로 번쩍이지 않게 한다.
+  private var consecutiveMissingCaptureTargetChecks = 0
   /// 기본 출력 장치가 마지막으로 바뀐 시각·이름(이어폰 꽂기/빼기 등). 무음 감시가
   /// "왜 조용해졌는지" 문구를 구체적으로 채울 때 참고만 한다 — 이것 자체로는
   /// 아무것도 알리지 않는다(장치가 바뀌어도 캡처가 안 죽는 경우가 더 흔하다).
   private var lastDeviceChangeAt: Date?
   private var lastDeviceChangeName: String?
-  /// 지금 이어지는 무음 구간에서 이미 알렸는지. 무음이 시작되는 바로 그 틱에
-  /// 하필 "온 시스템이 조용함"(playing.isEmpty)이면 그 틱엔 판단 근거가 없어
-  /// 넘어가는데, 이걸 "전환된 틱에만 확인"으로 짜면 몇 틱 뒤 Zoom이 다시 소리를
-  /// 내기 시작해도 다시는 확인을 안 하게 된다. 그래서 "조용한 동안은 매 틱 계속
-  /// 재확인하되, 한 번 알린 뒤로는 반복하지 않는다"로 따로 뗐다.
-  private var silenceNotified = false
-
   /// 마지막 유효 소리 뒤 이 시간이 지나면 하나의 강의가 끝난 것으로 확정한다.
   /// 30초 캡처 이상 경고와 목적이 다르므로 AudioActivityClock의 짧은 기준과 분리한다.
   private static let lectureBoundarySilenceSeconds: TimeInterval = 180
@@ -94,6 +117,13 @@ final class ZoomCaptionApp: @unchecked Sendable {
   /// Whisper 큐에 들어오기 직전인 AudioArchive의 VAD 분할도 먼저 기다린다. 평소에는
   /// 수백 ms지만 외부 분할 작업이 지연될 때 경계를 앞질러 확정하지 않도록 상한을 둔다.
   private static let lectureBoundaryArchiveWaitSeconds: TimeInterval = 30
+  /// 정상 탭은 무음 PCM도 짧은 간격으로 계속 보낸다. 마지막 버퍼가 이 시간보다
+  /// 오래됐으면 콘텐츠 무음이 아니라 전달 경로 중단 후보로 본다. 실제 경고 평가는
+  /// 5초마다 하므로 순간적인 스케줄 지연 한 번으로 사용자에게 오류를 띄우지 않는다.
+  private static let audioCallbackStallSeconds: TimeInterval = 5
+  /// 사용자가 정지한 열린 구간이 10분보다 짧으면 오류 복구나 짧은 시험 녹음일 수 있어
+  /// 독립적인 요약 단위로 오인되지 않도록 녹음 종료 경계를 붙이지 않는다.
+  private static let stopBoundaryMinimumOpenSpanSeconds: TimeInterval = 600
 
   let stateLock = NSLock()
   var running = false
@@ -248,13 +278,19 @@ final class ZoomCaptionApp: @unchecked Sendable {
     json["framesSeen"] = activityClock?.framesSeen ?? 0
     json["heardSound"] = activityClock?.isHearingSound ?? false
     json["silenceSeconds"] = activityClock?.silenceDuration ?? 0
-    json["somethingPlaying"] = CoreAudioInfo.isAnythingPlaying()
+    // 이 값은 실제 audible sound가 아니라 활성 출력 I/O 존재 여부다. 진단 화면도
+    // Core Audio가 보장하지 않는 "재생 중" 의미를 사용자에게 약속하지 않게 한다.
+    json["hasActiveOutputIO"] = CoreAudioInfo.hasAnyProcessWithActiveOutputIO()
+    let heartbeatSnapshot = stateLock.withLock { audioCaptureHeartbeat }?.snapshot()
+    json["captureHasReceivedBuffer"] = heartbeatSnapshot?.hasReceivedAudioBuffer ?? false
+    json["secondsSinceCaptureBuffer"] = heartbeatSnapshot?.secondsSinceMostRecentBufferOrStart ?? 0
+    json["captureScope"] = tap?.captureScope?.rawValue ?? "-"
     json["sourceFormat"] = tap?.sourceFormat.map { "\($0.sampleRate)Hz ch\($0.channelCount)" } ?? "-"
     json["peak"] = Double(activityClock?.peakLevel ?? 0)
     let db = activityClock?.peakDBFS ?? -Double.infinity
     json["peakDBFS"] = db.isFinite ? db : -120
     json["rms"] = activityClock?.rmsLevel ?? 0
-    json["levelAdvice"] = Self.levelAdvice(activityClock)
+    json["levelAdvice"] = Self.levelAdvice(activityClock, heartbeatSnapshot: heartbeatSnapshot)
     let procs: [String] = CoreAudioInfo.processes().map(\.bundleID).filter { !$0.isEmpty }
     json["audioProcesses"] = procs
 
@@ -275,13 +311,22 @@ final class ZoomCaptionApp: @unchecked Sendable {
     return json
   }
 
-  /// 입력 레벨을 보고 정규화(게인 보정)가 필요한 상태인지 한 줄로 알려준다.
-  private static func levelAdvice(_ activityClock: AudioActivityClock?) -> String {
+  /// 콘텐츠 레벨과 콜백 생존 상태를 구분해 진단용 한 줄을 만든다. 0 PCM만으로
+  /// 권한 문제라고 단정하거나 전처리를 권하지 않는다. 실제 오류 배너는 별도 캡처
+  /// 건강 감시가 콜백 중단 또는 대상 소실을 확인했을 때만 표시한다.
+  private static func levelAdvice(
+    _ activityClock: AudioActivityClock?,
+    heartbeatSnapshot: AudioCaptureHeartbeat.Snapshot?
+  ) -> String {
     guard let activityClock, activityClock.framesSeen > 0 else {
       return "아직 오디오가 들어오지 않았습니다."
     }
     guard activityClock.isHearingSound else {
-      return "무음만 들어옵니다 — 시스템 오디오 권한을 확인하세요."
+      if let heartbeatSnapshot,
+         heartbeatSnapshot.secondsSinceMostRecentBufferOrStart <= audioCallbackStallSeconds {
+        return "오디오 버퍼는 정상 수신 중이며 현재 콘텐츠가 무음입니다."
+      }
+      return "현재 콘텐츠가 무음이며 캡처 콜백 상태는 별도 경로 진단을 확인해야 합니다."
     }
     let db = activityClock.peakDBFS
     switch db {
@@ -303,6 +348,9 @@ final class ZoomCaptionApp: @unchecked Sendable {
     try? await Task.sleep(for: .milliseconds(250))
 
     log("종료 1/3 — 녹음을 멈추고 저장합니다.")
+    // 관리자 A/B probe는 일반 stop() 자원이 아니므로 앱 종료에서 별도로 닫는다.
+    // 먼저 닫아 이후 단계에서 Core Audio 집합 장치가 프로세스에 남지 않게 한다.
+    _ = administratorAudioProbe.stop()
     _ = await stop()
 
     log("종료 2/3 — Ollama 서버를 정리합니다.")
@@ -685,6 +733,24 @@ final class ZoomCaptionApp: @unchecked Sendable {
                      folder: String?, baseDir: String?, keepAudio: Bool) async throws {
     // 자리는 라우트에서 이미 잡았다(running = true). 여기서 다시 확인하지 않는다.
 
+    if options.admin {
+      // probe 시작은 녹음 상태를 검사하지만, probe가 돈 뒤 일반 시작 버튼을 누르는
+      // 반대 순서도 막아야 두 탭의 수치와 오디오 경로가 섞이지 않는다. 운영 모드에서는
+      // controller가 항상 비어 있고, 관리자 모드에서만 기존 측정을 안전하게 닫는다.
+      _ = administratorAudioProbe.stop()
+    }
+
+    let startsWithAdministratorFeed = stateLock.withLock { adminFeedPending }
+    let requestedCaptureScope: AudioCaptureScope = options.admin
+      ? .administratorSystemOutput
+      : .zoomMeetingOutput
+    if !startsWithAdministratorFeed {
+      // Zoom 후보가 없다는 사실은 전사기·아카이브·Whisper를 켜기 전에 확인한다.
+      // 이 검사는 최종 장치/스트림을 선택하지 않으며, 시작 순서 경쟁에 대비해
+      // SystemAudioTap.start도 같은 조건을 다시 확인하고 전역 폴백 없이 실패한다.
+      try SystemAudioTap.validateSourceAvailability(for: requestedCaptureScope)
+    }
+
     var locale = stateLock.withLock { resolvedLocale }
     var format = stateLock.withLock { analyzerFormat }
     if locale == nil || format == nil {
@@ -703,7 +769,6 @@ final class ZoomCaptionApp: @unchecked Sendable {
     let (_, created) = try ensureSessionDir(override: baseDir, folder: folder)
     if created { log("세션 폴더: \(store.sessionDir!.path)") }
     let recordingStartOffset = store.timeBase
-    store.beginRecording()
 
     // 실제 탭과 관리자 되먹임 모두 아래의 같은 sink를 지나므로, 활동 시계도 여기서
     // 딱 한 번 관측한다. 탭 내부에서도 재면 프레임 수와 RMS 표본이 두 배로 집계된다.
@@ -728,11 +793,24 @@ final class ZoomCaptionApp: @unchecked Sendable {
     }.prefix(DomainKnowledge.maxContextualTerms))
 
     let lecture = TrackTranscriber()
-    try await lecture.start(locale: locale, audioFormat: format, contextualStrings: allTerms,
-                            onFinal: { [store] s, e, t, w in
-                              store.appendFinal(track: .lecture, start: s, end: e, text: t,
-                                                words: w) },
-                            onVolatile: { [store] t in store.setVolatile(track: .lecture, text: t) })
+    do {
+      try await lecture.start(locale: locale, audioFormat: format, contextualStrings: allTerms,
+                              onFinal: { [store] s, e, t, w in
+                                store.appendFinal(track: .lecture, start: s, end: e, text: t,
+                                                  words: w) },
+                              onVolatile: { [store] t in
+                                store.setVolatile(track: .lecture, text: t)
+                              })
+    } catch {
+      // 전사기 준비가 실패하면 아직 탭은 없지만 활동 시계는 이미 새 세대로 바뀌어
+      // 있다. 이 참조가 그대로 남으면 다음 진단이 시작하지 않은 녹음을 현재 입력처럼
+      // 보므로, 자신이 설치한 시계일 때만 되돌린다.
+      stateLock.withLock {
+        if audioActivityClock === activityClock { audioActivityClock = nil }
+      }
+      await lecture.finish()
+      throw error
+    }
     lectureTranscriber = lecture
 
     // 소리 보관은 부가 기능이다. 만들다 실패해도 녹취는 그대로 간다.
@@ -804,9 +882,22 @@ final class ZoomCaptionApp: @unchecked Sendable {
     audioSink = sink
 
     // 관리자 모드에서는 파일 되먹임으로 소리를 넣을 수 있어야 하므로 탭 없이도 시작한다.
-    if stateLock.withLock({ adminFeedPending }) {
-      stateLock.withLock { adminFeedPending = false }
-      live.broadcast(event: "status", payload: ["running": true, "message": ""])
+    if startsWithAdministratorFeed {
+      stateLock.withLock {
+        adminFeedPending = false
+        audioCaptureHeartbeat = nil
+        currentAudioCaptureIssue = nil
+        consecutiveAudioCallbackStallChecks = 0
+        consecutiveMissingCaptureTargetChecks = 0
+      }
+      // 되먹임은 실제 탭 시작이 없으므로 sink까지 모두 준비된 이 지점을 녹음 시작으로
+      // 확정한다. 파일 입력이 끝난 뒤에도 기존 180초 경계를 시험할 수 있어야 한다.
+      store.beginRecording()
+      live.broadcast(event: "status", payload: [
+        "running": true,
+        "message": "",
+        "silent": false,
+      ])
       // 관리자 파일 되먹임도 실제 캡처와 같은 180초 무음 감시를 거친다. 시험 파일이
       // 끝난 뒤 녹음은 계속 살아 있으므로, 마지막 유효 샘플 기준으로 경계가 발생한다.
       startSilenceWatchdog()
@@ -814,47 +905,69 @@ final class ZoomCaptionApp: @unchecked Sendable {
       return
     }
 
-    let audioTap = SystemAudioTap(onBuffer: sink)
+    let captureHeartbeat = AudioCaptureHeartbeat()
+    let audioTap = SystemAudioTap(captureHeartbeat: captureHeartbeat, onBuffer: sink)
     do {
       // 관리자 모드면 Zoom 만이 아니라 시스템 전체 소리를 듣는다.
       // 표본 오디오를 아무 재생기로 틀어도 잡히므로 Zoom 없이 시험할 수 있다.
-      try audioTap.start(zoomOnly: !options.admin)
+      try audioTap.start(scope: requestedCaptureScope)
     } catch {
+      // 탭 시작은 전체 시작 transaction의 마지막 실패 지점이다. 여기서 일부 참조를
+      // 남기면 HTTP 상태는 idle인데 Whisper·아카이브가 살아 있는 반쪽 세션이 된다.
+      // 부분 생성된 탭부터 닫아 새 입력을 막고, 워커·아카이브·전사기 순서로 정리한
+      // 뒤 공유 상태를 되돌린다.
+      audioTap.stop()
+      whisperLive?.cancel()
+      whisperLive = nil
+      sentenceBuffer = nil
+      clip?.onChunk = nil
+      _ = await clip?.finish()
+      archive = nil
       await lecture.finish()
       lectureTranscriber = nil
-      await archive?.finish(); archive = nil
-      audioActivityClock = nil
+      audioSink = nil
+      stateLock.withLock {
+        if audioActivityClock === activityClock { audioActivityClock = nil }
+        audioCaptureHeartbeat = nil
+        currentAudioCaptureIssue = nil
+        consecutiveAudioCallbackStallChecks = 0
+        consecutiveMissingCaptureTargetChecks = 0
+      }
       throw error
     }
     tap = audioTap
+    stateLock.withLock {
+      audioCaptureHeartbeat = captureHeartbeat
+      currentAudioCaptureIssue = nil
+      consecutiveAudioCallbackStallChecks = 0
+      consecutiveMissingCaptureTargetChecks = 0
+    }
+    // 실제 탭이 성공한 뒤에만 Store의 녹음 시계를 연다. 실패 rollback에서
+    // endRecording()을 호출해 이어 적기 기준이 불필요하게 2초 늘어나는 일을 막는다.
+    store.beginRecording()
 
     // running 은 라우트에서 이미 세웠다. 여기서는 화면에만 알린다.
-    live.broadcast(event: "status", payload: ["running": true, "message": ""])
+    live.broadcast(event: "status", payload: [
+      "running": true,
+      "message": "",
+      "silent": false,
+    ])
     startSilenceWatchdog()
+    startAudioCaptureHealthWatchdog()
 
     log("녹음 시작 — \(store.title)\(store.timeBase > 0 ? " (이어 적기, \(TranscriptStore.clock(store.timeBase))부터)" : "")")
   }
 
-  /// 소리가 하나도 안 들어오는 상태를 알린다.
+  /// PCM 콘텐츠의 무음과 180초 강의 경계만 감시한다.
   ///
-  /// 알리는 조건은 딱 하나다 — **Zoom 은 CoreAudio 상으로 "지금 소리를 낸다"고
-  /// 스스로 보고하는데, 우리 입력은 30초(AudioActivityClock.recentSoundWindow) 넘게
-  /// 아무것도 못 들은 경우.** 이게 권한 문제(macOS 는 에러 대신 무음을 흘려보낸다)나
-  /// 이어폰 전환 등으로 탭이 죽었다는 확실한 신호다. Zoom 자체가 조용한 경우(회의에
-  /// 안 들어갔거나 발표자가 말을 안 하는 것)는 강의자 쪽 사정이지 이 앱의 문제가
-  /// 아니라서 알리지 않는다 — 로그만 남긴다.
-  ///
-  /// 이어폰 전환 자체는 독립적으로 알리지 않는다(장치가 바뀌어도 캡처가 안
-  /// 죽는 경우가 더 흔해서 오탐이 된다) — `lastDeviceChangeAt` 은 위 조건이 실제로
-  /// 걸렸을 때 "왜 그런지" 문구를 구체화하는 재료로만 쓴다.
-  ///
-  /// 20초마다 매번 다시 알리면 강의 쉬는 시간 10분 동안 30번 반복되므로,
-  /// **상태가 바뀔 때(조용해질 때 / 돌아올 때)만** 로그·알림을 낸다.
+  /// Zoom의 `isRunningOutput`은 실제 소리가 있다는 뜻이 아니므로 이 함수에서는 더
+  /// 이상 읽지 않는다. 30초 이상 0 PCM이 계속 도착하는 것은 정상 침묵이며 로그만
+  /// 남긴다. 빨간 오류 배너는 별도의 `startAudioCaptureHealthWatchdog()`가 콜백 중단
+  /// 또는 캡처 대상 소실을 확인했을 때만 표시한다.
   private func startSilenceWatchdog() {
     stateLock.withLock {
-      // 새 녹음 구간은 캡처 이상 알림과 강의 경계 모두 깨끗한 상태에서 시작한다.
+      // 새 녹음 구간은 콘텐츠 무음과 강의 경계 상태를 깨끗하게 시작한다.
       wasSilent = false
-      silenceNotified = false
       lectureBoundaryProcessing = false
       lastHandledLectureBoundarySoundAt = nil
     }
@@ -868,7 +981,11 @@ final class ZoomCaptionApp: @unchecked Sendable {
             activityClock.framesSeen > 0
       else { return }
 
-      let silentNow = !activityClock.isHearingSound
+      // 아직 유효한 소리를 한 번도 듣지 못했다면 무음의 시작점을 정할 수 없다.
+      // `isHearingSound == false`만 쓰면 첫 12초 감시 틱에서 곧바로 "30초 무음"을
+      // 기록하므로, 실제 마지막 소리 시각이 있는 경우에만 30초 경과를 판정한다.
+      guard let currentSilenceDuration = activityClock.silenceDuration else { return }
+      let silentNow = currentSilenceDuration >= AudioActivityClock.recentSoundWindow
       let wasSilentBefore = self.stateLock.withLock { () -> Bool in
         let prev = self.wasSilent
         self.wasSilent = silentNow
@@ -877,58 +994,130 @@ final class ZoomCaptionApp: @unchecked Sendable {
 
       guard silentNow else {
         if wasSilentBefore {   // 방금 회복된 그 틱에서만 한 번
-          log("오디오 입력 복구됨 — 다시 소리가 들어오고 있습니다.")
-          self.live.broadcast(event: "status", payload: ["silent": false])
+          log("콘텐츠 무음 종료 — 다시 유효한 소리가 들어오고 있습니다.")
           // 강의 경계의 재무장은 아래 beginLectureBoundaryIfNeeded가 마지막 유효
-          // 소리 시각을 비교해 자동 처리한다. 여기서는 캡처 경고 상태만 되돌린다.
-          self.stateLock.withLock { self.silenceNotified = false }
+          // 소리 시각을 비교해 자동 처리한다. 오류 배너는 캡처 건강 감시만 관리한다.
         }
         return
       }
 
-      // 캡처 이상 경고(30초)와 강의 종료 경계(180초)는 같은 마지막 소리 시각을
-      // 읽지만 서로 독립된 정책이다. 경계 처리는 관리자 되먹임처럼 tap이 없는
-      // 경우에도 실행되며, 내부에서 Whisper 대기 후 같은 무음인지 다시 검증한다.
+      if !wasSilentBefore {
+        log("30초 이상 콘텐츠 무음 — 오디오 콜백 상태와 별개로 정상 침묵으로 처리합니다.")
+      }
+
+      // 실제 탭의 콜백이 끊겼다면 시간이 180초 흘러도 강의 침묵으로 확정하지 않는다.
+      // 관리자 되먹임은 파일 끝 뒤에 콜백이 없는 것이 정상이고 바로 이 경로를 시험하는
+      // 용도이므로 tap이 없는 경우에는 기존 180초 동작을 그대로 허용한다.
+      guard self.hasHealthyCaptureDeliveryForLectureBoundary() else { return }
+
       if let silencePeriod = activityClock.silencePeriod,
          silencePeriod.duration >= Self.lectureBoundarySilenceSeconds {
         self.beginLectureBoundaryIfNeeded(activityClock: activityClock,
                                           silencePeriod: silencePeriod)
       }
+    }
+    timer.resume()
+    silenceWatchdog = timer
+  }
 
-      // 이미 이번 무음 구간에서 알렸으면 반복하지 않는다. 아직이면 조용한 동안
-      // 매 틱(20초마다) 계속 재확인한다 — 무음이 시작된 바로 그 틱에 하필
-      // 시스템 전체가 조용해서(playing.isEmpty) 판단 근거가 없었어도, 몇 틱 뒤
-      // Zoom이 다시 소리를 내기 시작하면 그때 잡아내야 하기 때문이다.
-      guard self.tap != nil,
-            !(self.stateLock.withLock { self.silenceNotified })
+  /// 180초가 실제 콘텐츠 침묵으로 관측됐는지 확인한다. 탭이 없는 관리자 되먹임은
+  /// 파일 입력 종료 뒤에도 경계 시험을 계속해야 하므로 true다. 실제 탭에서는 대상
+  /// 프로세스가 남아 있고 최근 콜백이 도착한 경우에만 강의 경계를 허용한다.
+  private func hasHealthyCaptureDeliveryForLectureBoundary() -> Bool {
+    guard let currentAudioTap = tap else { return true }
+    guard currentAudioTap.hasAvailableCapturedTarget,
+          let captureHeartbeat = stateLock.withLock({ audioCaptureHeartbeat })
+    else { return false }
+    return captureHeartbeat.snapshot().secondsSinceMostRecentBufferOrStart
+      <= Self.audioCallbackStallSeconds
+  }
+
+  /// 실제 탭의 전달 경로만 5초마다 검사한다. PCM이 0인지 아닌지는 전혀 보지 않기
+  /// 때문에 발표자 침묵은 정상으로 남고, 버퍼 자체가 멈추거나 시작 때 선택한 Zoom
+  /// 프로세스가 모두 사라진 경우에만 사용자에게 오류를 알린다.
+  private func startAudioCaptureHealthWatchdog() {
+    let timer = DispatchSource.makeTimerSource(queue: .global())
+    timer.schedule(deadline: .now() + 5, repeating: 5)
+    timer.setEventHandler { [weak self] in
+      guard let self,
+            self.stateLock.withLock({ self.running && !self.stopping }),
+            let currentAudioTap = self.tap,
+            let captureHeartbeat = self.stateLock.withLock({ self.audioCaptureHeartbeat })
       else { return }
 
-      // "앱이 떠 있다" 가 아니라 "지금 소리를 내고 있다" 로 판정해야 한다.
-      // Zoom 은 회의에 안 들어가 있어도 오디오 프로세스를 들고 있어서, 앱 존재로 재면 늘 참이 된다.
-      let playing = CoreAudioInfo.playingBundleIDs()
-      let zoomPlaying = playing.contains { SystemAudioTap.zoomBundleIDs.contains($0) }
-      guard !playing.isEmpty else { return }   // 이번 틱엔 판단 근거가 없다 — 다음 틱에 다시 본다
+      let heartbeatSnapshot = captureHeartbeat.snapshot()
+      let callbackAppearsStalled = heartbeatSnapshot.secondsSinceMostRecentBufferOrStart
+        > Self.audioCallbackStallSeconds
+      let captureTargetIsAvailable = currentAudioTap.hasAvailableCapturedTarget
+      let confirmedHealthState = self.stateLock.withLock { () -> (
+        callbackStalled: Bool, captureTargetMissing: Bool
+      ) in
+        if callbackAppearsStalled {
+          self.consecutiveAudioCallbackStallChecks += 1
+        } else {
+          self.consecutiveAudioCallbackStallChecks = 0
+        }
+        if captureTargetIsAvailable {
+          self.consecutiveMissingCaptureTargetChecks = 0
+        } else {
+          self.consecutiveMissingCaptureTargetChecks += 1
+        }
+        return (
+          self.consecutiveAudioCallbackStallChecks >= 2,
+          self.consecutiveMissingCaptureTargetChecks >= 2
+        )
+      }
+      let detectedIssue: AudioCaptureIssue?
+      if confirmedHealthState.captureTargetMissing {
+        detectedIssue = .targetProcessLost
+      } else if captureTargetIsAvailable && confirmedHealthState.callbackStalled {
+        let outputDeviceChangedRecently = self.stateLock.withLock {
+          self.lastDeviceChangeAt.map { Date().timeIntervalSince($0) < 60 } == true
+        }
+        detectedIssue = outputDeviceChangedRecently ? .outputRouteChanged : .callbackStalled
+      } else {
+        detectedIssue = nil
+      }
 
-      guard zoomPlaying else {
-        if !wasSilentBefore {   // 이번 무음 구간에서 처음 확인한 틱에만 로그
-          logWarn("무음 감지 — Zoom 은 소리를 안 내고 있습니다(회의 미참여·발표자 침묵 등으로 추정) — 알리지 않음.")
+      let previousIssue = self.stateLock.withLock { () -> AudioCaptureIssue? in
+        let previousIssue = self.currentAudioCaptureIssue
+        self.currentAudioCaptureIssue = detectedIssue
+        return previousIssue
+      }
+      guard previousIssue != detectedIssue else { return }
+
+      guard let detectedIssue else {
+        if previousIssue != nil {
+          log("오디오 캡처 경로 복구 — Core Audio 버퍼가 다시 들어오고 있습니다.")
+          self.live.broadcast(event: "status", payload: ["silent": false])
         }
         return
       }
 
-      let (changedAt, changedName) = self.stateLock.withLock { (self.lastDeviceChangeAt, self.lastDeviceChangeName) }
-      let recentSwitch = changedAt.map { Date().timeIntervalSince($0) < 60 } == true
-      let message = recentSwitch
-        ? "오디오 출력 장치가 \(changedName ?? "다른 장치")로 바뀐 뒤로 소리가 안 들어오고 있습니다 — 정지 후 다시 시작해 주세요."
-        : "Zoom은 소리를 내고 있는데 이 앱에는 들리지 않습니다 — 시스템 설정 > 화면 및 시스템 오디오 기록 권한을 확인하거나, 정지 후 다시 시작해 보세요."
-      logWarn("무음 감지 — \(message)")
-      self.stateLock.withLock { self.silenceNotified = true }
-      // "message" 는 #cfgNotice 가 이미 쓰는 공용 필드라 겹치면 엉뚱한 자리에도 뜬다.
-      // 그래서 무음 배너 전용 필드를 따로 둔다.
-      self.live.broadcast(event: "status", payload: ["silent": true, "silentMessage": message])
+      let issueMessage: String
+      switch detectedIssue {
+      case .targetProcessLost:
+        issueMessage = "녹음을 시작할 때 선택한 Zoom 오디오 프로세스가 종료되었습니다. "
+          + "시스템 전체 소리로 전환하지 않았습니다. Zoom 회의 상태를 확인한 뒤 녹음을 다시 시작해 주세요."
+      case .outputRouteChanged:
+        let changedOutputName = self.stateLock.withLock { self.lastDeviceChangeName }
+        issueMessage = "오디오 출력 장치가 \(changedOutputName ?? "다른 장치")로 바뀐 뒤 "
+          + "Core Audio 버퍼가 들어오지 않습니다. 녹음을 다시 시작해 주세요."
+      case .callbackStalled:
+        let stalledSeconds = Int(heartbeatSnapshot.secondsSinceMostRecentBufferOrStart.rounded())
+        issueMessage = "Core Audio 버퍼가 \(stalledSeconds)초 동안 들어오지 않았습니다. "
+          + "Zoom 회의와 화면 및 시스템 오디오 기록 권한을 확인한 뒤 녹음을 다시 시작해 주세요."
+      }
+      logWarn("오디오 캡처 경로 이상 — \(issueMessage)")
+      // `silentMessage`는 기존 빨간 배너 전용 필드 이름을 호환성 때문에 유지하지만,
+      // 이제 단순 무음이 아니라 확인된 캡처 경로 장애에만 true를 보낸다.
+      self.live.broadcast(event: "status", payload: [
+        "silent": true,
+        "silentMessage": issueMessage,
+      ])
     }
     timer.resume()
-    silenceWatchdog = timer
+    audioCaptureHealthWatchdog = timer
   }
 
   /// 같은 180초 무음에서 하나의 경계 작업만 시작한다. 실제 처리는 비동기로 돌려
@@ -1128,13 +1317,16 @@ final class ZoomCaptionApp: @unchecked Sendable {
     // 이벤트를 먼저 보낸 다음 idle로 전환한다.
     defer {
       stateLock.withLock { running = false }
-      live.broadcast(event: "status", payload: ["running": false])
+      // 캡처 장애 배너가 떠 있던 상태에서 정지해도 다음 세션 화면에 남지 않게
+      // running과 배너 상태를 같은 마지막 이벤트로 되돌린다.
+      live.broadcast(event: "status", payload: ["running": false, "silent": false])
       live.broadcast(event: "volatile",
                      payload: ["track": Track.lecture.rawValue, "text": ""], durable: false)
       stateLock.withLock { stopping = false }
     }
 
     silenceWatchdog?.cancel(); silenceWatchdog = nil
+    audioCaptureHealthWatchdog?.cancel(); audioCaptureHealthWatchdog = nil
     let boundaryTaskToCancel = stateLock.withLock { () -> Task<Void, Never>? in
       let task = lectureBoundaryTask
       lectureBoundaryTask = nil
@@ -1142,6 +1334,10 @@ final class ZoomCaptionApp: @unchecked Sendable {
       lectureBoundaryProcessing = false
       lastHandledLectureBoundarySoundAt = nil
       audioActivityClock = nil
+      audioCaptureHeartbeat = nil
+      currentAudioCaptureIssue = nil
+      consecutiveAudioCallbackStallChecks = 0
+      consecutiveMissingCaptureTargetChecks = 0
       return task
     }
     boundaryTaskToCancel?.cancel()
@@ -1162,6 +1358,9 @@ final class ZoomCaptionApp: @unchecked Sendable {
     }
     archive = nil
 
+    // 열린 구간은 문단이 아니라 이전 구조화 경계부터 재야 한다. 문단은 녹음 중에도
+    // 계속 확정되어 길이를 몇 초로 축소하므로, 강제 문단화 전에 경계 기준을 보존한다.
+    let openSpanReferencePoint: Double
     if let worker = whisperLive {
       let (done, total) = worker.progress
       if done < total {
@@ -1177,6 +1376,11 @@ final class ZoomCaptionApp: @unchecked Sendable {
       sentenceBuffer = nil
       log("Whisper 실시간 재전사 종료 — 조각 \(worker.progress.done)개, \(store.whisperSegments.count)줄")
       whisperLive = nil
+      // 이전 경계만 조회해야 실시간 문단 확정 횟수와 무관하게 마지막으로 닫힌 기록
+      // 단위 이후의 전체 길이를 보존하고, 10분 정지 기준이 영원히 충족되지 않는 일을 막는다.
+      openSpanReferencePoint =
+        store.lastClosedTranscriptUnitEnd(after: currentRecordingStartOffset)
+        ?? currentRecordingStartOffset
       // 마지막 2~3문장은 앞으로 문맥이 더 쌓일 일이 없다 — 대기하던 판정을 여기서 확정한다.
       // ingestWhisperLines 가 문단 없는 줄은 화면에 아예 안 띄워 왔으므로(재배치 방지),
       // 여기서 나오는 줄들은 전부 처음 등장하는 것이다 — 그래서 whisperSegment 로
@@ -1185,10 +1389,34 @@ final class ZoomCaptionApp: @unchecked Sendable {
         guard seg.paragraph != nil else { continue }
         live.broadcast(event: "whisperSegment", payload: whisperSegmentPayload(seg))
       }
+    } else {
+      // Whisper가 없으면 이번 구간의 정식 기록 경계도 없으므로 시작점을 써야 하며,
+      // 이어 적기 전 세션의 경계를 현재 열린 구간의 시작으로 잘못 가져오지 않는다.
+      openSpanReferencePoint = currentRecordingStartOffset
     }
 
     await lectureTranscriber?.finish(); lectureTranscriber = nil
     audioSink = nil
+
+    // 정지 직전의 실제 전사 끝만 보고 10분 이상 열린 구간에 표식을 붙인다. 이번 녹음
+    // 오프셋 검사는 이어 적기 후 발화가 없을 때 과거 세션의 마지막 문장을 오염시키지 않는다.
+    if let lastContentEnd = store.primarySegments.last(where: {
+      $0.end >= currentRecordingStartOffset
+    })?.end,
+       lastContentEnd - openSpanReferencePoint >= Self.stopBoundaryMinimumOpenSpanSeconds {
+      let boundaryUpdate = store.markLatestSegmentAsLectureEnded(
+        after: currentRecordingStartOffset,
+        reason: .recordingStopped)
+      if let boundaryUpdate {
+        // 저장소 변경만으로는 이미 열린 브라우저가 이유를 알 수 없으므로 구조화 값을
+        // 함께 보내며, 재동기화 전에도 강의 종료와 녹음 종료를 정확히 구분하게 한다.
+        live.broadcast(event: "lectureBoundary", payload: [
+          "collection": boundaryUpdate.collection.rawValue,
+          "id": boundaryUpdate.segment.id,
+          "boundaryAfter": TranscriptBoundary.recordingStopped.rawValue,
+        ])
+      }
+    }
 
     store.endRecording()
 

@@ -26,6 +26,14 @@ final class Logger: @unchecked Sendable {
   private let queue = DispatchQueue(label: "zoomcaption.logger")
   private var handle: FileHandle?
   private var currentDay = ""
+  /// 관리자 시험과 실사용 앱은 서로 다른 프로세스지만 같은 날짜에 동시에 실행될 수
+  /// 있다. 날짜만 파일명에 넣으면 각 프로세스의 독립적인 FileHandle 오프셋이 충돌해
+  /// 두 로그가 한 줄에 붙거나 덮어써진다. 역할과 PID를 고정해 프로세스마다 한 파일만
+  /// 쓰게 하면 별도의 프로세스 간 잠금 없이도 기록 경계가 보존된다.
+  private let processLogIdentity: String
+  /// prune이 현재 열어 둔 파일을 지우지 않도록 실제 파일명을 기억한다. 예전의 날짜
+  /// 기반 비교는 PID·역할 접미사가 붙은 뒤 현재 파일을 알아보지 못한다.
+  private var currentLogFileName = ""
 
   private let ringLock = NSLock()
   private var ring: [String] = []
@@ -43,10 +51,17 @@ final class Logger: @unchecked Sendable {
   }()
 
   private init() {
+    let processInfo = ProcessInfo.processInfo
+    let administratorModeWasRequested = processInfo.arguments.contains("--admin")
+      || processInfo.environment["ZOOMCAPTION_ADMIN"] == "1"
+    let processRole = administratorModeWasRequested ? "admin" : "live"
+    processLogIdentity = "\(processRole)-pid-\(processInfo.processIdentifier)"
     directory = FileManager.default.homeDirectoryForCurrentUser
       .appendingPathComponent("Library/Logs/ZoomCaption", isDirectory: true)
     try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-    queue.async { [weak self] in self?.prune() }
+    // 첫 log()가 날짜와 현재 프로세스의 파일명을 확정한 뒤 rollIfNeeded()에서
+    // 정리한다. 여기서 먼저 prune하면 어떤 파일이 현재 실행 중인 프로세스의 것인지
+    // 아직 모르므로, 용량 제한에 걸린 날 관리자 시험이 실사용 로그를 지울 수 있다.
   }
 
   // MARK: - 쓰기
@@ -74,7 +89,7 @@ final class Logger: @unchecked Sendable {
   /// 프로세스를 끝내기 직전에 부른다. 로그 쓰기는 큐에 비동기로 실려 있어서,
   /// 여기서 한 번 비워 주지 않으면 종료 과정의 마지막 줄들이 파일에 남지 않는다.
   func flush() {
-    queue.sync { try? self.handle?.synchronizeFile() }
+    queue.sync { self.handle?.synchronizeFile() }
   }
 
   private func rollIfNeeded(_ now: Date) {
@@ -85,12 +100,14 @@ final class Logger: @unchecked Sendable {
     handle = nil
     currentDay = today
 
-    let url = directory.appendingPathComponent("zoomcaption-\(today).log")
+    let logFileName = "zoomcaption-\(today)-\(processLogIdentity).log"
+    let url = directory.appendingPathComponent(logFileName)
     if !FileManager.default.fileExists(atPath: url.path) {
       FileManager.default.createFile(atPath: url.path, contents: nil)
     }
     handle = try? FileHandle(forWritingTo: url)
-    try? handle?.seekToEnd()
+    _ = try? handle?.seekToEnd()
+    currentLogFileName = logFileName
     prune()
   }
 
@@ -111,8 +128,10 @@ final class Logger: @unchecked Sendable {
       let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
       let modified = values?.contentModificationDate ?? .distantPast
       let size = values?.fileSize ?? 0
-      // 지금 쓰고 있는 파일은 건드리지 않는다.
-      if modified < cutoff, url.lastPathComponent != "zoomcaption-\(currentDay).log" {
+      // 오늘 날짜의 파일은 다른 live/admin 프로세스가 지금 쓰는 중일 수 있다.
+      // FileHandle을 열었는지는 프로세스 밖에서 안전하게 판별할 수 없으므로 현재
+      // 파일뿐 아니라 오늘 파일 전체를 보존하고, 지난 날짜 파일만 정리 대상으로 삼는다.
+      if modified < cutoff, !isPotentiallyActiveLog(url.lastPathComponent) {
         try? fm.removeItem(at: url)
       } else {
         survivors.append((url, modified, size))
@@ -123,10 +142,19 @@ final class Logger: @unchecked Sendable {
     guard total > Self.maxTotalBytes else { return }
     for entry in survivors.sorted(by: { $0.date < $1.date }) {
       guard total > Self.maxTotalBytes else { break }
-      guard entry.url.lastPathComponent != "zoomcaption-\(currentDay).log" else { continue }
+      guard !isPotentiallyActiveLog(entry.url.lastPathComponent) else { continue }
       try? fm.removeItem(at: entry.url)
       total -= entry.size
     }
+  }
+
+  /// 날짜만 쓰던 예전 파일과 역할·PID가 붙는 새 파일을 모두 보호한다. 같은 날 열린
+  /// 다른 프로세스 로그까지 보존해야 독립 관리자 시험이 실사용 진단 기록을 훼손하지 않는다.
+  private func isPotentiallyActiveLog(_ fileName: String) -> Bool {
+    guard !currentDay.isEmpty else { return true }
+    return fileName == currentLogFileName
+      || fileName == "zoomcaption-\(currentDay).log"
+      || fileName.hasPrefix("zoomcaption-\(currentDay)-")
   }
 
   // MARK: - 읽기

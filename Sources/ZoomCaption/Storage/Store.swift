@@ -103,6 +103,9 @@ struct SessionFile: Codable {
   var segments: [Segment]
   var nextID: Int
   var summary: String?
+  /// 예전 세션에는 이 키가 없으므로 반드시 Optional이어야 한다 — 기본값을 둔
+  /// 비Optional 필드는 누락된 키를 자동 보완하지 못해 파일 전체 디코딩을 실패시킨다.
+  var summaryEngineNote: String?
   var domainTerms: [String]
   var domainSource: String?
   /// 지금까지 기록된 총 길이. 이어 적기를 하면 여기서부터 타임스탬프가 이어진다.
@@ -145,6 +148,9 @@ final class TranscriptStore: @unchecked Sendable {
 
   var title: String = "Zoom 수업"
   var summary: String?
+  /// 현재 저장된 요약을 실제로 만든 경로다. 사용 가능한 엔진 상태와 섞으면 외부
+  /// LLM 결과를 다시 열었을 때 Ollama가 만든 것으로 잘못 표시될 수 있다.
+  var summaryEngineNote: String?
   /// 마지막 요약이 훑은 끝 지점(초)
   var lastSummarizedAt: Double?
   var domainTerms: [String] = []
@@ -200,6 +206,7 @@ final class TranscriptStore: @unchecked Sendable {
       startedAt = nil
       self.title = title
       summary = nil
+      summaryEngineNote = nil
       lastSummarizedAt = nil
       domainTerms = []
       domainSource = nil
@@ -227,6 +234,7 @@ final class TranscriptStore: @unchecked Sendable {
       startedAt = nil
       title = file.title
       summary = file.summary
+      summaryEngineNote = file.summaryEngineNote
       lastSummarizedAt = file.lastSummarizedAt
       domainTerms = file.domainTerms
       domainSource = file.domainSource
@@ -377,6 +385,7 @@ final class TranscriptStore: @unchecked Sendable {
     lock.withLock {
       SessionFile(title: title, createdAt: createdAt, updatedAt: Date(),
                   segments: segments, nextID: nextID, summary: summary,
+                  summaryEngineNote: summaryEngineNote,
                   domainTerms: domainTerms, domainSource: domainSource,
                   duration: max(timeBase, lastEndLocked()),
                   lastSummarizedAt: lastSummarizedAt,
@@ -463,6 +472,29 @@ final class TranscriptStore: @unchecked Sendable {
                               paragraph: $0.paragraph,
                               boundaryAfter: $0.boundaryAfter)
         }
+    }
+  }
+
+  /// 전체 Whisper 기록 기준 구간 목록.
+  ///
+  /// id는 언제나 전체 기준으로 만든다. 범위를 먼저 자른 뒤 구간을 만들면 사용자가
+  /// 고른 3강이 프롬프트나 로컬 요약에서 다시 1강이 되어, 여러 번 나눠 만든 결과를
+  /// 이어 붙일 때 번호가 흔들리기 때문이다.
+  func lectureUnits() -> [LectureUnit] {
+    SummaryChunker.makeUnits(from: whisperSummarySnapshot(from: nil))
+  }
+
+  /// 전체 기준 id의 닫힌 범위만 고른다. nil은 각각 처음과 끝을 뜻한다.
+  ///
+  /// 시각(Double)으로 경계를 다시 비교하면 JSON 왕복에서 소수점이 축약될 때
+  /// `segment.end <= to`의 마지막 세그먼트가 오류 없이 탈락할 수 있다. 이미 확정한
+  /// 구간 id만 비교하면 부동소수점 경계 판정 자체가 사라지고 id도 다시 매겨지지 않는다.
+  func lectureUnits(fromUnit: Int?, toUnit: Int?) -> [LectureUnit] {
+    if let fromUnit, let toUnit, toUnit < fromUnit { return [] }
+    return lectureUnits().filter { unit in
+      if let fromUnit, unit.id < fromUnit { return false }
+      if let toUnit, unit.id > toUnit { return false }
+      return true
     }
   }
 
@@ -813,6 +845,7 @@ final class TranscriptStore: @unchecked Sendable {
       out += "- 요약 범위: \(Self.clock(at)) 까지\n"
     }
     if let src = domainSource { out += "- 교안: \(src)\n" }
+    if let summaryEngineNote { out += "- 요약 엔진: \(summaryEngineNote)\n" }
     out += "\n"
     out += (summary ?? "_요약이 없습니다._")
     return out + "\n"
@@ -882,9 +915,9 @@ final class TranscriptStore: @unchecked Sendable {
     return out
   }
 
-  /// 경계 문구를 한곳에서 결정해야 문단/비문단 Markdown 경로가 새 경계 종류를 서로
-  /// 다르게 처리하는 누락을 막고, nil은 구조화 경계가 없는 발화에 아무것도 섞지 않는다.
-  private static func markdownLabel(for boundary: TranscriptBoundary?) -> String? {
+  /// 경계 문구를 한곳에서 결정해야 문단/비문단 Markdown과 프롬프트 내보내기가 새 경계
+  /// 종류를 서로 다르게 처리하는 누락을 막고, nil은 발화에 아무것도 섞지 않는다.
+  static func markdownLabel(for boundary: TranscriptBoundary?) -> String? {
     switch boundary {
     case .lectureEnded: "강의 종료"
     case .recordingStopped: "녹음 종료"

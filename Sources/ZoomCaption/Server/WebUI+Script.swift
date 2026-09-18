@@ -69,6 +69,14 @@ extension WebUI {
   let lines = new Map();      // id -> element
   let lastPicked = null;
   let state = {};
+  let summaryTargets = {
+    local: { name: '로컬 모델', url: '' },
+    claude: { name: 'Claude', url: 'https://claude.ai/new' },
+    chatgpt: { name: 'ChatGPT', url: 'https://chatgpt.com/' },
+    gemini: { name: 'Gemini', url: 'https://gemini.google.com/app' },
+  };
+  let promptRequestGeneration = 0;
+  let onlineEnvironmentLogged = false;
 
   const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
   const clock = t => {
@@ -99,19 +107,25 @@ extension WebUI {
     }
     marker.textContent = boundaryLabel;
   }
-  // "12:34" / "1:02:03" / "755" 모두 초로 바꾼다. 빈 값이면 null(=전체).
-  const parseClock = v => {
-    v = (v || '').trim();
-    if (!v) return null;
-    const parts = v.split(':').map(x => parseInt(x, 10));
-    if (parts.some(isNaN)) return null;
-    return parts.length === 1 ? parts[0]
-         : parts.length === 2 ? parts[0]*60 + parts[1]
-         : parts[0]*3600 + parts[1]*60 + parts[2];
-  };
   const post = (url, body) => fetch(url, {
     method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {})
   }).then(r => r.json());
+
+  // 프라이버시 약속 때문에 이 통로에는 전사·프롬프트·요약 본문을 절대 싣지 않는다.
+  // 브라우저 종류, API 지원 여부, 본문 길이, 오류 이름/메시지 같은 진단 메타데이터만
+  // 보낸다. 로그 전송 자체가 실패하면 재귀 전송하지 않고 콘솔에 원래 오류를 남긴다.
+  function clientLog(level, message) {
+    fetch('/api/clientLog', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ level, message: String(message || '').slice(0, 500) }),
+    }).catch(clientLogError => console.warn('클라이언트 로그 전송 실패', clientLogError));
+  }
+
+  function errorDescription(error) {
+    const errorName = error?.name || error?.constructor?.name || 'Error';
+    const errorMessage = error?.message || String(error || '알 수 없는 오류');
+    return `${errorName}: ${errorMessage}`;
+  }
 
   let toastTimer = null;
   function toast(text) {
@@ -380,10 +394,20 @@ extension WebUI {
       removeLine(id);
     });
 
-    el.querySelector('.ts').addEventListener('click', () => {
-      $('#sumFrom').value = clock(+el.dataset.start);
-      $('#fromHint').textContent = clock(+el.dataset.start) + ' 부터 요약합니다.';
-      document.querySelector('.tab[data-tab=sum]').click();
+    el.querySelector('.ts').addEventListener('click', async () => {
+      // 임의 시각을 요청에 싣지 않고, 서버가 계산한 구간 중 이 문장을 포함하는 id를
+      // 고른다. 그래야 JSON 소수점 축약 때문에 마지막 문장이 빠지는 경로가 다시 생기지 않는다.
+      if (!(state.summaryUnits || []).length) await loadSummaryUnits();
+      const segmentStart = Number(el.dataset.start);
+      const containingUnit = (state.summaryUnits || []).find(unit =>
+        segmentStart >= Number(unit.start) && segmentStart <= Number(unit.end));
+      if (containingUnit) {
+        $('#sumRangeStart').value = String(containingUnit.id);
+        $('#sumRangeEnd').value = '';
+        handleSummarySelectionChange('start');
+      }
+      setWorkspaceView('summary');
+      $('#sumRangeStart').focus();
     });
 
     el.querySelector('.pick').addEventListener('click', e => {
@@ -461,7 +485,321 @@ extension WebUI {
   }
 
   // ── 상태 ──
+  function showSummaryProgress(message, busy = false) {
+    const el = $('#summaryProgress');
+    el.textContent = message || '';
+    el.classList.toggle('busy', !!message && busy);
+  }
+
+  function showCurrentSummary(markdown = state.summary, clearNotice = false) {
+    $('#summarySource').textContent = '현재 세션 요약';
+    $('#btnCurrentSummary').style.display = 'none';
+    $('#saveSummaryBox').style.display = markdown ? '' : 'none';
+    $('#summary').innerHTML = markdown ? md(markdown)
+      : '<p class="muted-note">수업이 끝난 뒤 <b>요약 생성</b>을 누르면 전체 기록을 온디바이스 모델로 정리합니다.</p>';
+    if (clearNotice) notice('#sumNotice', '', '');
+  }
+
+  // 라디오는 select와 달리 값이 한 요소에 모이지 않으므로 선택된 항목을 직접 읽는다.
+  // 선택이 풀린 비정상 상태는 안전한 기존 동작인 로컬 모델로 되돌린다.
+  function selectedSummaryTarget() {
+    const checkedTarget = document.querySelector('input[name="onlineTarget"]:checked');
+    return checkedTarget ? checkedTarget.value : 'local';
+  }
+
+  function selectedSummaryRange() {
+    const startValue = $('#sumRangeStart').value;
+    const endValue = $('#sumRangeEnd').value;
+    return {
+      fromUnit: startValue === '' ? null : Number(startValue),
+      toUnit: endValue === '' ? null : Number(endValue),
+    };
+  }
+
+  function summaryRangeCacheKey(target = selectedSummaryTarget()) {
+    const range = selectedSummaryRange();
+    return `${target}:${range.fromUnit ?? ''}:${range.toUnit ?? ''}`;
+  }
+
+  function unitsInSelectedRange() {
+    const range = selectedSummaryRange();
+    return (state.summaryUnits || []).filter(unit =>
+      (range.fromUnit === null || Number(unit.id) >= range.fromUnit) &&
+      (range.toUnit === null || Number(unit.id) <= range.toUnit));
+  }
+
+  function invalidateOnlineContext() {
+    // 대상이나 범위가 바뀐 뒤 옛 기대 구간 수를 import 검증에 쓰면 정상 응답에도
+    // 누락 경고가 뜬다. 진행 작업과 프롬프트를 같은 순간에 버려 둘이 엇갈리지 않게 한다.
+    state.onlineJob = null;
+    state.promptCache = null;
+    promptRequestGeneration += 1;
+  }
+
+  function syncSummaryRangeConstraints(changedSide) {
+    const startSelect = $('#sumRangeStart');
+    const endSelect = $('#sumRangeEnd');
+    let range = selectedSummaryRange();
+    if (range.fromUnit !== null && range.toUnit !== null && range.toUnit < range.fromUnit) {
+      // 이미 고른 반대편 option을 disabled 상태로 남겨 두면 브라우저마다 표시가
+      // 달라진다. 사용자가 방금 바꾼 쪽을 보존하고 다른 쪽만 기본값으로 되돌린다.
+      if (changedSide === 'start') endSelect.value = '';
+      else startSelect.value = '';
+      range = selectedSummaryRange();
+    }
+    [...endSelect.options].forEach(option => {
+      option.disabled = option.value !== '' && range.fromUnit !== null
+        && Number(option.value) < range.fromUnit;
+    });
+    [...startSelect.options].forEach(option => {
+      option.disabled = option.value !== '' && range.toUnit !== null
+        && Number(option.value) > range.toUnit;
+    });
+  }
+
+  function renderSummaryRangeOptions(units) {
+    const startSelect = $('#sumRangeStart');
+    const endSelect = $('#sumRangeEnd');
+    const previousStart = startSelect.value;
+    const previousEnd = endSelect.value;
+    const validUnitIDs = new Set(units.map(unit => String(unit.id)));
+
+    startSelect.innerHTML = '<option value="">처음부터</option>' + units.map(unit =>
+      `<option value="${unit.id}">${unit.id}강 시작 · ${clock(unit.start)}</option>`).join('');
+    endSelect.innerHTML = '<option value="">끝까지</option>' + units.map(unit =>
+      `<option value="${unit.id}">${unit.id}강 끝 · ${clock(unit.end)}</option>`).join('');
+    // SSE 경계 추가나 정지 후 재조회가 와도 아직 존재하는 사용자의 선택은 지킨다.
+    // 매번 처음/끝으로 초기화하면 긴 수업에서 고른 범위를 조용히 잃는다.
+    startSelect.value = previousStart === '' || validUnitIDs.has(previousStart) ? previousStart : '';
+    endSelect.value = previousEnd === '' || validUnitIDs.has(previousEnd) ? previousEnd : '';
+    syncSummaryRangeConstraints();
+    showLastSummarized(state.lastSummarizedAt);
+    updateSummaryControls();
+  }
+
+  async function loadSummaryUnits() {
+    try {
+      const response = await fetch('/api/summary/units', { cache: 'no-store' }).then(result => result.json());
+      if (!response.ok) throw new Error(response.error || '구간 목록을 읽지 못했습니다.');
+      state.summaryUnits = response.units || [];
+      renderSummaryRangeOptions(state.summaryUnits);
+      return state.summaryUnits;
+    } catch (unitLoadError) {
+      console.warn('요약 구간 조회 실패', unitLoadError);
+      clientLog('warn', '요약 구간 조회 실패 — ' + errorDescription(unitLoadError));
+      return [];
+    }
+  }
+
+  function promptRequestBody(target) {
+    const range = selectedSummaryRange();
+    const requestBody = { target };
+    if (range.fromUnit !== null) requestBody.fromUnit = range.fromUnit;
+    if (range.toUnit !== null) requestBody.toUnit = range.toUnit;
+    return requestBody;
+  }
+
+  async function fetchPromptBundle(target, showErrors) {
+    const cacheKey = summaryRangeCacheKey(target);
+    const requestGeneration = ++promptRequestGeneration;
+    try {
+      const response = await post('/api/summary/prompt', promptRequestBody(target));
+      if (!response.ok) {
+        if (showErrors) notice('#sumNotice', 'warn', esc(response.error || '프롬프트를 만들지 못했습니다.'));
+        return null;
+      }
+      // 사용자가 fetch 도중 선택을 바꾸면 늦게 온 옛 응답이 새 선택의 캐시를 덮지
+      // 못하게 세대와 키를 모두 확인한다.
+      if (requestGeneration !== promptRequestGeneration || cacheKey !== summaryRangeCacheKey(target)) {
+        return null;
+      }
+      state.promptCache = { ...response, cacheKey };
+      return state.promptCache;
+    } catch (promptFetchError) {
+      console.warn('온라인 프롬프트 준비 실패', promptFetchError);
+      clientLog('warn', '온라인 프롬프트 준비 실패 — ' + errorDescription(promptFetchError));
+      if (showErrors) notice('#sumNotice', 'warn', '프롬프트를 준비하는 동안 서버 연결이 끊겼습니다.');
+      return null;
+    }
+  }
+
+  function prefetchPromptForSelection() {
+    const target = selectedSummaryTarget();
+    if (target === 'local' || running || stopping || state.summarizing) return;
+    const expectedKey = summaryRangeCacheKey(target);
+    if (state.promptCache?.cacheKey === expectedKey) return;
+    void fetchPromptBundle(target, false);
+  }
+
+  function handleSummarySelectionChange(changedSide) {
+    syncSummaryRangeConstraints(changedSide);
+    invalidateOnlineContext();
+    updateSummaryControls();
+    prefetchPromptForSelection();
+  }
+
+  function appendOnlineOpenButton(container, targetURL) {
+    const openButton = document.createElement('button');
+    openButton.className = 'sm';
+    openButton.textContent = '열기';
+    openButton.onclick = () => {
+      const openedWindow = window.open(targetURL, '_blank');
+      if (!openedWindow) clientLog('warn', '온라인 요약 팝업 차단 — 두 번째 열기 클릭');
+    };
+    container.appendChild(openButton);
+  }
+
+  function appendOnlineImportInputs(container) {
+    const importButton = document.createElement('button');
+    importButton.className = 'sm';
+    importButton.textContent = '요약 .md 불러오기';
+    importButton.onclick = () => $('#summaryFileInput').click();
+    container.appendChild(importButton);
+
+    const pasteTextarea = document.createElement('textarea');
+    pasteTextarea.placeholder = '온라인 LLM이 만든 마크다운을 여기에 붙여넣으세요.';
+    pasteTextarea.setAttribute('aria-label', '온라인 요약 붙여넣기');
+    pasteTextarea.addEventListener('paste', async pasteEvent => {
+      const pastedText = pasteEvent.clipboardData?.getData('text') || '';
+      if (!pastedText) return;
+      pasteEvent.preventDefault();
+      pasteTextarea.value = pastedText;
+      await importOnlineSummary(pastedText);
+    });
+    container.appendChild(pasteTextarea);
+  }
+
+  function showOnlineTransfer(bundle, copiedToClipboard, popupBlocked, clipboardError) {
+    const onlineStep = $('#onlineStep');
+    onlineStep.style.display = '';
+    onlineStep.innerHTML =
+      '<div class="onlineStepRow"><span class="onlineStepNumber">1</span><div>' +
+      `<strong>${esc(bundle.targetName)}에 프롬프트 전달</strong>` +
+      (copiedToClipboard
+        ? '프롬프트를 복사했습니다. 열린 탭에서 <kbd>⌘V</kbd> 한 뒤 요약 문서를 .md로 내려받으세요.'
+        : `자동 복사가 실패했습니다 (${esc(errorDescription(clipboardError))}). ` +
+          '아래 전문이 전체 선택되어 있습니다. 직접 복사한 뒤 [열기]를 누르세요.') +
+      '</div></div>' +
+      '<div class="onlineStepRow"><span class="onlineStepNumber">2</span><div>' +
+      '<strong>다운로드한 .md를 놓거나, 불러오거나, 붙여넣으세요</strong>' +
+      '요약 화면에 파일을 끌어다 놓을 수 있고, 파일 선택이나 아래 붙여넣기도 사용할 수 있습니다.' +
+      '</div></div>';
+
+    const firstStepBody = onlineStep.querySelector('.onlineStepRow > div');
+    if (!copiedToClipboard) {
+      const promptTextarea = document.createElement('textarea');
+      promptTextarea.readOnly = true;
+      promptTextarea.value = bundle.text;
+      promptTextarea.setAttribute('aria-label', '온라인 LLM 프롬프트 전문');
+      firstStepBody.appendChild(promptTextarea);
+      appendOnlineOpenButton(firstStepBody, bundle.url);
+      // 실패 뒤 다시 드래그할 필요가 없도록 전문을 미리 선택한다. 이동은 아직 하지
+      // 않았으므로 현재 문서가 포커스를 가진 상태에서 사용자가 바로 ⌘C 할 수 있다.
+      promptTextarea.focus();
+      promptTextarea.select();
+    } else if (popupBlocked) {
+      appendOnlineOpenButton(firstStepBody, bundle.url);
+    }
+    const secondStepBody = onlineStep.querySelectorAll('.onlineStepRow > div')[1];
+    appendOnlineImportInputs(secondStepBody);
+  }
+
+  async function importOnlineSummary(markdownText) {
+    const onlineJob = state.onlineJob;
+    const requestBody = {
+      markdown: markdownText,
+      expectedUnitCount: onlineJob?.unitCount || 0,
+      targetName: onlineJob?.targetName || '외부 LLM',
+    };
+    if (onlineJob?.fromUnit !== null && onlineJob?.fromUnit !== undefined) {
+      requestBody.fromUnit = onlineJob.fromUnit;
+    }
+    if (onlineJob?.toUnit !== null && onlineJob?.toUnit !== undefined) {
+      requestBody.toUnit = onlineJob.toUnit;
+    }
+
+    let response;
+    try {
+      response = await post('/api/summary/import', requestBody);
+    } catch (importRequestError) {
+      console.warn('온라인 요약 적용 실패', importRequestError);
+      clientLog('error', '온라인 요약 적용 연결 실패 — ' + errorDescription(importRequestError));
+      notice('#sumNotice', 'warn', '요약을 적용하는 동안 서버 연결이 끊겼습니다.');
+      return;
+    }
+    if (!response.ok) {
+      const rejectionMessage = response.error || '요약을 가져오지 못했습니다.';
+      clientLog('warn', '온라인 요약 import 거부 — ' + rejectionMessage);
+      notice('#sumNotice', 'warn', esc(rejectionMessage));
+      return;
+    }
+    state.onlineJob = null;
+    $('#onlineStep').style.display = '';
+    $('#onlineStep').innerHTML =
+      '<div class="onlineStepRow"><span class="onlineStepNumber">✓</span><div>' +
+      '<strong>온라인 요약을 적용했습니다.</strong>서버가 모든 열린 탭을 같은 요약으로 갱신했습니다.</div></div>';
+    // 화면 갱신은 서버가 보내는 summaryDone SSE가 맡는다. 여기서 직접 그리면 같은
+    // 결과가 두 번 렌더되고 다른 기기 탭과 적용 순서가 어긋날 수 있다.
+    if (response.warning) notice('#sumNotice', 'warn', esc(response.warning));
+  }
+
+  function localSummaryUnavailable() {
+    return selectedSummaryTarget() === 'local'
+      && (!!state.summarizerNote || String(state.summaryEngine || '').includes('사용 불가'));
+  }
+
+  function renderSummaryEngineLine() {
+    if (localSummaryUnavailable()) {
+      $('#engineLine').textContent = '로컬 요약 불가: '
+        + (state.summarizerNote || 'Ollama와 Qwen 모델이 필요합니다.');
+      return;
+    }
+    const displayedSummaryEngine = state.summaryEngineNote || state.summaryEngine;
+    $('#engineLine').textContent = displayedSummaryEngine ? '요약 엔진: ' + displayedSummaryEngine : '';
+  }
+
+  function updateSummaryControls() {
+    const busy = !!state.summarizing;
+    // 현재 runSummary는 generation이 도중에 바뀌면 어느 해제 경로도 isSummarizing을
+    // 내리지 못한다. 그 수명주기를 다음 단계에서 교체하기 전까지 로컬·온라인을 모두
+    // running/stopping/summarizing 세 상태에서 같은 방식으로 보수적으로 잠근다.
+    const blocked = running || stopping || busy;
+    const target = selectedSummaryTarget();
+    const usesLocalModel = target === 'local';
+    const button = $('#btnSummarize');
+    button.disabled = blocked || localSummaryUnavailable();
+    button.textContent = usesLocalModel
+      ? (busy ? '요약 생성 중…' : (state.summary ? '요약 다시 생성' : '요약 생성'))
+      : '프롬프트 복사하고 열기';
+    button.title = running ? '녹음과 Whisper 정리가 끝난 뒤 요약할 수 있습니다.'
+                 : stopping ? 'Whisper 정리가 끝난 뒤 요약할 수 있습니다.'
+                 : localSummaryUnavailable() ? (state.summarizerNote || 'Ollama와 Qwen 모델이 필요합니다.')
+                 : '';
+    $('#btnPromptFile').style.display = usesLocalModel ? 'none' : '';
+    $('#btnImportSummary').style.display = usesLocalModel ? 'none' : '';
+    $('#btnPromptFile').disabled = blocked;
+    $('#btnImportSummary').disabled = blocked;
+    // 버튼만 잠그고 대상 선택을 열어 두면 못 누르는 버튼 옆에서 고르기만 되는
+    // 어긋난 상태가 보이므로 선택지도 같은 조건으로 함께 잠근다.
+    $('#onlineTargets').disabled = blocked;
+    const hasMultipleUnits = (state.summaryUnits || []).length > 1;
+    $('#sumRangeStart').disabled = blocked || !hasMultipleUnits;
+    $('#sumRangeEnd').disabled = blocked || !hasMultipleUnits;
+    const continuationUnitID = $('#btnFromLast').dataset.unitId;
+    $('#btnFromLast').disabled = blocked || !hasMultipleUnits || !continuationUnitID;
+    if (!hasMultipleUnits) {
+      $('#sumRangeHint').textContent = '이 수업에는 강의 종료 표시가 없어 전체만 요약할 수 있습니다.';
+    }
+    renderSummaryEngineLine();
+    if (busy && !$('#summaryProgress').textContent) {
+      showSummaryProgress('요약을 생성하는 중입니다.', true);
+    } else if (!busy && !blocked && $('#summaryProgress').textContent === '요약을 생성하는 중입니다.') {
+      showSummaryProgress('');
+    }
+  }
+
   function setRunning(on) {
+    const wasRunning = running;
     running = on;
     $('#status').classList.toggle('live', on);
     $('#statusText').textContent = on ? '녹음 중' : '대기 중';
@@ -471,6 +809,14 @@ extension WebUI {
       .forEach(e => e.disabled = on);
     $('#btnEdit').title = on ? '녹음 중에는 편집할 수 없습니다 — 정지한 뒤 이용하세요.' : '';
     if (on) {
+      // 새 녹음이 시작되면 실제로 들어오는 자막을 바로 볼 수 있게 한다. 사용자는 이후
+      // 기존 요약을 읽으러 다시 전환할 수 있고, 공통 장애 배너는 어느 화면에서나 보인다.
+      if (!wasRunning) {
+        setWorkspaceView('whisper');
+        // 정지 중에 미리 받은 프롬프트는 새 전사가 붙는 순간 더 이상 같은 입력이
+        // 아니다. 다음 정지 뒤 서버 구간을 다시 받은 다음에만 새 캐시를 만든다.
+        invalidateOnlineContext();
+      }
       // 녹음 중엔 편집을 막는다(서버도 같은 판단을 한다 — 여긴 그걸 미리 보여줄 뿐이다).
       // 이미 편집 모드였다면(다른 탭에서 방금 시작을 눌렀을 수도 있다) 강제로 빠져나온다.
       document.body.classList.remove('editing');
@@ -484,6 +830,8 @@ extension WebUI {
       setLive('');            // 멈췄으면 받아쓰던 줄도 같이 치운다
       $('#resumeBar').classList.remove('on');
     }
+    updateSummaryControls();
+    if (wasRunning && !on) void loadSummaryUnits();
   }
 
   // 아직 확정되지 않은 텍스트. 확정 자막과 다른 칸에 그린다.
@@ -505,7 +853,16 @@ extension WebUI {
   }
 
   function renderSession(s) {
+    // 온라인 작업 맥락은 예상 수·대상·범위를 흩어진 플래그로 두지 않고 onlineJob
+    // 객체 하나로 보존한다. promptCache와 서버 구간 목록은 작업이 아니라 재요청을
+    // 줄이는 파생 캐시이므로 그대로 옮기되, import 판단은 onlineJob만 본다.
+    const onlineJob = state.onlineJob || null;
+    const promptCache = state.promptCache || null;
+    const summaryUnits = state.summaryUnits || [];
     state = s;
+    state.onlineJob = onlineJob;
+    state.promptCache = promptCache;
+    state.summaryUnits = summaryUnits;
     $('#baseDir').value = s.storageLocation || '';
     if (s.sessionName) {
       $('#sessionChip').style.display = ''; $('#sessionChip').textContent = '📁 ' + s.sessionName;
@@ -516,8 +873,10 @@ extension WebUI {
       $('#curName').textContent = '저장 폴더 없음';
       $('#curSub').textContent = '시작하면 폴더가 만들어집니다';
     }
-    $('#engineLine').textContent = s.summaryEngine ? '요약 엔진: ' + s.summaryEngine : '';
-    $('#btnSummarize').disabled = !!s.summarizing;
+    renderSummaryEngineLine();
+    if (s.summarizing) showSummaryProgress('요약을 생성하는 중입니다.', true);
+    else showSummaryProgress('');
+    updateSummaryControls();
     notice('#sesNotice', 'info', s.continuing
       ? `이어 적기 모드입니다. 새 자막은 <b>${clock(s.timeBase)}</b> 이후 시각으로 붙습니다.` : '');
     if (s.domainSource) renderDoc({ name: s.domainSource, terms: s.domainTerms || [] });
@@ -565,6 +924,14 @@ extension WebUI {
   }
 
   function reloadAll(s) {
+    if (state.sessionDir && state.sessionDir !== s.sessionDir) {
+      // 다른 수업의 구간 id와 프롬프트를 새 세션에 재사용하면 같은 숫자라도 전혀 다른
+      // 발화를 가리킨다. 세션 전환은 선택 변경보다 강한 캐시 무효화 경계다.
+      invalidateOnlineContext();
+      state.summaryUnits = [];
+      $('#sumRangeStart').value = '';
+      $('#sumRangeEnd').value = '';
+    }
     stream.querySelectorAll('.line').forEach(e => e.remove());
     lines.clear();
     fastStream.innerHTML = '';
@@ -590,11 +957,10 @@ extension WebUI {
     if ($('#search').value.trim()) applyFilter();   // 다 그린 뒤 한 번만
     empty.style.display = lines.size ? 'none' : '';
     showLastSummarized(s.lastSummarizedAt);
-    $('#saveSummaryBox').style.display = s.summary ? '' : 'none';
     if (s.summary && !$('#sumName').value) $('#sumName').value = (s.title || '수업') + '_요약.md';
-    $('#summary').innerHTML = s.summary ? md(s.summary)
-      : '<p class="muted-note">수업이 끝난 뒤 <b>요약 생성</b>을 누르면 전체 기록을 온디바이스 모델로 정리합니다.</p>';
+    showCurrentSummary(s.summary);
     renderSession(s);
+    void loadSummaryUnits();
     loadSummaryFiles();
     // 창을 새로 열어도 경과 시간은 서버가 아는 진짜 시작 시각에서 이어 센다.
     startedAt = s.running ? (s.startedAt ? s.startedAt * 1000 : Date.now() - (s.elapsed || 0) * 1000) : null;
@@ -783,6 +1149,9 @@ extension WebUI {
       ? lines.get(boundaryEvent.id)
       : fastStream.querySelector(`.fline[data-id="${boundaryEvent.id}"]`);
     if (targetLine) setLectureBoundaryMarker(targetLine, boundaryEvent.boundaryAfter);
+    // 경계가 하나 늘면 선택 가능한 강의 단위도 즉시 달라진다. 서버의 Chunker 결과를
+    // 다시 받아야 option과 실제 요약 범위가 정의상 같은 상태를 유지한다.
+    void loadSummaryUnits();
   });
   es.addEventListener('whisperLive', e => {
     const d = JSON.parse(e.data); if (!seen(d)) return;
@@ -839,25 +1208,34 @@ extension WebUI {
   });
   es.addEventListener('summaryProgress', e => {
     const d = JSON.parse(e.data); if (!seen(d)) return;
-    $('#summary').innerHTML = `<p class="muted-note">요약 중… (${d.done}/${d.total})</p>`;
+    state.summarizing = true;
+    showSummaryProgress(`요약 중… ${d.done}/${d.total}`, true);
+    updateSummaryControls();
   });
   es.addEventListener('summaryDone', e => {
     const d = JSON.parse(e.data); if (!seen(d)) return;
-    $('#btnSummarize').disabled = false;
+    state.summarizing = false;
+    showSummaryProgress('');
+    updateSummaryControls();
     if (!d.ok) {
       notice('#sumNotice', 'warn', esc(d.error || '요약에 실패했습니다.'));
-      $('#summary').innerHTML = state.summary
-        ? md(state.summary)
-        : '<p class="muted-note">요약 결과가 없습니다. 문제를 해결한 뒤 다시 시도해 주세요.</p>';
+      if (!state.summary) {
+        $('#summary').innerHTML = '<p class="muted-note">요약 결과가 없습니다. 문제를 해결한 뒤 다시 시도해 주세요.</p>';
+      }
       return;
     }
     notice('#sumNotice', '', '');
     state.summary = d.markdown;
-    $('#summary').innerHTML = md(d.markdown);
-    $('#btnSummarize').textContent = '요약 다시 생성';
+    if (d.engineNote) {
+      state.summaryEngineNote = d.engineNote;
+      $('#engineLine').textContent = '요약 엔진: ' + d.engineNote;
+    }
+    showCurrentSummary(d.markdown);
+    updateSummaryControls();
     showLastSummarized(d.lastSummarizedAt);
     $('#saveSummaryBox').style.display = '';
     if (!$('#sumName').value) $('#sumName').value = ($('#title').value || '수업') + '_요약.md';
+    $('.summaryScroll').scrollTop = 0;
   });
   es.addEventListener('polishProgress', e => {
     const d = JSON.parse(e.data); if (!seen(d)) return;
@@ -941,6 +1319,7 @@ extension WebUI {
   $('#btnStop').onclick = async () => {
     if (stopping) return;
     stopping = true;
+    updateSummaryControls();
     stopSteps.forEach(s => { s.status = 'pending'; s.detail = ''; });
     renderStopSteps();
     $('#stopVeil').hidden = false;
@@ -959,6 +1338,8 @@ extension WebUI {
       const left = minVisible - (Date.now() - shownAt);
       if (left > 0) await new Promise(res => setTimeout(res, left));
       stopping = false;
+      updateSummaryControls();
+      prefetchPromptForSelection();
       $('#stopVeil').hidden = true;
     }
   };
@@ -978,12 +1359,105 @@ extension WebUI {
   };
 
   $('#btnSummarize').onclick = async () => {
-    $('#btnSummarize').disabled = true;
-    $('#summary').innerHTML = '<p class="muted-note">요약 준비 중…</p>';
-    const from = parseClock($('#sumFrom').value);
-    const r = await post('/api/summarize', from === null ? {} : { from });
-    if (!r.ok) { $('#summary').innerHTML = `<p class="muted-note">${esc(r.error||'실패')}</p>`; $('#btnSummarize').disabled = false; }
+    if (running || stopping || state.summarizing) return;
+    const target = selectedSummaryTarget();
+    const range = selectedSummaryRange();
+    if (target !== 'local') {
+      notice('#sumNotice', '', '');
+      if (!onlineEnvironmentLogged) {
+        onlineEnvironmentLogged = true;
+        clientLog('info', '온라인 요약 환경 — userAgent=' + navigator.userAgent
+          + '; secureContext=' + String(window.isSecureContext)
+          + '; clipboard=' + String(!!navigator.clipboard));
+      }
+
+      // 복사 성공 여부와 관계없이 이 클릭이 시작한 대상·범위를 먼저 고정한다.
+      // 파일 드롭이나 붙여넣기가 나중에 도착해도 그때의 현재 UI 선택이 아니라
+      // 실제로 내보낸 작업의 기대 구간 수로 검증해야 한다.
+      state.onlineJob = {
+        target,
+        targetName: summaryTargets[target]?.name || target,
+        fromUnit: range.fromUnit,
+        toUnit: range.toUnit,
+        unitCount: unitsInSelectedRange().length,
+        startedAt: Date.now(),
+      };
+
+      const expectedCacheKey = summaryRangeCacheKey(target);
+      let bundle = state.promptCache?.cacheKey === expectedCacheKey ? state.promptCache : null;
+      if (!bundle) bundle = await fetchPromptBundle(target, true);
+      if (!bundle) return;
+      state.onlineJob.targetName = bundle.targetName;
+      state.onlineJob.unitCount = bundle.unitCount;
+
+      let clipboardError = null;
+      try {
+        if (!navigator.clipboard?.writeText) {
+          throw new Error('Clipboard.writeText를 지원하지 않는 브라우저입니다.');
+        }
+        // 캐시가 있으면 이 호출 전에는 await가 없다. 클릭 제스처와 문서 포커스가
+        // 살아 있는 동안 writeText를 시작해야 Safari/Chrome의 권한 판정을 통과한다.
+        const clipboardWrite = navigator.clipboard.writeText(bundle.text);
+        await clipboardWrite;
+      } catch (copyError) {
+        clipboardError = copyError;
+        console.warn('온라인 프롬프트 클립보드 복사 실패', copyError);
+        clientLog('error', '클립보드 복사 실패 — ' + errorDescription(copyError));
+        // 복사가 실패하면 이동하지 않는다. 사용자가 빈 온라인 탭에서 헤매지 않도록
+        // 현재 문서에 전문과 두 번째 클릭용 열기 버튼을 먼저 제공한다.
+        showOnlineTransfer(bundle, false, false, clipboardError);
+        return;
+      }
+
+      // window.open은 반드시 writeText 성공 뒤에만 실행한다. 먼저 열면 현재 문서가
+      // 포커스를 잃어 Clipboard API가 NotAllowedError로 실패한다.
+      const openedWindow = window.open(bundle.url, '_blank');
+      const popupBlocked = !openedWindow;
+      if (popupBlocked) clientLog('warn', '온라인 요약 팝업 차단 — 첫 열기');
+      showOnlineTransfer(bundle, true, popupBlocked, null);
+      return;
+    }
+
+    // 저장된 옛 요약을 보고 있었다면, 실패 시 보존해야 할 현재 세션 요약으로 먼저 돌아온다.
+    showCurrentSummary(state.summary);
+    state.summarizing = true;
+    notice('#sumNotice', '', '');
+    showSummaryProgress('요약을 준비하는 중입니다.', true);
+    updateSummaryControls();
+    const requestBody = {};
+    if (range.fromUnit !== null) requestBody.fromUnit = range.fromUnit;
+    if (range.toUnit !== null) requestBody.toUnit = range.toUnit;
+    const response = await post('/api/summarize', requestBody);
+    if (!response.ok) {
+      state.summarizing = false;
+      showSummaryProgress('');
+      notice('#sumNotice', 'warn', esc(response.error || '요약을 시작하지 못했습니다.'));
+      updateSummaryControls();
+    }
   };
+
+  $('#btnPromptFile').onclick = () => {
+    const target = selectedSummaryTarget();
+    if (target === 'local') return;
+    const range = selectedSummaryRange();
+    const query = new URLSearchParams({ target });
+    if (range.fromUnit !== null) query.set('fromUnit', String(range.fromUnit));
+    if (range.toUnit !== null) query.set('toUnit', String(range.toUnit));
+    location.href = '/export/prompt.md?' + query.toString();
+  };
+
+  $('#btnImportSummary').onclick = () => $('#summaryFileInput').click();
+  $('#summaryFileInput').onchange = () => {
+    const selectedFile = $('#summaryFileInput').files?.[0];
+    if (selectedFile) importSummaryFile(selectedFile);
+    // 같은 파일을 고쳐 다시 선택해도 change가 다시 발생하도록 값을 비운다.
+    $('#summaryFileInput').value = '';
+  };
+  $('#sumRangeStart').onchange = () => handleSummarySelectionChange('start');
+  $('#sumRangeEnd').onchange = () => handleSummarySelectionChange('end');
+  document.querySelectorAll('input[name="onlineTarget"]').forEach(targetInput => {
+    targetInput.onchange = () => handleSummarySelectionChange();
+  });
 
   $('#btnPolish').onclick = async () => {
     $('#btnPolish').disabled = true;
@@ -1019,15 +1493,40 @@ extension WebUI {
   }
   // 마지막으로 요약이 훑은 지점을 보여주고, 다음 요약 시작점으로 넣을 수 있게 한다.
   function showLastSummarized(at) {
-    const btn = $('#btnFromLast');
-    if (!at || at <= 0) { btn.disabled = true; $('#fromHint').textContent = '자막의 시각을 클릭하면 여기에 들어갑니다.'; return; }
-    btn.disabled = false;
-    btn.dataset.at = at;
-    $('#fromHint').innerHTML = '마지막 요약 지점: <b>' + clock(at) + '</b> — “이어서”를 누르면 그 다음부터 요약합니다.';
+    state.lastSummarizedAt = Number(at) || 0;
+    const continuationButton = $('#btnFromLast');
+    delete continuationButton.dataset.unitId;
+    const units = state.summaryUnits || [];
+    if (units.length <= 1) {
+      continuationButton.disabled = true;
+      $('#sumRangeHint').textContent = '이 수업에는 강의 종료 표시가 없어 전체만 요약할 수 있습니다.';
+      return;
+    }
+    if (!state.lastSummarizedAt) {
+      continuationButton.disabled = true;
+      $('#sumRangeHint').textContent = '구간을 고르지 않으면 전체를 요약합니다.';
+      return;
+    }
+    // 마지막 요약 끝과 다음 구간 시작이 정확히 맞닿을 수 있어 >=를 쓴다. end보다
+    // 작은 시작을 가진 현재 구간은 건너뛰고, 그 지점 이후에 시작하는 첫 id만 고른다.
+    const continuationUnit = units.find(unit => Number(unit.start) >= state.lastSummarizedAt);
+    if (!continuationUnit) {
+      continuationButton.disabled = true;
+      $('#sumRangeHint').innerHTML = '마지막 요약 지점: <b>' + clock(state.lastSummarizedAt)
+        + '</b> — 이어서 요약할 새 구간이 없습니다.';
+      return;
+    }
+    continuationButton.dataset.unitId = String(continuationUnit.id);
+    continuationButton.disabled = running || stopping || !!state.summarizing;
+    $('#sumRangeHint').innerHTML = '마지막 요약 지점: <b>' + clock(state.lastSummarizedAt)
+      + '</b> — “이어서”는 ' + continuationUnit.id + '강부터 시작합니다.';
   }
   $('#btnFromLast').onclick = () => {
-    const at = +$('#btnFromLast').dataset.at || 0;
-    $('#sumFrom').value = clock(at);
+    const continuationUnitID = $('#btnFromLast').dataset.unitId;
+    if (!continuationUnitID) return;
+    $('#sumRangeStart').value = continuationUnitID;
+    $('#sumRangeEnd').value = '';
+    handleSummarySelectionChange('start');
   };
 
   $('#btnSumPick').onclick = async () => {
@@ -1059,7 +1558,15 @@ extension WebUI {
       const r = await post('/api/summary/open', { path: b.dataset.sum });
       if (!r.ok) { notice('#sumNotice', 'warn', esc(r.error)); return; }
       $('#summary').innerHTML = md(r.markdown);
-      notice('#sumNotice', 'info', esc(b.previousElementSibling.querySelector('.name').textContent) + ' 를 불러왔습니다.');
+      const name = b.previousElementSibling.querySelector('.name').textContent;
+      $('#summarySource').textContent = name;
+      $('#btnCurrentSummary').style.display = '';
+      // 이 상태에서 서버 저장을 누르면 화면의 옛 파일이 아니라 현재 세션 요약이 저장된다.
+      // 오해를 막기 위해 현재 요약으로 돌아오기 전까지 저장 도구는 숨긴다.
+      $('#saveSummaryBox').style.display = 'none';
+      notice('#sumNotice', 'info', esc(name) + ' 를 불러왔습니다.');
+      setWorkspaceView('summary');
+      $('.summaryScroll').scrollTop = 0;
     });
   }
   async function loadSummaryFiles() {
@@ -1069,6 +1576,10 @@ extension WebUI {
 
   $('#btnMd').onclick = () => location.href = '/export/md';
   $('#btnSrt').onclick = () => location.href = '/export/srt';
+  $('#btnCurrentSummary').onclick = () => {
+    showCurrentSummary(state.summary, true);
+    $('.summaryScroll').scrollTop = 0;
+  };
 
   $('#btnNewSession').onclick = async () => {
     if (lines.size && !confirm('현재 기록을 닫고 새 세션을 시작할까요? (저장된 파일은 그대로 남습니다)')) return;
@@ -1107,6 +1618,43 @@ extension WebUI {
   drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over');
                        if (e.dataTransfer.files[0]) upload(e.dataTransfer.files[0]); };
   pdfInput.onchange = () => pdfInput.files[0] && upload(pdfInput.files[0]);
+
+  // 온라인 LLM에서 아티팩트를 .md로 내려받은 사용자를 위한 경로다. ~/Downloads를
+  // 감시하면 macOS 폴더 접근 권한이 추가로 필요하므로 권한 없는 드래그앤드롭만 쓴다.
+  const summaryDropZone = $('#view-summary');
+  let summaryDragDepth = 0;
+  summaryDropZone.addEventListener('dragenter', event => {
+    if (![...(event.dataTransfer?.items || [])].some(item => item.kind === 'file')) return;
+    event.preventDefault();
+    summaryDragDepth += 1;
+    summaryDropZone.classList.add('summaryDropActive');
+  });
+  summaryDropZone.addEventListener('dragover', event => {
+    event.preventDefault();
+    summaryDropZone.classList.add('summaryDropActive');
+  });
+  summaryDropZone.addEventListener('dragleave', () => {
+    summaryDragDepth = Math.max(0, summaryDragDepth - 1);
+    if (summaryDragDepth === 0) summaryDropZone.classList.remove('summaryDropActive');
+  });
+  summaryDropZone.addEventListener('drop', event => {
+    event.preventDefault();
+    summaryDragDepth = 0;
+    summaryDropZone.classList.remove('summaryDropActive');
+    const summaryFile = event.dataTransfer?.files?.[0];
+    if (!summaryFile) return;
+    if (!/\.(md|markdown|txt)$/i.test(summaryFile.name)) {
+      notice('#sumNotice', 'warn', '마크다운(.md, .markdown)이나 텍스트(.txt) 파일만 받을 수 있습니다.');
+      return;
+    }
+    const fileReader = new FileReader();
+    fileReader.onload = async () => {
+      const markdownText = typeof fileReader.result === 'string' ? fileReader.result : '';
+      await importOnlineSummary(markdownText);
+    };
+    fileReader.onerror = () => notice('#sumNotice', 'warn', '요약 파일을 읽지 못했습니다.');
+    fileReader.readAsText(summaryFile);
+  });
 
   async function upload(file) {
     if (!/\.pdf$/i.test(file.name)) { notice('#docInfo', 'warn', 'PDF 파일만 됩니다.'); return; }
@@ -1802,9 +2350,43 @@ extension WebUI {
   $('#search').oninput = applyFilter;
   $('#fontSize').oninput = e => document.documentElement.style.setProperty('--cap', e.target.value + 'px');
   $('#title').onchange = () => post('/api/title', { title: $('#title').value });
-  document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
-    document.querySelectorAll('.tab').forEach(x => x.classList.toggle('on', x === t));
-    document.querySelectorAll('.panel').forEach(p => p.classList.toggle('on', p.id === 'panel-' + t.dataset.tab));
+  // 메인 화면과 보조 사이드 탭은 서로 다른 계층이다. selector를 분리해 한쪽 탭이
+  // 다른 쪽 panel을 모두 숨기는 일을 막는다. 화면 전환은 DOM을 다시 만들지 않으므로
+  // 90분 자막의 스크롤·검색·편집 상태도 그대로 남는다.
+  function setWorkspaceView(view, focusTab = false) {
+    const target = view === 'summary' ? 'summary' : 'whisper';
+    document.querySelectorAll('.workspaceTab').forEach(tab => {
+      const selected = tab.dataset.view === target;
+      tab.classList.toggle('on', selected);
+      tab.setAttribute('aria-selected', selected ? 'true' : 'false');
+      tab.tabIndex = selected ? 0 : -1;
+      if (selected && focusTab) tab.focus();
+    });
+    document.querySelectorAll('.workspaceView').forEach(panel => {
+      panel.hidden = panel.id !== 'view-' + target;
+    });
+    document.body.classList.toggle('summary-view', target === 'summary');
+  }
+
+  const workspaceTabs = [...document.querySelectorAll('.workspaceTab')];
+  workspaceTabs.forEach((tab, index) => {
+    tab.onclick = () => setWorkspaceView(tab.dataset.view);
+    tab.onkeydown = e => {
+      let next = null;
+      if (e.key === 'ArrowRight') next = (index + 1) % workspaceTabs.length;
+      if (e.key === 'ArrowLeft') next = (index - 1 + workspaceTabs.length) % workspaceTabs.length;
+      if (e.key === 'Home') next = 0;
+      if (e.key === 'End') next = workspaceTabs.length - 1;
+      if (next === null) return;
+      e.preventDefault();
+      setWorkspaceView(workspaceTabs[next].dataset.view, true);
+    };
+  });
+  setWorkspaceView('whisper');
+
+  document.querySelectorAll('aside .tab').forEach(t => t.onclick = () => {
+    document.querySelectorAll('aside .tab').forEach(x => x.classList.toggle('on', x === t));
+    document.querySelectorAll('aside .panel').forEach(p => p.classList.toggle('on', p.id === 'panel-' + t.dataset.tab));
     if (t.dataset.tab === 'ses') loadSessions();
     if (t.dataset.tab === 'cfg') { loadDiag(); loadAdmin(); }
     if (t.dataset.tab === 'cmp') { loadCompare(); loadGold(); loadGoldAll(); }

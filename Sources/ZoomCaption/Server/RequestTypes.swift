@@ -22,7 +22,18 @@ struct OpenRequest: Decodable { var path: String? }
 /// `list` 가 "whisper" 면 Whisper 기록을, 아니면 실시간 기록을 고친다.
 struct EditRequest: Decodable { var id: Int?; var text: String?; var list: String? }
 struct DeleteRequest: Decodable { var ids: [Int]?; var from: Double?; var to: Double?; var list: String? }
-struct SummarizeRequest: Decodable { var from: Double? }
+struct SummarizeRequest: Decodable { var fromUnit: Int?; var toUnit: Int? }
+struct PromptRequest: Decodable { var fromUnit: Int?; var toUnit: Int?; var target: String? }
+struct SummaryImportRequest: Decodable {
+  var markdown: String?
+  var expectedUnitCount: Int?
+  var targetName: String?
+  /// 가져온 문서에서 끝 시각을 못 읽었을 때만, 프롬프트를 만들었던 전체 기준 구간
+  /// 범위로 이어서 지점을 복구한다. 브라우저가 보낸 시각을 직접 믿지 않기 위한 값이다.
+  var fromUnit: Int?
+  var toUnit: Int?
+}
+struct ClientLogRequest: Decodable { var level: String?; var message: String? }
 struct SaveSummaryRequest: Decodable { var dir: String?; var filename: String? }
 struct ApplyCorrectionsRequest: Decodable {
   struct Item: Decodable { var segID: Int; var rangeStart: Int; var rangeEnd: Int

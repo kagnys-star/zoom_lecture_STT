@@ -12,6 +12,10 @@ if rawArgs.contains("--summary-check") {
   runSummaryPipelineChecks()
 }
 
+if rawArgs.contains("--webui-check") {
+  runWebUIContractChecks()
+}
+
 if let idx = rawArgs.firstIndex(of: "--pdftest"), idx + 1 < rawArgs.count {
   let path = rawArgs[idx + 1]
   let useLLM = rawArgs.contains("--llm")

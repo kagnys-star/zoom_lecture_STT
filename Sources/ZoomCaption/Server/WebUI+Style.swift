@@ -17,7 +17,7 @@ extension WebUI {
     --bg: #f6f7f9;      --panel: #ffffff;   --ink: #16181d;     --muted: #6b7280;
     --line: #e3e6ea;    --accent: #2f6df6;  --accent-soft: #e8f0ff;
     --me: #0f9d6b;      --me-soft: #e6f7f0; --warn: #b45309;    --warn-soft: #fef3c7;
-    --danger: #d9342b;  --danger-soft: #fdeceb;
+    --danger: #d9342b;  --danger-soft: #fdeceb; --on-accent: #ffffff;
     --cap: 20px;
   }
   @media (prefers-color-scheme: dark) {
@@ -37,16 +37,30 @@ extension WebUI {
   }
 
   header {
-    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-    padding: 11px 18px; background: var(--panel); border-bottom: 1px solid var(--line);
+    position: relative; z-index: 10; display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    min-height: 64px; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line);
+    box-shadow: 0 3px 14px color-mix(in srgb, var(--ink) 5%, transparent);
   }
-  .brand { font-weight: 700; letter-spacing: -.02em; font-size: 16px; }
+  .headerIdentity {
+    display: flex; align-items: center; gap: 10px; flex: 1 1 300px; min-width: 220px;
+  }
+  .brand {
+    display: inline-flex; align-items: center; gap: 8px; flex: 0 0 auto;
+    font-weight: 750; letter-spacing: -.025em; font-size: 16px;
+  }
+  .brandMark {
+    display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px;
+    border-radius: 9px; background: var(--accent); color: var(--on-accent); font-size: 14px; font-weight: 800;
+    box-shadow: 0 4px 10px color-mix(in srgb, var(--accent) 28%, transparent);
+  }
   #title {
     font: inherit; font-weight: 600; color: var(--ink); background: transparent;
-    border: 1px solid transparent; border-radius: 8px; padding: 5px 9px; min-width: 160px;
+    border: 1px solid transparent; border-radius: 9px; padding: 7px 9px;
+    width: clamp(140px, 17vw, 250px); min-width: 0;
   }
-  #title:hover { border-color: var(--line); }
-  #title:focus { outline: none; border-color: var(--accent); background: var(--bg); }
+  #title:hover { border-color: var(--line); background: var(--bg); }
+  #title:focus { outline: none; border-color: var(--accent); background: var(--bg);
+                 box-shadow: 0 0 0 3px var(--accent-soft); }
 
   .pill {
     display: inline-flex; align-items: center; gap: 7px; padding: 5px 12px;
@@ -57,12 +71,24 @@ extension WebUI {
               overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
   .pill.live .dot { background: var(--danger); animation: pulse 1.6s ease-in-out infinite; }
-  .pill.live { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 35%, var(--line)); }
+  .pill.live { color: var(--danger); background: var(--danger-soft); border-color: color-mix(in srgb, var(--danger) 35%, var(--line)); }
   @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
   /* 서버와의 연결 상태. 끊기면 화면이 굳는데, 그 사실이 보여야 한다. */
   .conn { width: 6px; height: 6px; border-radius: 50%; background: var(--me); margin-left: 2px; }
   .conn.off { background: var(--danger); animation: pulse 1s steps(1) infinite; }
   .spacer { flex: 1 }
+  .recordingStatus {
+    display: flex; align-items: center; gap: 7px; flex: 0 0 auto;
+    padding-left: 14px; border-left: 1px solid var(--line);
+  }
+  .statusCaption {
+    margin-right: 2px; color: var(--muted); font-size: 12px; font-weight: 650; white-space: nowrap;
+  }
+  .clockPill { min-width: 86px; justify-content: center; color: var(--muted); }
+  .headerActions {
+    display: flex; align-items: center; gap: 8px; flex: 0 0 auto;
+    padding-left: 14px; border-left: 1px solid var(--line);
+  }
 
   button {
     font: inherit; font-weight: 600; font-size: 14px; cursor: pointer;
@@ -71,22 +97,97 @@ extension WebUI {
   }
   button:hover:not(:disabled) { background: var(--bg); border-color: var(--muted); }
   button:disabled { opacity: .45; cursor: default; }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
   button.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent); }
-  button.stop { background: var(--danger); border-color: var(--danger); color: #fff; }
+  button.stop { background: var(--danger); border-color: var(--danger); color: var(--on-accent); }
   button.stop:hover:not(:disabled) { filter: brightness(1.08); background: var(--danger); }
   button.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 30%, var(--line)); }
   button.danger:hover:not(:disabled) { background: var(--danger-soft); }
   button.sm { font-size: 13px; padding: 5px 10px; }
+  button:focus-visible { outline: 3px solid var(--accent-soft); outline-offset: 2px; }
+  .recordAction {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    min-width: 118px; min-height: 42px; padding: 8px 16px; border-radius: 12px;
+    font-size: 14px; font-weight: 750; letter-spacing: -.01em;
+    box-shadow: 0 5px 14px color-mix(in srgb, var(--accent) 24%, transparent);
+    transition: transform .14s ease, box-shadow .14s ease, filter .14s ease;
+  }
+  .recordAction > span { font-size: 9px; }
+  .recordAction:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 7px 18px color-mix(in srgb, var(--accent) 30%, transparent); }
+  .recordAction.stop { box-shadow: 0 5px 14px color-mix(in srgb, var(--danger) 24%, transparent); }
+  .recordAction.stop:hover:not(:disabled) { box-shadow: 0 7px 18px color-mix(in srgb, var(--danger) 30%, transparent); }
+  .quitAction {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 42px; height: 42px; padding: 0; border-radius: 12px; font-size: 17px;
+  }
 
   main { flex: 1; display: grid; grid-template-columns: minmax(0,1fr) 22px 390px; min-height: 0; }
-  @media (max-width: 940px) { main { grid-template-columns: 1fr; } aside { border-left: none !important; border-top: 1px solid var(--line); } }
+  #primaryWorkspace { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .workspaceView { flex: 1; min-width: 0; min-height: 0; }
+  .workspaceView[hidden] { display: none !important; }
+
+  /* 두 메인 화면은 제목 바로 뒤에서 고르는 큰 세그먼트 버튼으로 둔다.
+     활성 화면은 떠 있는 카드처럼 보여 탭 자체가 클릭 가능한 영역임을 드러낸다. */
+  .workspaceTabs {
+    display: inline-flex; gap: 3px; flex: 0 0 auto; padding: 4px;
+    background: var(--bg); border: 1px solid var(--line); border-radius: 13px;
+    box-shadow: inset 0 1px 2px color-mix(in srgb, var(--ink) 5%, transparent);
+  }
+  .workspaceTab {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    min-width: 100px; min-height: 36px; padding: 6px 14px; border: none; border-radius: 9px;
+    background: transparent; color: var(--muted); font-size: 14px; font-weight: 700;
+    transition: color .14s ease, background .14s ease, box-shadow .14s ease, transform .14s ease;
+  }
+  .workspaceTab:hover:not(:disabled) { background: var(--panel); border-color: transparent; color: var(--ink); }
+  .workspaceTab:active:not(:disabled) { transform: scale(.98); }
+  .workspaceTab.on {
+    color: var(--accent); background: var(--panel);
+    box-shadow: 0 2px 8px color-mix(in srgb, var(--ink) 12%, transparent), inset 0 -2px 0 var(--accent);
+  }
+  .workspaceTab.on:hover:not(:disabled) { background: var(--panel); }
+  .workspaceTab:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .tabIcon { position: relative; display: inline-flex; width: 16px; height: 16px; flex: 0 0 auto; }
+  .waveformIcon { align-items: center; justify-content: center; gap: 2px; }
+  .waveformIcon i { display: block; width: 2px; border-radius: 2px; background: currentColor; }
+  .waveformIcon i:nth-child(1), .waveformIcon i:nth-child(4) { height: 6px; }
+  .waveformIcon i:nth-child(2) { height: 13px; }
+  .waveformIcon i:nth-child(3) { height: 9px; }
+  .summaryIcon { border: 1.5px solid currentColor; border-radius: 4px; }
+  .summaryIcon::before, .summaryIcon::after {
+    content: ""; position: absolute; left: 3px; right: 3px; height: 1.5px;
+    border-radius: 2px; background: currentColor;
+  }
+  .summaryIcon::before { top: 4px; }
+  .summaryIcon::after { top: 9px; right: 6px; }
+
+  @media (max-width: 1180px) {
+    .statusCaption { display: none; }
+    .recordingStatus, .headerActions { padding-left: 10px; }
+    .workspaceTab { min-width: 88px; padding-inline: 11px; }
+  }
+
+  @media (max-width: 940px) {
+    header { align-items: stretch; }
+    .headerIdentity { flex-basis: 100%; }
+    .workspaceTabs { flex: 1 1 auto; }
+    .workspaceTab { flex: 1; }
+    .recordingStatus { border-left: none; padding-left: 0; }
+    main { grid-template-columns: 1fr; overflow-y: auto; }
+    #primaryWorkspace { min-height: 70vh; }
+    aside { border-left: none !important; border-top: 1px solid var(--line); min-height: 55vh; }
+  }
 
   /* 사이드 접기. #sideToggle 은 <aside> 앞에 오는 별도 DOM 요소라 grid 세 번째
      칸이 아니라 가운데 칸(항상 22px)에 자동으로 앉는다 — 접어도 손잡이는 그대로
      보여야 다시 펼 수 있다. 상태는 localStorage 에 남겨 새로고침해도 유지한다. */
   body.side-collapsed main { grid-template-columns: minmax(0,1fr) 22px; }
   body.side-collapsed aside { display: none; }
+  /* 요약은 읽기 화면이므로 보조 사이드바를 숨기고 작업공간 전체 폭을 사용한다.
+     side-collapsed 설정 자체는 건드리지 않아 Whisper로 돌아오면 이전 상태가 복원된다. */
+  body.summary-view main { grid-template-columns: minmax(0,1fr); overflow: hidden; }
+  body.summary-view #primaryWorkspace { min-height: 0; }
+  body.summary-view #sideToggle, body.summary-view aside { display: none; }
   #sideToggle {
     display: flex; align-items: center; justify-content: center;
     background: var(--panel); border: none;
@@ -304,6 +405,129 @@ extension WebUI {
   #silentBar.on { display: flex; }
   #silentBar .grow { flex: 1; line-height: 1.55; }
 
+  /* ── 넓은 요약 읽기 화면 ── */
+  .summaryView { background: var(--bg); }
+  .summaryScroll { height: 100%; overflow-y: auto; overscroll-behavior: contain; }
+  .summaryShell { width: min(1040px, 100%); margin: 0 auto; padding: 28px 34px 72px; }
+  .summaryHead {
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 20px;
+    margin-bottom: 18px;
+  }
+  .summaryHead h1 { margin: 0 0 5px; font-size: 25px; line-height: 1.3; letter-spacing: -.025em; }
+  .summaryMeta { display: flex; gap: 9px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
+  .summaryMeta span + span::before { content: "·"; margin-right: 9px; color: var(--line); }
+  .summaryMeta button {
+    border: none; background: transparent; color: var(--accent); padding: 0; font-size: 13px;
+  }
+  .summaryMeta button:hover:not(:disabled) { background: transparent; border-color: transparent; text-decoration: underline; }
+  .summaryOnline {
+    display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; margin-bottom: 12px;
+  }
+  .onlineActions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  /* 드롭다운은 접힌 상태에서 어떤 선택지가 있는지 보이지 않아, 어느 서비스로 보내는지가
+     한눈에 드러나야 하는 이 흐름에 맞지 않는다. 세 대상을 항상 펼쳐 두고 고른 것만
+     강조한다. 라디오는 화면에서 숨기되 제거하지 않아 키보드·보조기술 접근을 유지한다. */
+  .onlineTargets { border: 0; margin: 0; padding: 0; min-width: 0; }
+  .onlineTargets > legend {
+    padding: 0; margin-bottom: 6px; font-size: 14px; font-weight: 650; color: var(--ink);
+  }
+  .onlineTargetOption {
+    display: inline-flex; align-items: center; min-height: 38px; padding: 7px 14px;
+    font-size: 14px; font-weight: 600; color: var(--muted); cursor: pointer;
+    border: 1px solid var(--line); background: var(--panel);
+  }
+  .onlineTargetOption:first-of-type { border-radius: 9px 0 0 9px; }
+  .onlineTargetOption:last-of-type { border-radius: 0 9px 9px 0; }
+  .onlineTargetOption + .onlineTargetOption { margin-left: -1px; }
+  .onlineTargetOption input {
+    position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none;
+  }
+  .onlineTargetOption:hover { color: var(--ink); }
+  .onlineTargetOption:has(input:checked) {
+    z-index: 1; color: var(--on-accent); background: var(--accent); border-color: var(--accent);
+  }
+  /* 라디오 자체가 안 보이므로 초점 표시를 감싼 라벨이 대신 받아야 키보드 사용자가
+     지금 어디에 있는지 알 수 있다. */
+  .onlineTargetOption:has(input:focus-visible) {
+    z-index: 2; outline: none; box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+  .onlineTargets:disabled > legend, .onlineTargets:disabled .onlineTargetOption {
+    opacity: .5; cursor: not-allowed;
+  }
+  .onlineStep {
+    margin-bottom: 14px; padding: 15px 17px; background: var(--accent-soft);
+    border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--line)); border-radius: 13px;
+    color: var(--ink); font-size: 13.5px; line-height: 1.6;
+  }
+  .onlineStepRow { display: grid; grid-template-columns: 27px 1fr; gap: 10px; align-items: start; }
+  .onlineStepRow + .onlineStepRow { margin-top: 11px; }
+  .onlineStepNumber {
+    display: inline-flex; align-items: center; justify-content: center; width: 25px; height: 25px;
+    border-radius: 50%; background: var(--accent); color: var(--on-accent); font-weight: 750;
+  }
+  .onlineStep strong { display: block; margin-bottom: 1px; }
+  .onlineStep textarea {
+    width: 100%; min-height: 130px; margin-top: 9px; padding: 10px 11px; resize: vertical;
+    border: 1px solid var(--line); border-radius: 9px; background: var(--panel); color: var(--ink);
+    font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .onlineStep textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent); }
+  /* 다운로드한 마크다운을 놓는 순간에만 전체 요약 면을 강조해, PDF 드롭 존과
+     대상이 다르다는 점을 보이면서 평소 읽기 화면에는 시각 잡음을 남기지 않는다. */
+  .summaryDropActive .summaryShell { position: relative; }
+  .summaryDropActive .summaryShell::after {
+    content: "요약 마크다운을 놓아 적용"; position: absolute; inset: 18px; z-index: 20;
+    display: flex; align-items: center; justify-content: center; pointer-events: none;
+    border: 3px dashed var(--accent); border-radius: 16px;
+    background: color-mix(in srgb, var(--accent-soft) 92%, transparent);
+    color: var(--accent); font-size: 18px; font-weight: 750;
+  }
+  .summaryControls {
+    display: grid; grid-template-columns: minmax(260px, .9fr) minmax(360px, 1.1fr); gap: 18px;
+    align-items: start; padding: 16px 18px; margin-bottom: 14px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 13px;
+  }
+  .summaryRange > label, .summarySave > label {
+    display: block; margin-bottom: 6px; font-size: 14px; font-weight: 650;
+  }
+  /* 시작/끝은 같은 서버 구간 id를 고르는 한 쌍이라 한 줄에 묶는다. 너비가 좁아도
+     select가 버튼을 밀어내지 않도록 min-width:0과 유연한 비율을 함께 둔다. */
+  .summaryRangeRow { display: flex; align-items: center; gap: 8px; }
+  .summaryRangeRow select {
+    flex: 1 1 0; min-width: 0; font: inherit; font-size: 14px; padding: 8px 10px;
+    border: 1px solid var(--line); border-radius: 9px; background: var(--bg); color: var(--ink);
+  }
+  .summaryRangeRow select:focus { outline: none; border-color: var(--accent); }
+  .summaryRangeRow > span { color: var(--muted); }
+  .summarySaveDestination { margin-top: 8px; }
+  .summaryView input[type=text] {
+    width: 100%; min-width: 0; font: inherit; font-size: 14px; padding: 8px 10px;
+    border: 1px solid var(--line); border-radius: 9px; background: var(--bg); color: var(--ink);
+  }
+  .summaryView input[type=text]:focus { outline: none; border-color: var(--accent); }
+  .summaryProgress {
+    grid-column: 1 / -1; min-height: 21px; color: var(--accent); font-size: 13.5px; font-weight: 600;
+  }
+  .summaryProgress.busy::before {
+    content: ""; display: inline-block; width: 12px; height: 12px; margin-right: 7px;
+    vertical-align: -1px; border: 2px solid var(--line); border-top-color: var(--accent);
+    border-radius: 50%; animation: spin .8s linear infinite;
+  }
+  #summary {
+    min-height: 260px; padding: 34px 42px 42px; margin-top: 14px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 15px;
+    box-shadow: 0 8px 30px color-mix(in srgb, var(--ink) 5%, transparent);
+    font-size: 16.5px; line-height: 1.75;
+  }
+  .summaryUtilities { display: grid; grid-template-columns: 1fr; gap: 12px; margin-top: 14px; }
+  .summaryUtility { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+  .summaryUtility > summary {
+    padding: 12px 14px; cursor: pointer; font-size: 14px; font-weight: 650; user-select: none;
+  }
+  .summaryUtility[open] > summary { border-bottom: 1px solid var(--line); }
+  .summaryUtilityBody { padding: 14px; }
+  .summaryUtilityBody .card:last-child { margin-bottom: 0; }
+
   .empty { color: var(--muted); text-align: center; padding: 56px 20px; line-height: 1.9; }
   .empty kbd { background: var(--panel); border: 1px solid var(--line); border-bottom-width: 2px;
                border-radius: 6px; padding: 2px 7px; font-size: 13px; font-family: inherit; }
@@ -416,16 +640,43 @@ extension WebUI {
   }
   .drop:hover, .drop.over { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
 
-  #summary h2 { font-size: 15px; margin: 19px 0 8px; padding-bottom: 5px; border-bottom: 1px solid var(--line); }
+  #summary h2 { font-size: 24px; margin: 30px 0 13px; padding-bottom: 9px; border-bottom: 1px solid var(--line); line-height: 1.35; }
   #summary h2:first-child { margin-top: 0; }
-  #summary h3 { font-size: 14px; margin: 18px 0 7px; color: var(--text); }
-  #summary h4 { font-size: 13px; margin: 14px 0 6px; color: var(--muted); }
-  #summary ul { padding-left: 19px; margin: 8px 0; }
-  #summary li { margin: 5px 0; line-height: 1.65; word-break: keep-all; }
-  #summary p { margin: 8px 0; line-height: 1.65; }
-  #summary hr { border: none; border-top: 1px solid var(--line); margin: 17px 0; }
-  #summary blockquote { margin: 12px 0; padding: 10px 13px; background: var(--bg);
+  #summary h3 { font-size: 20px; margin: 28px 0 11px; color: var(--ink); line-height: 1.4; }
+  #summary h4 { font-size: 16px; margin: 22px 0 8px; color: var(--muted); }
+  #summary ul { padding-left: 23px; margin: 10px 0 16px; }
+  #summary li { margin: 7px 0; line-height: 1.75; word-break: keep-all; }
+  #summary p { margin: 9px 0 16px; line-height: 1.75; word-break: keep-all; }
+  #summary .muted-note { font-size: 15px; }
+  #summary hr { border: none; border-top: 1px solid var(--line); margin: 24px 0; }
+  #summary blockquote { margin: 16px 0; padding: 12px 15px; background: var(--bg);
                         border-left: 3px solid var(--warn); border-radius: 0 8px 8px 0;
-                        font-size: 13px; color: var(--muted); }
+                        font-size: 15px; color: var(--muted); }
+
+  @media (max-width: 700px) {
+    header .spacer { display: none; }
+    .headerActions { width: 100%; }
+    .headerActions .recordAction { flex: 1; }
+    .workspaceTabs { flex: 1; }
+    .workspaceTab { flex: 1; min-width: 0; }
+    .summaryShell { padding: 20px 14px 48px; }
+    .summaryHead { align-items: stretch; flex-direction: column; }
+    .summaryHead #btnSummarize { width: 100%; }
+    .summaryOnline { align-items: stretch; }
+    .summaryOnline > * { flex: 1 1 100%; }
+    .onlineTargets { display: flex; flex-direction: column; }
+    .onlineTargetOption { justify-content: center; }
+    .onlineTargetOption:first-of-type { border-radius: 9px 9px 0 0; }
+    .onlineTargetOption:last-of-type { border-radius: 0 0 9px 9px; }
+    .onlineTargetOption + .onlineTargetOption { margin-left: 0; margin-top: -1px; }
+    .onlineActions > * { flex: 1 1 auto; }
+    .summaryRangeRow { flex-wrap: wrap; }
+    .summaryRangeRow select { flex: 1 1 calc(50% - 18px); }
+    .summaryRangeRow #btnFromLast { flex-basis: 100% !important; }
+    .summaryControls, .summaryUtilities { grid-template-columns: 1fr; }
+    #summary { padding: 24px 20px 32px; border-radius: 12px; font-size: 16px; }
+    #summary h2 { font-size: 21px; }
+    #summary h3 { font-size: 18px; }
+  }
 """#
 }

@@ -636,6 +636,9 @@ final class ZoomCaptionApp: @unchecked Sendable {
     ]
     if let sum = store.summary { json["summary"] = sum }
     json["summaryEngine"] = engine.label
+    if let summaryEngineNote = store.summaryEngineNote {
+      json["summaryEngineNote"] = summaryEngineNote
+    }
     if let note = engine.note { json["summarizerNote"] = note }
     return json
   }
@@ -1512,43 +1515,62 @@ final class ZoomCaptionApp: @unchecked Sendable {
 
   // MARK: - 요약
 
-  func runSummary(segments: [SummaryInputSegment], from: Double?, generation: Int) async {
+  /// 로컬 Qwen 경로와 온라인 붙여넣기 경로가 같은 뒷정리를 하도록 한 곳에 모은다.
+  /// 여기서 autosave나 SSE 브로드캐스트를 빠뜨리면 이미 열려 있는 다른 브라우저 탭이
+  /// 새 요약을 영영 못 본다.
+  func applySummary(_ markdown: String,
+                    lastSummarizedAt: Double?,
+                    engineNote: String,
+                    from: Double?) {
+    store.summary = markdown
+    store.lastSummarizedAt = lastSummarizedAt
+    store.summaryEngineNote = engineNote
+    autosave()
+    live.broadcast(event: "summaryDone", payload: [
+      "ok": true,
+      "markdown": markdown,
+      "lastSummarizedAt": lastSummarizedAt ?? 0,
+      "from": from ?? 0,
+      "engineNote": engineNote,
+    ])
+  }
+
+  func runSummary(units: [LectureUnit], from: Double?, generation: Int) async {
     defer {
       stateLock.withLock {
         if summaryGeneration == generation { isSummarizing = false }
       }
     }
+    // 범위를 자르기 전에 Store가 붙인 전체 기준 unit id를 그대로 모델과 Renderer까지
+    // 운반해야 부분 요약의 3강이 다시 1강으로 바뀌지 않는다. 세그먼트 평탄화는 기존
+    // 로그와 마지막 끝 시각 계산에만 쓰고, 구간 재생성에는 쓰지 않는다.
+    let segments = units.flatMap(\.segments)
     let textCount = segments.reduce(0) { $0 + $1.text.count }
     log("요약 시작 — 범위 \(from.map { TranscriptStore.clock($0) + " 이후" } ?? "전체"), "
       + "\(segments.count)줄 / \(textCount)자, 교안 용어 \(store.domainTerms.count)개")
     let glossary = DomainKnowledge.glossary(store.domainTerms)
     do {
+      // Summarizer가 내부에서 선택하는 것과 같은 선택기를 바로 앞에서 읽어, 반환형을
+      // 넓히지 않고도 실제 로컬 모델 이름을 저장 출처에 남긴다.
+      let engineNote = await Summarizer.currentEngine().label
       let result = try await Summarizer.summarize(
-        segments: segments, title: store.title, glossary: glossary) { done, total in
+        units: units, title: store.title, glossary: glossary) { done, total in
           self.live.broadcast(event: "summaryProgress",
                               payload: ["done": done, "total": total], durable: false)
         }
-      let isCurrent = stateLock.withLock {
-        isSummarizing && summaryGeneration == generation
+      let isCurrent = stateLock.withLock { () -> Bool in
+        guard isSummarizing && summaryGeneration == generation else { return false }
+        isSummarizing = false
+        return true
       }
       guard isCurrent else {
         logWarn("오래된 요약 결과를 저장하지 않았습니다 — generation \(generation)")
         return
       }
-      store.summary = result
-      let lastAt = segments.map(\.end).max()
-      store.lastSummarizedAt = lastAt
-      autosave()
-      stateLock.withLock {
-        if summaryGeneration == generation { isSummarizing = false }
-      }
-      live.broadcast(event: "summaryDone", payload: [
-        "ok": true,
-        "markdown": result,
-        "lastSummarizedAt": lastAt ?? 0,
-        "from": from ?? 0,
-      ])
-      log("요약 완료 — 마지막 지점 \(lastAt.map(TranscriptStore.clock) ?? "-")")
+      let lastSummarizedAt = segments.map(\.end).max()
+      applySummary(result, lastSummarizedAt: lastSummarizedAt,
+                   engineNote: engineNote, from: from)
+      log("요약 완료 — 마지막 지점 \(lastSummarizedAt.map(TranscriptStore.clock) ?? "-")")
     } catch {
       let isCurrent = stateLock.withLock { () -> Bool in
         guard summaryGeneration == generation else { return false }

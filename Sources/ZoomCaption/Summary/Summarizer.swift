@@ -54,18 +54,17 @@ enum Summarizer {
   }
 
   /// - Parameter onProgress: 완료된 모델 호출 수와 전체 모델 호출 수.
-  static func summarize(segments: [SummaryInputSegment],
+  static func summarize(units: [LectureUnit],
                         title: String,
                         glossary: String = "",
                         onProgress: @escaping @Sendable (Int, Int) -> Void) async throws -> String {
-    guard !segments.isEmpty else { throw SummarizerError.emptyTranscript }
+    guard units.contains(where: { !$0.segments.isEmpty }) else {
+      throw SummarizerError.emptyTranscript
+    }
     guard case .ollama(let model) = await currentEngine() else {
       throw SummarizerError.noQwenModel
     }
     guard await OllamaClient.ensureServer() else { throw SummarizerError.serverUnavailable }
-
-    let units = SummaryChunker.makeUnits(from: segments)
-    guard !units.isEmpty else { throw SummarizerError.noLectureUnit }
 
     let glossaryTokens = Int(Double(glossary.count) * OllamaClient.tokensPerChar)
     let transcriptBudget = max(4_000,

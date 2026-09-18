@@ -8,24 +8,44 @@ extension WebUI {
   /// 그래서 사용자 기록(자막 본문)이 HTML 문자열에 섞여 들어갈 일이 없다.
   ///
   /// 큰 구획 셋:
-  /// - `#stream` — 위 칸. Whisper 기록. 이게 정식 기록이다
-  /// - `#fastPane` — 아래 칸. 실시간 전사기. 지금 무슨 말이 나오는지 보는 용도
-  /// - 오른쪽 탭 — 요약 · 교안 · 대조 · 세션 · 설정
+  /// - 메인 탭 `#view-whisper` — Whisper 기록과 실시간 전사
+  /// - 메인 탭 `#view-summary` — 넓은 화면에서 읽는 전체 요약
+  /// - 오른쪽 보조 탭 — 교안 · 대조 · 다듬기 · 세션 · 설정
   ///
   /// 관리자 전용 영역(`#adminBox`, `#quietBox`)은 `display:none` 으로 두고
   /// `/api/admin` 이 켜져 있다고 답할 때만 JS 가 연다.
   static let markup = #"""
 
 <header>
-  <span class="brand">ZoomCaption</span>
-  <input id="title" value="Zoom 수업" spellcheck="false" aria-label="수업 제목">
-  <span class="pill sub" id="sessionChip" style="display:none"></span>
-  <span class="pill" id="status"><span class="dot"></span><span id="statusText">대기 중</span><span class="conn" id="connDot" title="서버와 연결됨"></span></span>
-  <span class="pill" id="clock">00:00:00</span>
-  <span class="spacer"></span>
-  <button id="btnStart" class="primary">시작</button>
-  <button id="btnStop" class="stop" style="display:none">정지</button>
-  <button id="btnQuitTop" class="danger" title="ZoomCaption 앱을 완전히 종료합니다">⏻ 완전 종료</button>
+  <div class="headerIdentity">
+    <span class="brand"><span class="brandMark" aria-hidden="true">Z</span>ZoomCaption</span>
+    <input id="title" value="Zoom 수업" spellcheck="false" aria-label="수업 제목">
+    <span class="pill sub" id="sessionChip" style="display:none"></span>
+  </div>
+
+  <nav class="workspaceTabs" role="tablist" aria-label="주요 화면">
+    <button class="workspaceTab on" id="tab-whisper" type="button" role="tab"
+            aria-selected="true" aria-controls="view-whisper" data-view="whisper">
+      <span class="tabIcon waveformIcon" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+      <span>Whisper</span>
+    </button>
+    <button class="workspaceTab" id="tab-summary" type="button" role="tab"
+            aria-selected="false" aria-controls="view-summary" data-view="summary">
+      <span class="tabIcon summaryIcon" aria-hidden="true"></span><span>요약</span>
+    </button>
+  </nav>
+
+  <div class="recordingStatus" aria-label="녹음 상태">
+    <span class="statusCaption">녹음 상태</span>
+    <span class="pill" id="status"><span class="dot"></span><span id="statusText">대기 중</span><span class="conn" id="connDot" title="서버와 연결됨"></span></span>
+    <span class="pill clockPill" id="clock">00:00:00</span>
+  </div>
+
+  <div class="headerActions">
+    <button id="btnStart" class="primary recordAction"><span aria-hidden="true">●</span> 녹음 시작</button>
+    <button id="btnStop" class="stop recordAction" style="display:none"><span aria-hidden="true">■</span> 녹음 정지</button>
+    <button id="btnQuitTop" class="danger quitAction" title="ZoomCaption 앱을 완전히 종료합니다" aria-label="ZoomCaption 완전 종료">⏻</button>
+  </div>
 </header>
 
 <!-- 완전 종료 확인 -->
@@ -52,7 +72,8 @@ extension WebUI {
 </div>
 
 <main>
-  <section class="captions">
+  <div id="primaryWorkspace">
+    <!-- 어느 메인 탭에 있든 녹음 상태 문제를 놓치지 않도록 공통 영역에 둔다. -->
     <div id="resumeBar">
       <span class="grow" id="resumeText"></span>
       <button id="btnResumeOK" class="sm">알겠습니다</button>
@@ -61,6 +82,9 @@ extension WebUI {
       <span class="grow" id="silentText"></span>
       <button id="btnSilentOK" class="sm">알겠습니다</button>
     </div>
+
+  <section class="captions workspaceView" id="view-whisper" role="tabpanel"
+           aria-labelledby="tab-whisper">
     <div class="toolbar">
       <span class="paneTag main">Whisper</span>
       <input id="search" type="search" placeholder="자막 검색…" autocomplete="off">
@@ -103,56 +127,109 @@ extension WebUI {
     </div>
   </section>
 
+  <!-- 전체 너비 읽기 화면. 기존 id를 유지해 서버 상태·SSE 연결을 그대로 쓴다. -->
+  <section class="workspaceView summaryView" id="view-summary" role="tabpanel"
+           aria-labelledby="tab-summary" hidden>
+    <div class="summaryScroll">
+      <div class="summaryShell">
+        <div class="summaryHead">
+          <div>
+            <h1>수업 요약</h1>
+            <div class="summaryMeta">
+              <span id="engineLine"></span><span id="summarySource">현재 세션 요약</span>
+              <button id="btnCurrentSummary" type="button" style="display:none">현재 요약으로 돌아가기</button>
+            </div>
+          </div>
+          <button id="btnSummarize" class="primary">요약 생성</button>
+        </div>
+
+        <!-- 한 버튼이 선택한 엔진에 따라 로컬 실행 또는 온라인 프롬프트 반출을 맡는다.
+             온라인 결과는 브라우저 클립보드 읽기 권한에 기대지 않고 파일/붙여넣기로 받는다. -->
+        <div class="summaryOnline">
+          <fieldset class="onlineTargets" id="onlineTargets">
+            <legend>요약 모델</legend>
+            <label class="onlineTargetOption">
+              <input type="radio" name="onlineTarget" value="local" checked>
+              <span>로컬 모델</span>
+            </label>
+            <label class="onlineTargetOption">
+              <input type="radio" name="onlineTarget" value="claude">
+              <span>Claude</span>
+            </label>
+            <label class="onlineTargetOption">
+              <input type="radio" name="onlineTarget" value="chatgpt">
+              <span>ChatGPT</span>
+            </label>
+            <label class="onlineTargetOption">
+              <input type="radio" name="onlineTarget" value="gemini">
+              <span>Gemini</span>
+            </label>
+          </fieldset>
+          <div class="onlineActions">
+            <button id="btnPromptFile" class="sm" style="display:none">프롬프트 .md 저장</button>
+            <button id="btnImportSummary" class="sm" style="display:none">요약 .md 불러오기</button>
+            <input id="summaryFileInput" type="file" accept=".md,.markdown,.txt" hidden>
+          </div>
+        </div>
+        <div id="onlineStep" class="onlineStep" role="status" aria-live="polite" style="display:none"></div>
+
+        <div class="summaryControls">
+          <div class="summaryRange">
+            <label for="sumRangeStart">요약 범위</label>
+            <div class="summaryRangeRow">
+              <select id="sumRangeStart" aria-label="요약 시작 구간">
+                <option value="">처음부터</option>
+              </select>
+              <span aria-hidden="true">~</span>
+              <select id="sumRangeEnd" aria-label="요약 종료 구간">
+                <option value="">끝까지</option>
+              </select>
+              <button id="btnFromLast" class="sm" style="flex:0 0 auto" disabled>이어서</button>
+            </div>
+            <div class="hint" id="sumRangeHint">구간을 고르지 않으면 전체를 요약합니다.</div>
+          </div>
+          <div class="summarySave" id="saveSummaryBox" style="display:none">
+            <label for="sumName">요약 저장</label>
+            <div class="row">
+              <input type="text" id="sumName" placeholder="파일 이름">
+              <button id="btnSumSave" class="sm" style="flex:0 0 auto">저장</button>
+            </div>
+            <div class="row summarySaveDestination">
+              <input type="text" id="sumDir" placeholder="기본: 수업 폴더" readonly>
+              <button id="btnSumPick" class="sm" style="flex:0 0 auto">폴더…</button>
+            </div>
+            <div class="hint" id="sumSaveHint"></div>
+          </div>
+          <div id="summaryProgress" class="summaryProgress" role="status" aria-live="polite"></div>
+        </div>
+
+        <div id="sumNotice"></div>
+        <article id="summary" aria-live="polite"><p class="muted-note">수업이 끝난 뒤 <b>요약 생성</b>을 누르면 전체 기록을 온디바이스 모델로 정리합니다.</p></article>
+
+        <div class="summaryUtilities">
+          <details class="summaryUtility" id="sumFilesBox" style="display:none">
+            <summary>이 수업에 저장된 요약</summary>
+            <div class="summaryUtilityBody" id="sumFiles"></div>
+          </details>
+        </div>
+      </div>
+    </div>
+  </section>
+  </div>
+
   <button id="sideToggle" title="사이드 패널 접기" aria-label="사이드 패널 접기">‹</button>
 
   <aside>
     <div class="tabs">
-      <div class="tab on" data-tab="sum">요약</div>
-      <div class="tab" data-tab="doc">교안</div>
+      <div class="tab on" data-tab="doc">교안</div>
       <div class="tab" data-tab="cmp">대조</div>
       <div class="tab" data-tab="pol">다듬기</div>
       <div class="tab" data-tab="ses">세션</div>
       <div class="tab" data-tab="cfg">설정</div>
     </div>
 
-    <!-- 요약 -->
-    <div class="panel on" id="panel-sum">
-      <div class="field">
-        <label for="sumFrom">요약 시작 지점</label>
-        <div class="row">
-          <input type="text" id="sumFrom" placeholder="전체 (비우면 처음부터)">
-          <button id="btnFromLast" class="sm" style="flex:0 0 auto" disabled>이어서</button>
-        </div>
-        <div class="hint" id="fromHint">자막의 시각을 클릭하면 여기에 들어갑니다.</div>
-      </div>
-      <div class="row" style="margin-bottom:13px">
-        <button id="btnSummarize" class="primary">요약 생성</button>
-        <button id="btnMd">MD</button>
-        <button id="btnSrt">SRT</button>
-      </div>
-      <div class="hint" id="engineLine" style="margin-bottom:12px"></div>
-      <div id="sumNotice"></div>
-      <div class="field" id="saveSummaryBox" style="display:none">
-        <label>요약 저장</label>
-        <div class="row" style="margin-bottom:6px">
-          <input type="text" id="sumDir" placeholder="기본: 수업 폴더" readonly>
-          <button id="btnSumPick" class="sm" style="flex:0 0 auto">폴더…</button>
-        </div>
-        <div class="row">
-          <input type="text" id="sumName" placeholder="파일 이름">
-          <button id="btnSumSave" class="sm" style="flex:0 0 auto">저장</button>
-        </div>
-        <div class="hint" id="sumSaveHint"></div>
-      </div>
-      <div class="field" id="sumFilesBox" style="display:none">
-        <label>이 수업에 저장된 요약</label>
-        <div id="sumFiles"></div>
-      </div>
-      <div id="summary"><p class="muted-note">수업이 끝난 뒤 <b>요약 생성</b>을 누르면 전체 기록을 온디바이스 모델로 정리합니다.</p></div>
-    </div>
-
     <!-- 교안 -->
-    <div class="panel" id="panel-doc">
+    <div class="panel on" id="panel-doc">
       <div class="field">
         <label>교안 PDF</label>
         <div class="drop" id="drop">
@@ -245,6 +322,10 @@ extension WebUI {
         <div class="row" style="margin-top:9px">
           <button id="btnNewSession" class="sm">새 세션</button>
           <button id="btnSave" class="sm">지금 저장</button>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button id="btnMd" class="sm" title="요약과 전체 기록이 들어 있는 Markdown을 저장합니다">전체 기록 MD</button>
+          <button id="btnSrt" class="sm" title="Whisper 자막을 SRT로 저장합니다">자막 SRT</button>
         </div>
       </div>
       <div class="field">

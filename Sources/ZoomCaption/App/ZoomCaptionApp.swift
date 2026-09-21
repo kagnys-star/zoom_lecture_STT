@@ -20,7 +20,9 @@ final class ZoomCaptionApp: @unchecked Sendable {
   // 아래 멤버 중 `private` 이 없는 것들은 `Server/Routes/` 의 extension 이 쓴다.
   // Swift 의 `private` 는 **같은 파일 안**까지만이라, extension 을 파일로 나누면 안 보인다.
   // 모듈 밖으로 나가지 않으므로 internal(기본값) 로 두었다.
-  private let options: Options
+  // 여러 파일로 나눈 라우트 extension이 관리자 여부와 저장 위치를 판단한다.
+  // Swift의 private은 같은 파일 밖 extension에서 보이지 않으므로 모듈 내부 접근으로 둔다.
+  let options: Options
   let store = TranscriptStore()
   private let server: HTTPServer
   /// 기본 포트가 막혀 다른 포트로 열었을 때 실제로 쓰는 서버
@@ -58,6 +60,10 @@ final class ZoomCaptionApp: @unchecked Sendable {
   private var lectureTranscriber: TrackTranscriber?
   /// 이번 녹음 구간의 소리를 담는 WAV. 나중에 재전사·확인에 쓴다.
   private var archive: AudioArchive?
+  /// 사용자가 정한 것은 오디오 처리 여부가 아니라 처리 완료 뒤 원본 보관 여부다.
+  /// start/stop 전체가 같은 상태 전이 가드로 직렬화되므로 한 녹음 구간 동안 값이 바뀌지
+  /// 않으며, 체크박스를 다음 녹음용으로 바꿔도 이미 진행 중인 파일 정책은 흔들리지 않는다.
+  private var retainOriginalAudioAfterTranscription = true
   /// 수업이 도는 동안 뒤에서 Whisper 를 돌리는 워커
   private var whisperLive: WhisperLive?
   /// Whisper 가 청크 단위로 끊어 주는 줄을 마침표 기준 문장으로 다시 짜 맞춘다.
@@ -613,6 +619,13 @@ final class ZoomCaptionApp: @unchecked Sendable {
       if let boundary = seg.boundaryAfter { d["boundaryAfter"] = boundary.rawValue }
       return d
     }
+    // 클립 목록을 한 번만 읽는다. 상태 요청마다 디렉터리를 두 번 훑으면 긴 세션에서
+    // 불필요한 파일 시스템 작업이 생기고, 두 조회 사이에 파일이 바뀌면 개수와 용량이
+    // 서로 다른 시점의 값이 될 수 있다.
+    let archivedAudioClips = store.sessionDir.map { AudioArchive.clips(in: $0) } ?? []
+    let archivedAudioBytes = archivedAudioClips.reduce(Int64(0)) { partialBytes, audioClip in
+      partialBytes + audioClip.bytes
+    }
     var json: [String: Any] = [
       // 화면이 "내가 여기까지 봤다" 를 대조할 기준점. 이벤트를 놓쳤는지 이걸로 안다.
       "seq": live.currentSeq,
@@ -640,9 +653,11 @@ final class ZoomCaptionApp: @unchecked Sendable {
       "whisperLiveNote": stateLock.withLock { whisperLiveNote } ?? "",
       "hasCorrections": store.hasCorrections,
       "whisperLines": store.whisperSegments.count,
-      "audioClips": store.sessionDir.map { AudioArchive.clips(in: $0).count } ?? 0,
-      "audioSeconds": Int((store.sessionDir.map { AudioArchive.clips(in: $0) } ?? [])
-        .reduce(Int64(0)) { $0 + $1.bytes } / 32_000),
+      "audioClips": archivedAudioClips.count,
+      "audioSeconds": Int(archivedAudioBytes / 32_000),
+      "audioMB": Double(archivedAudioBytes) / 1_048_576,
+      "audioRetentionStatus": store.audioRetentionStatus?.rawValue ?? "",
+      "administratorMode": options.admin,
     ]
     // SSE 진행 이벤트는 durable: false라 새로고침하면 사라진다. 수 분짜리 작업에서
     // "요약 중"이라는 문구만 남고 몇 번째인지 알 수 없으면 사용자가 멈춘 줄 알고
@@ -753,8 +768,12 @@ final class ZoomCaptionApp: @unchecked Sendable {
   }
 
   func start(title: String?, terms: [String],
-                     folder: String?, baseDir: String?, keepAudio: Bool) async throws {
+                     folder: String?, baseDir: String?, retainOriginalAudio: Bool) async throws {
     // 자리는 라우트에서 이미 잡았다(running = true). 여기서 다시 확인하지 않는다.
+
+    // 이 값은 이번 녹음 구간의 수명주기에 고정한다. UI 체크박스는 녹음 중 비활성화되지만
+    // HTTP 요청을 직접 보내 값을 바꾸더라도 이미 시작한 구간의 삭제 정책이 바뀌면 안 된다.
+    retainOriginalAudioAfterTranscription = retainOriginalAudio
 
     if options.admin {
       // probe 시작은 녹음 상태를 검사하지만, probe가 돈 뒤 일반 시작 버튼을 누르는
@@ -836,18 +855,20 @@ final class ZoomCaptionApp: @unchecked Sendable {
     }
     lectureTranscriber = lecture
 
-    // 소리 보관은 부가 기능이다. 만들다 실패해도 녹취는 그대로 간다.
+    // 정확한 Whisper 기록에는 오디오 아카이브가 필수다. 사용자가 선택하는 것은 녹음
+    // 여부가 아니라 Whisper 완료 뒤 원본 WAV를 남길지뿐이므로, 보관 선택과 무관하게
+    // 항상 같은 처리 파일을 만든다. 파일 생성에 실패해도 Apple 실시간 전사는 계속하되,
+    // 위쪽 Whisper 칸에는 실패 이유를 분명히 표시한다.
     var clip: AudioArchive?
-    stateLock.withLock {
-      whisperLiveNote = keepAudio ? (Whisper.isReady ? nil : Whisper.status.detail)
-                                  : "설정에서 ‘소리도 함께 저장’ 이 꺼져 있어 Whisper 를 돌릴 수 없습니다."
-    }
-    if keepAudio, let dir = store.sessionDir {
+    stateLock.withLock { whisperLiveNote = Whisper.isReady ? nil : Whisper.status.detail }
+    if let dir = store.sessionDir {
       do {
         clip = try AudioArchive(dir: dir, startOffset: store.timeBase)
-        log("소리 저장: \(clip!.url.lastPathComponent) (16kHz mono, 시간당 약 110MB)")
+        log("Whisper 처리용 소리 기록: \(clip!.url.lastPathComponent) "
+          + "(16kHz mono, 시간당 약 110MB, 종료 뒤 보관=\(retainOriginalAudio))")
 
-        // 소리를 남기는 김에, 수업이 도는 동안 Whisper 도 뒤에서 돌린다.
+        // 이 파일은 정확한 자막을 만드는 처리 입력이다. 보관 정책은 Whisper가 끝난 뒤
+        // stop()에서 적용하므로, 여기서는 두 선택 모두 같은 전사 경로를 지난다.
         if Whisper.isReady {
           // 문단화 모델도 같이 준비한다. Whisper 없이는 문단화도 의미가 없어 여기서만 싣는다.
           // 로드가 늦어도 자막은 안 막힌다 — 준비되기 전까지는 문장 단위로 그대로 나간다.
@@ -877,15 +898,15 @@ final class ZoomCaptionApp: @unchecked Sendable {
           log("Whisper 를 쓸 수 없어 실시간 재전사는 건너뜁니다 — \(Whisper.status.detail)")
         }
       } catch {
-        // 여기서 넘어지면 Whisper 로 넘길 조각도 안 만들어진다.
+        // 처리 파일 생성이 실패하면 Whisper 로 넘길 조각도 만들 수 없다.
         // 위 칸이 조용히 비어 있는 게 아니라 이유가 보여야 한다.
-        logWarn("소리 저장을 시작하지 못했습니다: \(error.localizedDescription)")
+        logWarn("Whisper 처리용 소리를 기록하지 못했습니다: \(error.localizedDescription)")
         clip = nil
         stateLock.withLock {
-          whisperLiveNote = "소리를 저장하지 못해 Whisper 를 돌릴 수 없습니다 — \(error.localizedDescription)"
+          whisperLiveNote = "처리용 소리를 기록하지 못해 Whisper 를 돌릴 수 없습니다 — \(error.localizedDescription)"
         }
         live.broadcast(event: "status", payload: [
-          "message": "소리 저장 실패로 Whisper 자막이 만들어지지 않습니다: \(error.localizedDescription)",
+          "message": "오디오 처리 실패로 Whisper 자막이 만들어지지 않습니다: \(error.localizedDescription)",
           "level": "warn"])
       }
     }
@@ -1375,15 +1396,18 @@ final class ZoomCaptionApp: @unchecked Sendable {
 
     // 탭을 멈춘 뒤에 닫아야 마지막 버퍼까지 들어간다.
     // finish() 안에서 자투리가 마지막 조각으로 나가므로 Whisper 를 기다리는 건 그다음이다.
-    if let done = await archive?.finish() {
-      log(String(format: "소리 저장 완료: %@ — %.0f초, %.1fMB",
-                 done.url.lastPathComponent, done.seconds, Double(done.bytes) / 1_048_576))
+    let completedAudioArchive = await archive?.finish()
+    if let completedAudioArchive {
+      log(String(format: "Whisper 처리용 소리 기록 완료: %@ — %.0f초, %.1fMB",
+                 completedAudioArchive.url.lastPathComponent, completedAudioArchive.seconds,
+                 Double(completedAudioArchive.bytes) / 1_048_576))
     }
     archive = nil
 
     // 열린 구간은 문단이 아니라 이전 구조화 경계부터 재야 한다. 문단은 녹음 중에도
     // 계속 확정되어 길이를 몇 초로 축소하므로, 강제 문단화 전에 경계 기준을 보존한다.
     let openSpanReferencePoint: Double
+    var whisperProcessingCompletedSuccessfully = false
     if let worker = whisperLive {
       let (done, total) = worker.progress
       if done < total {
@@ -1391,7 +1415,12 @@ final class ZoomCaptionApp: @unchecked Sendable {
         live.broadcast(event: "status", payload: [
           "message": "Whisper 가 마지막 구간을 정리하는 중입니다…", "level": "info"])
       }
-      await worker.finish()
+      whisperProcessingCompletedSuccessfully = await worker.finish()
+      if !whisperProcessingCompletedSuccessfully {
+        // 자동 삭제를 골랐더라도 Whisper 실패나 시간 초과가 있었다면 원본이 유일한
+        // 복구 수단이다. 아래 보관 정책이 이 값을 보고 파일을 지우지 않는다.
+        logWarn("Whisper 처리가 완전히 성공하지 않아 원본 소리를 보존합니다.")
+      }
       // 마침표를 못 만나 문장으로 못 묶고 대기 중이던 꼬리 — 더 올 줄이 없으니 그대로 확정.
       if let tail = sentenceBuffer?.finalize(), !tail.isEmpty {
         ingestWhisperLines(tail)
@@ -1448,9 +1477,52 @@ final class ZoomCaptionApp: @unchecked Sendable {
       // 세션 폴더가 없으면(예: 시작 도중 실패) 여기서 만들어서라도 남긴다.
       let (madeDir, created) = try ensureSessionDir()
       if created { log("세션 폴더가 없어 새로 만들었습니다: \(madeDir.lastPathComponent)") }
+
+      // 삭제보다 세션 저장이 반드시 먼저다. 자막과 상태 파일을 안전하게 디스크에 쓴
+      // 뒤에만 원본을 지워, 저장 실패와 삭제 성공이 겹쳐 복구 자료를 모두 잃는 경우를
+      // 만들지 않는다. Whisper 실패·시간 초과 때도 사용자 선택보다 복구 가능성을 우선한다.
+      if completedAudioArchive != nil {
+        let retentionStatusBeforeSaving: AudioRetentionStatus
+        if retainOriginalAudioAfterTranscription {
+          retentionStatusBeforeSaving = .kept
+        } else if whisperProcessingCompletedSuccessfully {
+          // 첫 저장 시점에는 실제 파일이 아직 있으므로 상태도 kept가 정확하다.
+          // 삭제가 성공한 뒤 deletedAfterWhisper로 바꾸고 한 번 더 원자 저장한다.
+          retentionStatusBeforeSaving = .kept
+        } else {
+          retentionStatusBeforeSaving = .retainedForRecovery
+        }
+        store.setAudioRetentionStatus(retentionStatusBeforeSaving)
+      }
+
       guard let dir = try SessionStore.save(store) else {
         logError("저장 대상 폴더를 정하지 못했습니다")
         return nil
+      }
+
+      if !retainOriginalAudioAfterTranscription,
+         whisperProcessingCompletedSuccessfully,
+         completedAudioArchive != nil {
+        do {
+          let deletedAudioFileCount = try removeArchivedAudioFiles(in: dir)
+          store.setAudioRetentionStatus(.deletedAfterWhisper)
+          _ = try SessionStore.save(store)
+          log("Whisper 처리 완료 후 원본 소리 \(deletedAudioFileCount)개를 삭제했습니다.")
+        } catch {
+          // 일부 삭제 뒤 오류가 나도 transcript와 session.json은 이미 저장돼 있다.
+          // 실패 상태를 다시 저장해 설정 화면에서 조치가 필요함을 숨기지 않는다.
+          store.setAudioRetentionStatus(.deletionFailed)
+          do {
+            _ = try SessionStore.save(store)
+          } catch {
+            logError("원본 소리 삭제 실패 상태를 저장하지 못했습니다: \(error)")
+          }
+          logWarn("원본 소리를 모두 삭제하지 못해 남은 파일을 보존합니다: \(error.localizedDescription)")
+          live.broadcast(event: "status", payload: [
+            "message": "원본 소리 자동 삭제를 마치지 못했습니다. 설정에서 저장 상태를 확인해 주세요.",
+            "level": "warn",
+          ])
+        }
       }
       log("저장 완료: \(dir.path)")
       live.broadcast(event: "status", payload: [
@@ -1464,6 +1536,45 @@ final class ZoomCaptionApp: @unchecked Sendable {
       ])
       return nil
     }
+  }
+
+  /// 세션 폴더 안에서 AudioArchive가 만든 이름의 WAV만 지운다.
+  ///
+  /// 사용자가 선택한 상위 저장 폴더 전체를 대상으로 삼거나 `*.wav` 같은 넓은 패턴을
+  /// 쓰면 교안 음원까지 지울 수 있다. AudioArchive가 이미 파싱한 목록을 다시 경로와
+  /// 이름으로 검증하고, 하나라도 범위를 벗어나면 즉시 멈춘다.
+  private func removeArchivedAudioFiles(in sessionDirectory: URL) throws -> Int {
+    let canonicalSessionDirectory = sessionDirectory.standardizedFileURL.resolvingSymlinksInPath()
+    let archivedAudioClips = AudioArchive.clips(in: sessionDirectory)
+    var deletedAudioFileCount = 0
+
+    for audioClip in archivedAudioClips {
+      let audioFileURL = audioClip.url.standardizedFileURL
+      let canonicalParentDirectory = audioFileURL.deletingLastPathComponent()
+        .resolvingSymlinksInPath()
+      let audioFileName = audioFileURL.lastPathComponent
+      let numericOffset = audioFileName
+        .dropFirst("audio_".count)
+        .dropLast(".wav".count)
+      let hasNumericTimelineOffset = !numericOffset.isEmpty
+        && numericOffset.allSatisfy { $0.wholeNumberValue != nil }
+
+      guard canonicalParentDirectory == canonicalSessionDirectory,
+            audioFileName.hasPrefix("audio_"),
+            audioFileName.hasSuffix(".wav"),
+            hasNumericTimelineOffset
+      else {
+        throw NSError(
+          domain: "ZoomCaption.AudioRetention",
+          code: 1,
+          userInfo: [NSLocalizedDescriptionKey:
+            "세션 폴더 밖이거나 예상하지 않은 이름의 오디오 파일은 삭제하지 않았습니다."])
+      }
+
+      try FileManager.default.removeItem(at: audioFileURL)
+      deletedAudioFileCount += 1
+    }
+    return deletedAudioFileCount
   }
 
   // MARK: - 문맥 다듬기 (자기 일관성 교정 — 미리보기)

@@ -97,6 +97,7 @@ enum SessionStore {
         "updatedAt": ISO8601DateFormatter().string(from: file.updatedAt),
         "hasSummary": file.summary?.isEmpty == false,
         "domainSource": file.domainSource ?? "",
+        "audioRetentionStatus": file.audioRetentionStatus?.rawValue ?? "",
       ])
     }
     let sorted = out.sorted { ($0["updatedAt"] as? String ?? "") > ($1["updatedAt"] as? String ?? "") }

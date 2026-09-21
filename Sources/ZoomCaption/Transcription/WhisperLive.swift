@@ -34,6 +34,9 @@ final class WhisperLive: @unchecked Sendable {
   private var stopped = false
   private var _done = 0
   private var _queued = 0
+  /// whisper-cli가 실행됐지만 결과 자체를 읽지 못한 조각 수. 빈 배열은 VAD가 침묵으로
+  /// 판정한 정상 결과지만 nil은 실행·파싱 실패이므로 원본 자동 삭제를 막아야 한다.
+  private var failedJobCount = 0
 
   /// 처리한 조각 수 / 들어온 조각 수
   var progress: (done: Int, total: Int) { lock.withLock { (_done, _queued) } }
@@ -81,6 +84,8 @@ final class WhisperLive: @unchecked Sendable {
                               end: $0.end + job.start, p: $0.p, startsWord: $0.startsWord)
                })
         })
+      } else if lines == nil {
+        lock.withLock { failedJobCount += 1 }
       }
 
       let snapshot: (Int, Int) = lock.withLock { _done += 1; return (_done, _queued) }
@@ -112,10 +117,21 @@ final class WhisperLive: @unchecked Sendable {
   }
 
   /// 남은 조각까지 다 끝날 때까지 기다린다. 정지 직후 저장 전에 부른다.
-  func finish(timeout: TimeInterval = 180) async {
-    if await waitUntilIdle(timeout: timeout) { return }
+  ///
+  /// 반환값은 원본 오디오 자동 삭제의 안전 조건이다. 제한 시간 안에 끝나지 않았는데
+  /// 단순히 `void`로 끝내면 호출부가 "처리 완료"로 오해해 복구에 필요한 WAV까지 지울
+  /// 수 있다. 모든 대기·실행 조각이 끝난 경우에만 true를 돌려준다.
+  @discardableResult
+  func finish(timeout: TimeInterval = 180) async -> Bool {
+    if await waitUntilIdle(timeout: timeout) {
+      let failedJobs = lock.withLock { failedJobCount }
+      if failedJobs == 0 { return true }
+      logWarn("Whisper 조각 \(failedJobs)개를 처리하지 못해 원본 소리를 보존합니다.")
+      return false
+    }
     logWarn("Whisper 조각 처리가 \(Int(timeout))초 안에 끝나지 않아 남은 것은 버립니다.")
     lock.withLock { stopped = true; queue.removeAll() }
+    return false
   }
 
   func cancel() {

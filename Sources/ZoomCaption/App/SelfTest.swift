@@ -44,6 +44,26 @@ func runWebUIContractChecks() -> Never {
   let sideTargets = captures(#"data-tab="([A-Za-z0-9_-]+)""#, in: markup)
   check(!sideTargets.isEmpty && sideTargets.allSatisfy { ids.contains("panel-\($0)") },
         "모든 사이드 탭에 대응하는 패널이 존재한다")
+  check(markup.contains(#"data-caption-size="small""#)
+          && markup.contains(#"data-caption-size="medium""#)
+          && markup.contains(#"data-caption-size="large""#),
+        "자막 크기 선택이 작게·중간·크게 세 단계다")
+  check(!markup.contains(#"id="fontSize""#), "연속 글자 크기 슬라이더가 남아 있지 않는다")
+  check(markup.contains(#"id="retainOriginalAudio""#)
+          && !markup.contains(#"id="keepAudio""#),
+        "오디오 설정은 처리 여부가 아니라 원본 보관 여부를 묻는다")
+  check(["cmp", "pol", "adm"].allSatisfy { administratorTabName in
+    markup.contains("class=\"tab administratorOnly\" id=\"side-tab-\(administratorTabName)\"")
+  }, "검수·진단 탭이 모두 관리자 전용으로 표시된다")
+
+  let userPage = WebUI.page(isAdministratorMode: false)
+  let administratorPage = WebUI.page(isAdministratorMode: true)
+  check(userPage.contains(#"<body class="user-mode">"#)
+          && userPage.contains("녹음 시작"),
+        "일반 실행 페이지가 사용자 역할과 녹음 문구를 받는다")
+  check(administratorPage.contains(#"<body class="administrator-mode">"#)
+          && administratorPage.contains("테스트 캡처 시작"),
+        "관리자 실행 페이지가 별도 역할과 테스트 문구를 받는다")
   check(!markup.contains("data-tab=\"sum\"") && !markup.contains("id=\"panel-sum\""),
         "요약이 사이드 탭에 남아 있지 않는다")
   if let summary = markup.range(of: "id=\"view-summary\""),

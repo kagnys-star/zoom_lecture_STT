@@ -9,6 +9,20 @@ import AppKit
 
 extension ZoomCaptionApp {
   func adminRoutes(_ req: HTTPRequest) async -> Route? {
+    // 관리자 화면을 숨겨도 localhost API 주소를 아는 사용자는 직접 호출할 수 있다.
+    // `/api/admin` 계열과 무음 진단 경로를 한 곳에서 먼저 차단해, 개별 case에 guard를
+    // 빼먹더라도 관리자 작업이 일반 모드에서 실행되지 않게 한다.
+    let isAdministratorEndpoint = req.path == "/api/quiet"
+      || req.path.hasPrefix("/api/quiet/")
+      || req.path == "/api/admin"
+      || req.path.hasPrefix("/api/admin/")
+    if isAdministratorEndpoint, !options.admin {
+      return .response(.json([
+        "ok": false,
+        "error": "관리자 모드에서만 사용할 수 있는 기능입니다.",
+      ], status: 403))
+    }
+
     switch (req.method, req.path) {
     // ── 무음 의심 검사 ──
     //
@@ -259,7 +273,7 @@ extension ZoomCaptionApp {
           return .response(.json(["ok": false, "error": "녹음 상태가 바뀌는 중입니다. 잠시 뒤 다시 시도하세요."]))
         }
         do { try await start(title: r.title ?? "관리자 시험", terms: [],
-                             folder: nil, baseDir: nil, keepAudio: true)
+                             folder: nil, baseDir: nil, retainOriginalAudio: true)
           stateLock.withLock { starting = false }
         }
         catch {

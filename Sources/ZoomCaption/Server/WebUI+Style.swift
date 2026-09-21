@@ -18,7 +18,7 @@ extension WebUI {
     --line: #e3e6ea;    --accent: #2f6df6;  --accent-soft: #e8f0ff;
     --me: #0f9d6b;      --me-soft: #e6f7f0; --warn: #b45309;    --warn-soft: #fef3c7;
     --danger: #d9342b;  --danger-soft: #fdeceb; --on-accent: #ffffff;
-    --cap: 20px;
+    --cap: 22px;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -30,6 +30,10 @@ extension WebUI {
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; }
+  /* 관리자 요소는 일반 화면에서 단순히 흐리게 두지 않고 레이아웃과 접근성 트리에서
+     함께 제외한다. 서버 라우트도 별도로 거부하므로 이 규칙은 보안 경계가 아니라
+     일반 사용자에게 실험 도구를 노출하지 않기 위한 표현 계층이다. */
+  body:not(.administrator-mode) .administratorOnly { display: none !important; }
   body {
     margin: 0; background: var(--bg); color: var(--ink);
     font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Pretendard", sans-serif;
@@ -52,6 +56,12 @@ extension WebUI {
     display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px;
     border-radius: 9px; background: var(--accent); color: var(--on-accent); font-size: 14px; font-weight: 800;
     box-shadow: 0 4px 10px color-mix(in srgb, var(--accent) 28%, transparent);
+  }
+  .administratorBadge {
+    display: inline-flex; align-items: center; min-height: 26px; padding: 4px 9px;
+    border-radius: 999px; background: var(--warn-soft); color: var(--warn);
+    border: 1px solid color-mix(in srgb, var(--warn) 38%, var(--line));
+    font-size: 12px; font-weight: 750; white-space: nowrap;
   }
   #title {
     font: inherit; font-weight: 600; color: var(--ink); background: transparent;
@@ -209,7 +219,23 @@ extension WebUI {
   #search:focus { outline: none; border-color: var(--accent); }
   .toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); cursor: pointer; user-select: none; }
   .size-ctl { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
-  .size-ctl input { width: 78px; accent-color: var(--accent); }
+  .captionSizeControl {
+    display: inline-flex; align-items: center; gap: 2px; margin: 0; padding: 3px;
+    border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+  }
+  .captionSizeControl legend {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+  }
+  .captionSizeControl button {
+    min-height: 34px; padding: 5px 9px; border: 0; border-radius: 7px;
+    background: transparent; color: var(--muted); font-size: 12.5px;
+  }
+  .captionSizeControl button[aria-pressed="true"] {
+    background: var(--accent-soft); color: var(--accent);
+    box-shadow: inset 0 -2px 0 var(--accent);
+  }
+  .captionSizeControl button:hover:not(:disabled) { border-color: transparent; }
 
   .editbar {
     display: none; gap: 9px; align-items: center; padding: 9px 18px;
@@ -537,8 +563,11 @@ extension WebUI {
   aside { border-left: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
   .tabs { display: flex; border-bottom: 1px solid var(--line); }
   .tab { flex: 1; padding: 11px 4px; text-align: center; font-size: 13.5px; font-weight: 600;
-         color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; }
+         color: var(--muted); cursor: pointer; border: 0; border-radius: 0;
+         background: transparent; border-bottom: 2px solid transparent; }
+  .tab:hover:not(:disabled) { background: var(--bg); border-color: transparent; color: var(--ink); }
   .tab.on { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab.on:hover:not(:disabled) { border-bottom-color: var(--accent); }
   .panel { flex: 1; overflow-y: auto; padding: 17px; display: none; }
   .panel.on { display: block; }
 

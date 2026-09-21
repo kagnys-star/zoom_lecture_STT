@@ -103,7 +103,7 @@ extension ZoomCaptionApp {
                         terms: r.terms ?? [],
                         folder: r.folder,
                         baseDir: r.baseDir,
-                        keepAudio: r.keepAudio ?? true)
+                        retainOriginalAudio: r.retainOriginalAudio ?? true)
         stateLock.withLock { starting = false }
         return .response(.json(["ok": true, "state": await stateJSON()]))
       } catch {

@@ -10,15 +10,16 @@ extension WebUI {
   /// 큰 구획 셋:
   /// - 메인 탭 `#view-whisper` — Whisper 기록과 실시간 전사
   /// - 메인 탭 `#view-summary` — 넓은 화면에서 읽는 전체 요약
-  /// - 오른쪽 보조 탭 — 교안 · 대조 · 다듬기 · 세션 · 설정
+  /// - 오른쪽 보조 탭 — 일반 사용자는 교안 · 세션 · 설정, 관리자는 검수·진단 탭 추가
   ///
-  /// 관리자 전용 영역(`#adminBox`, `#quietBox`)은 `display:none` 으로 두고
-  /// `/api/admin` 이 켜져 있다고 답할 때만 JS 가 연다.
+  /// 관리자 전용 영역은 서버가 정한 body 역할 클래스와 API 403 검사를 함께 쓴다.
+  /// CSS는 보이지 않게 만드는 UX 경계이고, 실제 권한 경계는 서버 라우트다.
   static let markup = #"""
 
 <header>
   <div class="headerIdentity">
     <span class="brand"><span class="brandMark" aria-hidden="true">Z</span>ZoomCaption</span>
+    <span class="administratorBadge administratorOnly" aria-label="관리자 모드">관리자 모드</span>
     <input id="title" value="Zoom 수업" spellcheck="false" aria-label="수업 제목">
     <span class="pill sub" id="sessionChip" style="display:none"></span>
   </div>
@@ -42,7 +43,7 @@ extension WebUI {
   </div>
 
   <div class="headerActions">
-    <button id="btnStart" class="primary recordAction"><span aria-hidden="true">●</span> 녹음 시작</button>
+    <button id="btnStart" class="primary recordAction"><span aria-hidden="true">●</span> __RECORD_BUTTON_LABEL__</button>
     <button id="btnStop" class="stop recordAction" style="display:none"><span aria-hidden="true">■</span> 녹음 정지</button>
     <button id="btnQuitTop" class="danger quitAction" title="ZoomCaption 앱을 완전히 종료합니다" aria-label="ZoomCaption 완전 종료">⏻</button>
   </div>
@@ -89,10 +90,15 @@ extension WebUI {
       <span class="paneTag main">Whisper</span>
       <input id="search" type="search" placeholder="자막 검색…" autocomplete="off">
       <button id="btnEdit" class="sm">편집</button>
-      <label class="toggle" title="실시간 기록과 갈린 자리에 밑줄을 긋습니다. 눌러서 고칠 수 있습니다.">
+      <label class="toggle administratorOnly" title="실시간 기록과 갈린 자리에 밑줄을 긋습니다. 눌러서 고칠 수 있습니다.">
         <input type="checkbox" id="showDiv"> 갈린 곳 표시 <b id="divCount"></b></label>
       <label class="toggle"><input type="checkbox" id="autoscroll" checked> 자동 스크롤</label>
-      <span class="size-ctl">글자 <input type="range" id="fontSize" min="15" max="34" value="20"></span>
+      <fieldset class="captionSizeControl" aria-label="자막 글자 크기">
+        <legend>글자</legend>
+        <button type="button" data-caption-size="small" aria-pressed="false">작게</button>
+        <button type="button" data-caption-size="medium" aria-pressed="true">중간</button>
+        <button type="button" data-caption-size="large" aria-pressed="false">크게</button>
+      </fieldset>
       <span class="size-ctl" id="waitNote"></span>
       <span class="size-ctl" id="count">0줄</span>
     </div>
@@ -240,16 +246,23 @@ extension WebUI {
   <button id="sideToggle" title="사이드 패널 접기" aria-label="사이드 패널 접기">‹</button>
 
   <aside>
-    <div class="tabs">
-      <div class="tab on" data-tab="doc">교안</div>
-      <div class="tab" data-tab="cmp">대조</div>
-      <div class="tab" data-tab="pol">다듬기</div>
-      <div class="tab" data-tab="ses">세션</div>
-      <div class="tab" data-tab="cfg">설정</div>
+    <div class="tabs" role="tablist" aria-label="보조 도구">
+      <button class="tab on" id="side-tab-doc" type="button" role="tab" aria-selected="true"
+              aria-controls="panel-doc" data-tab="doc">교안</button>
+      <button class="tab" id="side-tab-ses" type="button" role="tab" aria-selected="false"
+              aria-controls="panel-ses" data-tab="ses">세션</button>
+      <button class="tab" id="side-tab-cfg" type="button" role="tab" aria-selected="false"
+              aria-controls="panel-cfg" data-tab="cfg">설정</button>
+      <button class="tab administratorOnly" id="side-tab-cmp" type="button" role="tab"
+              aria-selected="false" aria-controls="panel-cmp" data-tab="cmp">대조</button>
+      <button class="tab administratorOnly" id="side-tab-pol" type="button" role="tab"
+              aria-selected="false" aria-controls="panel-pol" data-tab="pol">다듬기</button>
+      <button class="tab administratorOnly" id="side-tab-adm" type="button" role="tab"
+              aria-selected="false" aria-controls="panel-adm" data-tab="adm">오디오 진단</button>
     </div>
 
     <!-- 교안 -->
-    <div class="panel on" id="panel-doc">
+    <div class="panel on" id="panel-doc" role="tabpanel" aria-labelledby="side-tab-doc">
       <div class="field">
         <label>교안 PDF</label>
         <div class="drop" id="drop">
@@ -262,7 +275,7 @@ extension WebUI {
     </div>
 
     <!-- 대조 -->
-    <div class="panel" id="panel-cmp">
+    <div class="panel administratorOnly" id="panel-cmp" role="tabpanel" aria-labelledby="side-tab-cmp">
       <div id="cmpNotice"></div>
       <div id="cmpStat"></div>
       <div class="field" id="quietBox" style="display:none;padding-top:16px;border-top:1px solid var(--line)">
@@ -316,7 +329,7 @@ extension WebUI {
     </div>
 
     <!-- 다듬기 (미리보기 단계 — 원문은 아직 안 건드림) -->
-    <div class="panel" id="panel-pol">
+    <div class="panel administratorOnly" id="panel-pol" role="tabpanel" aria-labelledby="side-tab-pol">
       <div class="field">
         <label>문맥 다듬기 (미리보기)</label>
         <div class="hint">강의 전체를 다시 훑어서, 음성 인식이 잘못 알아들어 표기가
@@ -331,7 +344,7 @@ extension WebUI {
     </div>
 
     <!-- 세션 -->
-    <div class="panel" id="panel-ses">
+    <div class="panel" id="panel-ses" role="tabpanel" aria-labelledby="side-tab-ses">
       <div id="sesNotice"></div>
       <div class="field">
         <label>현재 세션</label>
@@ -358,45 +371,21 @@ extension WebUI {
     </div>
 
     <!-- 설정 -->
-    <div class="panel" id="panel-cfg">
+    <div class="panel" id="panel-cfg" role="tabpanel" aria-labelledby="side-tab-cfg">
       <div id="cfgNotice"></div>
-
-      <!-- 관리자 모드로 켰을 때만 보인다. Zoom 없이 저장된 소리로 전체 경로를 시험한다. -->
-      <div class="field" id="adminBox" style="display:none">
-        <label>관리자 — 소리 되먹임</label>
-        <div class="hint">저장된 WAV를 <b>실제 녹음과 같은 경로</b>로 흘려 넣습니다.
-          Zoom도 재생도 필요 없고 실시간보다 빠르게 돌릴 수 있어, 수업 없이 확인할 수 있습니다.
-          이 모드에서는 Zoom 외의 소리도 함께 잡습니다.</div>
-        <div class="row" style="margin-top:9px">
-          <input type="text" id="adminPath" placeholder="WAV 경로 (예: /tmp/sample.wav)">
-          <input type="text" id="adminSpeed" value="4" style="flex:0 0 64px" title="배속">
-          <button id="btnAdminFeed" class="sm primary" style="flex:0 0 auto">흘려 넣기</button>
-          <button id="btnAdminStop" class="sm" style="flex:0 0 auto">멈춤</button>
-        </div>
-        <div id="adminClips" class="hint" style="margin-top:8px"></div>
-        <div id="adminNote"></div>
-        <div style="border-top:1px solid var(--line);margin:14px 0 12px"></div>
-        <label>관리자 — Zoom 캡처 A/B</label>
-        <div class="hint">운영 녹음을 정지한 상태에서 후보 하나씩 측정합니다. 오디오는
-          저장하거나 전사하지 않습니다. 같은 경로를 초기화해 ① 원격만 재생, ② 원격을
-          멈추고 로컬 마이크로 고유 문구 발화 순서로 비교하세요.</div>
-        <div class="row" style="margin-top:9px">
-          <select id="adminProbeProcess" aria-label="A/B 오디오 프로세스"></select>
-          <button id="btnAdminProbeRefresh" class="sm" style="flex:0 0 auto">후보 새로고침</button>
-        </div>
-        <div class="row" style="margin-top:8px">
-          <select id="adminProbeRoute" aria-label="A/B 출력 경로"></select>
-          <button id="btnAdminProbeStart" class="sm primary" style="flex:0 0 auto">측정 시작·초기화</button>
-          <button id="btnAdminProbeStop" class="sm" style="flex:0 0 auto">측정 종료</button>
-        </div>
-        <div id="adminProbeResult" class="hint" style="margin-top:8px"></div>
-      </div>
       <div class="field">
         <label>녹음</label>
-        <div class="hint" style="margin-bottom:9px">Zoom 소리만 잡습니다. Zoom 회의 오디오 프로세스를 찾지 못하면 다른 앱의 소리를 잡지 않고 시작을 중단합니다.</div>
-        <label class="check"><input type="checkbox" id="keepAudio" checked>
-          <span>소리도 함께 저장<span class="hint">수업 폴더에 WAV로 남깁니다(<b>시간당 약 110MB</b>).
-          나중에 인식이 틀린 곳을 다시 듣거나 재전사하려면 필요합니다.</span></span></label>
+        <div class="hint">Zoom 소리를 정확한 자막으로 바꾸기 위해 오디오는 이 Mac 안에서만
+          처리됩니다. Zoom 회의 오디오 프로세스를 찾지 못하면 다른 앱의 소리를 잡지 않고
+          시작을 중단합니다.</div>
+      </div>
+      <div class="field">
+        <label>저장 및 개인정보</label>
+        <label class="check"><input type="checkbox" id="retainOriginalAudio" checked>
+          <span>Whisper 처리 후 원본 소리 보관<span class="hint">켜면 수업 폴더에 WAV를 남겨
+          다시 듣기와 재전사에 사용할 수 있습니다(<b>시간당 약 110MB</b>). 꺼도 정확한
+          Whisper 자막은 만들며, 처리가 안전하게 끝난 뒤 원본 소리만 삭제합니다.</span></span></label>
+        <div id="audioStorageStatus" class="hint" aria-live="polite"></div>
       </div>
       <div class="field">
         <label>저장 위치</label>
@@ -429,6 +418,42 @@ extension WebUI {
           <button id="btnClearCache" class="sm">교안 캐시 비우기</button>
         </div>
         <pre id="logView"></pre>
+      </div>
+    </div>
+
+    <!-- 관리자 실행 진입점에서만 화면에 나타난다. 일반 모드에서는 CSS뿐 아니라
+         모든 관련 API도 서버에서 403으로 막아 개발자 도구로 표시를 바꿔도 실행되지 않는다. -->
+    <div class="panel administratorOnly" id="panel-adm" role="tabpanel" aria-labelledby="side-tab-adm">
+      <div class="notice warn"><b>관리자 진단 모드</b><br>
+        테스트 캡처에는 Zoom 밖의 시스템 소리가 포함될 수 있습니다. 실사용 녹음을 멈춘
+        상태에서 전용 저장 위치와 포트로만 사용하세요.</div>
+      <div class="field" id="adminBox">
+        <label>소리 되먹임</label>
+        <div class="hint">저장된 WAV를 <b>실제 녹음과 같은 경로</b>로 흘려 넣습니다.
+          Zoom도 재생도 필요 없고 실시간보다 빠르게 돌릴 수 있어, 수업 없이 확인할 수 있습니다.</div>
+        <div class="row" style="margin-top:9px">
+          <input type="text" id="adminPath" placeholder="WAV 경로 (예: /tmp/sample.wav)">
+          <input type="text" id="adminSpeed" value="4" style="flex:0 0 64px" title="배속">
+          <button id="btnAdminFeed" class="sm primary" style="flex:0 0 auto">흘려 넣기</button>
+          <button id="btnAdminStop" class="sm" style="flex:0 0 auto">멈춤</button>
+        </div>
+        <div id="adminClips" class="hint" style="margin-top:8px"></div>
+        <div id="adminNote"></div>
+        <div style="border-top:1px solid var(--line);margin:14px 0 12px"></div>
+        <label>Zoom 캡처 A/B</label>
+        <div class="hint">운영 녹음을 정지한 상태에서 후보 하나씩 측정합니다. 오디오는
+          저장하거나 전사하지 않습니다. 같은 경로를 초기화해 ① 원격만 재생, ② 원격을
+          멈추고 로컬 마이크로 고유 문구 발화 순서로 비교하세요.</div>
+        <div class="row" style="margin-top:9px">
+          <select id="adminProbeProcess" aria-label="A/B 오디오 프로세스"></select>
+          <button id="btnAdminProbeRefresh" class="sm" style="flex:0 0 auto">후보 새로고침</button>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <select id="adminProbeRoute" aria-label="A/B 출력 경로"></select>
+          <button id="btnAdminProbeStart" class="sm primary" style="flex:0 0 auto">측정 시작·초기화</button>
+          <button id="btnAdminProbeStop" class="sm" style="flex:0 0 auto">측정 종료</button>
+        </div>
+        <div id="adminProbeResult" class="hint" style="margin-top:8px"></div>
       </div>
     </div>
   </aside>

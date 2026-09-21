@@ -32,7 +32,7 @@ extension ZoomCaptionApp {
   func coreRoutes(_ req: HTTPRequest) async -> Route? {
     switch (req.method, req.path) {
     case ("GET", "/"):
-      return .response(.html(WebUI.page))
+      return .response(.html(WebUI.page(isAdministratorMode: options.admin)))
 
     case ("GET", "/events"):
       return .eventStream

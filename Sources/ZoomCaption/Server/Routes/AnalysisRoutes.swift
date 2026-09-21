@@ -7,6 +7,21 @@ import AppKit
 
 extension ZoomCaptionApp {
   func analysisRoutes(_ req: HTTPRequest) async -> Route? {
+    // 이 파일의 모든 기능은 운영 자막을 만드는 데 필요하지 않은 검수 도구다.
+    // 탭을 CSS로 숨기는 것만으로는 주소를 직접 호출할 수 있으므로, 일반 모드에서는
+    // 알려진 분석 경로 자체를 403으로 닫는다. 알 수 없는 경로는 다음 라우터가 처리할
+    // 수 있도록 nil을 유지한다.
+    let administratorAnalysisPaths: Set<String> = [
+      "/api/compare", "/api/polish/suggest", "/api/fix", "/api/correct/revert",
+      "/api/audio", "/api/gold", "/api/gold/delete", "/api/gold/all",
+    ]
+    if administratorAnalysisPaths.contains(req.path), !options.admin {
+      return .response(.json([
+        "ok": false,
+        "error": "관리자 모드에서만 사용할 수 있는 기능입니다.",
+      ], status: 403))
+    }
+
     switch (req.method, req.path) {
     // ── 정렬·대조 ──
     case ("GET", "/api/compare"):

@@ -77,6 +77,14 @@ extension WebUI {
   };
   let promptRequestGeneration = 0;
   let onlineEnvironmentLogged = false;
+  const isAdministratorMode = document.body.classList.contains('administrator-mode');
+
+  // 자막 크기는 사용자가 의미를 알기 어려운 15~34 연속 숫자가 아니라, 반복해서
+  // 같은 결과를 얻을 수 있는 세 가지 읽기 단계로만 제공한다. 픽셀 값은 이 한곳에
+  // 모아 CSS와 저장값이 서로 다른 크기를 가리키지 않게 한다.
+  const captionSizePixelsByPreference = Object.freeze({ small: 18, medium: 22, large: 26 });
+  const captionSizeStorageKey = 'zoomcaption.captionSize';
+  const originalAudioRetentionStorageKey = 'zoomcaption.retainOriginalAudio';
 
   const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
   const clock = t => {
@@ -826,7 +834,7 @@ extension WebUI {
     $('#statusText').textContent = on ? '녹음 중' : '대기 중';
     $('#btnStart').style.display = on ? 'none' : '';
     $('#btnStop').style.display = on ? '' : 'none';
-    document.querySelectorAll('#keepAudio, #folder, #baseDir, #btnPick, #btnNewSession, #btnEdit')
+    document.querySelectorAll('#retainOriginalAudio, #folder, #baseDir, #btnPick, #btnNewSession, #btnEdit')
       .forEach(e => e.disabled = on);
     $('#btnEdit').title = on ? '녹음 중에는 편집할 수 없습니다 — 정지한 뒤 이용하세요.' : '';
     if (on) {
@@ -908,6 +916,15 @@ extension WebUI {
       ? `이어 적기 모드입니다. 새 자막은 <b>${clock(s.timeBase)}</b> 이후 시각으로 붙습니다.` : '');
     if (s.domainSource) renderDoc({ name: s.domainSource, terms: s.domainTerms || [] });
     $('#btnCorrectRevert').style.display = s.hasCorrections ? '' : 'none';
+    const audioMegabytes = Number(s.audioMB || 0);
+    const retentionStatusLabels = {
+      kept: `원본 소리 ${audioMegabytes.toFixed(1)}MB를 보관 중입니다.`,
+      deletedAfterWhisper: 'Whisper 처리가 끝나 원본 소리를 삭제했습니다.',
+      retainedForRecovery: 'Whisper 처리가 완전히 끝나지 않아 복구용 원본 소리를 보관했습니다.',
+      deletionFailed: `원본 소리 삭제에 실패해 ${audioMegabytes.toFixed(1)}MB가 남아 있습니다.`,
+    };
+    $('#audioStorageStatus').textContent = retentionStatusLabels[s.audioRetentionStatus]
+      || (audioMegabytes > 0 ? `현재 세션 원본 소리: ${audioMegabytes.toFixed(1)}MB` : '');
     showWhisperWhy(s.running ? (s.whisperLiveNote || '') : '');
   }
 
@@ -1287,7 +1304,7 @@ extension WebUI {
       title: $('#title').value,
       folder: $('#folder').value,
       baseDir: $('#baseDir').value,
-      keepAudio: $('#keepAudio').checked
+      retainOriginalAudio: $('#retainOriginalAudio').checked
     });
     $('#btnStart').disabled = false;
     if (!r.ok) {
@@ -2118,7 +2135,7 @@ extension WebUI {
     }
     if (!r.hasAudio) {
       box.innerHTML = '<div class="notice info">저장된 소리가 없어 대조할 수 없습니다. ' +
-        '설정에서 <b>소리도 함께 저장</b>을 켜 두면 다음 수업부터 확인할 수 있습니다.</div>';
+        '원본 소리를 보관한 세션에서만 다시 듣고 판정할 수 있습니다.</div>';
       return;
     }
     const undoBar = r.dropped
@@ -2308,7 +2325,6 @@ extension WebUI {
   async function loadAdmin() {
     const a = await fetch('/api/admin').then(r => r.json()).catch(() => null);
     if (!a || !a.enabled) return;
-    $('#adminBox').style.display = '';
     // 무음 점검은 VAD 가 도는지 확인하는 계기판이라 관리자 모드에서만 연다.
     $('#quietBox').style.display = '';
     if (a.clips && a.clips.length) {
@@ -2387,7 +2403,47 @@ extension WebUI {
   }
 
   $('#search').oninput = applyFilter;
-  $('#fontSize').oninput = e => document.documentElement.style.setProperty('--cap', e.target.value + 'px');
+
+  function applyCaptionSizePreference(requestedPreference, persistSelection = true) {
+    const normalizedPreference = Object.hasOwn(captionSizePixelsByPreference, requestedPreference)
+      ? requestedPreference : 'medium';
+    document.documentElement.style.setProperty(
+      '--cap', captionSizePixelsByPreference[normalizedPreference] + 'px');
+    document.querySelectorAll('[data-caption-size]').forEach(captionSizeButton => {
+      captionSizeButton.setAttribute(
+        'aria-pressed', captionSizeButton.dataset.captionSize === normalizedPreference ? 'true' : 'false');
+    });
+    if (persistSelection) localStorage.setItem(captionSizeStorageKey, normalizedPreference);
+  }
+
+  const captionSizeButtons = [...document.querySelectorAll('[data-caption-size]')];
+  captionSizeButtons.forEach((captionSizeButton, buttonIndex) => {
+    captionSizeButton.onclick = () => applyCaptionSizePreference(captionSizeButton.dataset.captionSize);
+    captionSizeButton.onkeydown = keyboardEvent => {
+      let nextButtonIndex = null;
+      if (keyboardEvent.key === 'ArrowRight') nextButtonIndex = (buttonIndex + 1) % captionSizeButtons.length;
+      if (keyboardEvent.key === 'ArrowLeft') {
+        nextButtonIndex = (buttonIndex - 1 + captionSizeButtons.length) % captionSizeButtons.length;
+      }
+      if (keyboardEvent.key === 'Home') nextButtonIndex = 0;
+      if (keyboardEvent.key === 'End') nextButtonIndex = captionSizeButtons.length - 1;
+      if (nextButtonIndex === null) return;
+      keyboardEvent.preventDefault();
+      const nextCaptionSizeButton = captionSizeButtons[nextButtonIndex];
+      applyCaptionSizePreference(nextCaptionSizeButton.dataset.captionSize);
+      nextCaptionSizeButton.focus();
+    };
+  });
+  applyCaptionSizePreference(localStorage.getItem(captionSizeStorageKey) || 'medium', false);
+
+  // 이 선택은 오디오 처리를 켜고 끄는 값이 아니다. Whisper는 항상 원본 오디오를
+  // 처리하고, 이 값은 성공적으로 전사를 마친 뒤 WAV를 남길지만 결정한다.
+  const retainOriginalAudioCheckbox = $('#retainOriginalAudio');
+  retainOriginalAudioCheckbox.checked = localStorage.getItem(originalAudioRetentionStorageKey) !== '0';
+  retainOriginalAudioCheckbox.onchange = () => {
+    localStorage.setItem(originalAudioRetentionStorageKey,
+                         retainOriginalAudioCheckbox.checked ? '1' : '0');
+  };
   $('#title').onchange = () => post('/api/title', { title: $('#title').value });
   // 메인 화면과 보조 사이드 탭은 서로 다른 계층이다. selector를 분리해 한쪽 탭이
   // 다른 쪽 panel을 모두 숨기는 일을 막는다. 화면 전환은 DOM을 다시 만들지 않으므로
@@ -2423,12 +2479,38 @@ extension WebUI {
   });
   setWorkspaceView('whisper');
 
-  document.querySelectorAll('aside .tab').forEach(t => t.onclick = () => {
-    document.querySelectorAll('aside .tab').forEach(x => x.classList.toggle('on', x === t));
-    document.querySelectorAll('aside .panel').forEach(p => p.classList.toggle('on', p.id === 'panel-' + t.dataset.tab));
-    if (t.dataset.tab === 'ses') loadSessions();
-    if (t.dataset.tab === 'cfg') { loadDiag(); loadAdmin(); }
-    if (t.dataset.tab === 'cmp') { loadCompare(); loadGold(); loadGoldAll(); }
+  const visibleSideTabs = [...document.querySelectorAll('aside .tab')]
+    .filter(sideTab => !sideTab.classList.contains('administratorOnly') || isAdministratorMode);
+  function activateSideTab(selectedSideTab, focusSelectedTab = false) {
+    visibleSideTabs.forEach(sideTab => {
+      const isSelected = sideTab === selectedSideTab;
+      sideTab.classList.toggle('on', isSelected);
+      sideTab.setAttribute('aria-selected', isSelected ? 'true' : 'false');
+      sideTab.tabIndex = isSelected ? 0 : -1;
+    });
+    document.querySelectorAll('aside .panel').forEach(sidePanel => {
+      sidePanel.classList.toggle('on', sidePanel.id === 'panel-' + selectedSideTab.dataset.tab);
+    });
+    if (focusSelectedTab) selectedSideTab.focus();
+    if (selectedSideTab.dataset.tab === 'ses') loadSessions();
+    if (selectedSideTab.dataset.tab === 'cfg') loadDiag();
+    if (selectedSideTab.dataset.tab === 'adm') loadAdmin();
+    if (selectedSideTab.dataset.tab === 'cmp') { loadCompare(); loadGold(); loadGoldAll(); }
+  }
+  visibleSideTabs.forEach((sideTab, sideTabIndex) => {
+    sideTab.onclick = () => activateSideTab(sideTab);
+    sideTab.onkeydown = keyboardEvent => {
+      let nextSideTabIndex = null;
+      if (keyboardEvent.key === 'ArrowRight') nextSideTabIndex = (sideTabIndex + 1) % visibleSideTabs.length;
+      if (keyboardEvent.key === 'ArrowLeft') {
+        nextSideTabIndex = (sideTabIndex - 1 + visibleSideTabs.length) % visibleSideTabs.length;
+      }
+      if (keyboardEvent.key === 'Home') nextSideTabIndex = 0;
+      if (keyboardEvent.key === 'End') nextSideTabIndex = visibleSideTabs.length - 1;
+      if (nextSideTabIndex === null) return;
+      keyboardEvent.preventDefault();
+      activateSideTab(visibleSideTabs[nextSideTabIndex], true);
+    };
   });
 
   // ── 사이드 패널 접기 ──

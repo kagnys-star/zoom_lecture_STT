@@ -58,9 +58,12 @@ struct HTTPResponse {
   static func html(_ s: String) -> HTTPResponse {
     HTTPResponse(contentType: "text/html; charset=utf-8", body: Data(s.utf8))
   }
-  static func json(_ object: Any) -> HTTPResponse {
+  /// JSON 본문과 HTTP 상태 코드를 함께 만든다. 관리자 전용 API를 일반 모드에서
+  /// 차단할 때 본문만 `ok: false`로 보내고 200 OK를 반환하면 브라우저·테스트·향후
+  /// 클라이언트가 성공으로 오해하므로, 호출부가 403 같은 의미 있는 상태를 지정한다.
+  static func json(_ object: Any, status: Int = 200) -> HTTPResponse {
     let data = (try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8)
-    return HTTPResponse(contentType: "application/json; charset=utf-8", body: data)
+    return HTTPResponse(status: status, contentType: "application/json; charset=utf-8", body: data)
   }
   static func text(_ s: String, type: String = "text/plain; charset=utf-8") -> HTTPResponse {
     HTTPResponse(contentType: type, body: Data(s.utf8))
@@ -262,6 +265,7 @@ final class HTTPServer: @unchecked Sendable {
     switch code {
     case 200: return "OK"
     case 400: return "Bad Request"
+    case 403: return "Forbidden"
     case 404: return "Not Found"
     case 500: return "Internal Server Error"
     default: return "OK"

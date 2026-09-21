@@ -95,6 +95,18 @@ struct TranscriptBoundaryUpdate: Sendable {
   let segment: Segment
 }
 
+/// 세션 원본 오디오가 녹음 종료 뒤 어떤 상태인지 기록한다.
+///
+/// Optional로 저장해 이 필드가 없던 기존 `session.json`을 그대로 읽을 수 있게 한다.
+/// `retainedForRecovery`는 사용자가 자동 삭제를 골랐어도 Whisper가 준비되지 않았거나
+/// 완료되지 않아, 데이터 유실을 피하려고 원본을 보존한 경우다.
+enum AudioRetentionStatus: String, Codable, Sendable {
+  case kept
+  case deletedAfterWhisper
+  case retainedForRecovery
+  case deletionFailed
+}
+
 /// 디스크에 저장되는 세션 원본. .md/.srt 는 이걸로부터 파생된다.
 struct SessionFile: Codable {
   var title: String
@@ -121,6 +133,8 @@ struct SessionFile: Codable {
   var reference: Reference?
   /// 문맥 교정을 적용하기 전의 원문. 되돌리기용. (세그먼트 id → 원래 텍스트)
   var preCorrection: [String: String]?
+  /// 원본 WAV의 현재 보관 상태. 옛 세션에는 키가 없으므로 Optional이다.
+  var audioRetentionStatus: AudioRetentionStatus?
 }
 
 /// 정답지 — 어느 구간을 사람이 직접 맞게 고쳤는지.
@@ -166,6 +180,9 @@ final class TranscriptStore: @unchecked Sendable {
   var reference: Reference?
   /// 교정 적용 전 원문 보관. 한 번만 담고, 되돌리면 비운다.
   private(set) var preCorrection: [Int: String] = [:]
+  /// 오디오 삭제 여부를 파일 존재만으로 추측하면 삭제 실패와 의도적 삭제를 구분할 수
+  /// 없다. 세션 자체에 마지막 결정을 남겨 UI와 재시작 뒤 동작이 같은 설명을 하게 한다.
+  private(set) var audioRetentionStatus: AudioRetentionStatus?
   var hasCorrections: Bool { lock.withLock { !preCorrection.isEmpty } }
   /// Whisper 줄의 id 는 실시간 자막과 겹치지 않게 따로 띄운다.
   private var nextWhisperID = 1_000_000
@@ -216,6 +233,7 @@ final class TranscriptStore: @unchecked Sendable {
       summaryFiles = []
       reference = nil
       preCorrection = [:]
+      audioRetentionStatus = nil
       nextWhisperID = 1_000_000
       paragraphVectors = [:]
       paragraphOf = [:]
@@ -245,6 +263,7 @@ final class TranscriptStore: @unchecked Sendable {
       reference = file.reference
       preCorrection = Dictionary(uniqueKeysWithValues:
         (file.preCorrection ?? [:]).compactMap { k, v in Int(k).map { ($0, v) } })
+      audioRetentionStatus = file.audioRetentionStatus
       nextWhisperID = max(1_000_000, (whisperSegments.map(\.id).max() ?? 999_999) + 1)
       // 이미 매겨진 문단 번호는 그대로 이어받는다 — 다시 계산하면 이전 회차에서
       // 보여줬던 문단이 재배치될 수 있다. 벡터 캐시는 안 들고 왔으니(저장 안 함)
@@ -394,8 +413,16 @@ final class TranscriptStore: @unchecked Sendable {
                   summaryFiles: summaryFiles.isEmpty ? nil : summaryFiles,
                   reference: reference,
                   preCorrection: preCorrection.isEmpty ? nil
-                    : Dictionary(uniqueKeysWithValues: preCorrection.map { (String($0.key), $0.value) }))
+                    : Dictionary(uniqueKeysWithValues: preCorrection.map { (String($0.key), $0.value) }),
+                  audioRetentionStatus: audioRetentionStatus)
     }
+  }
+
+  /// 오디오 보관 결정을 세션 스냅샷과 함께 원자적으로 저장할 수 있도록 Store가 소유한다.
+  /// 파일 삭제를 먼저 하고 이 값을 바꾸면 앱이 중단됐을 때 상태만 남고 파일이 없는
+  /// 모순이 생기므로, 호출부는 실제 파일 작업 결과가 확정된 뒤에만 이 메서드를 부른다.
+  func setAudioRetentionStatus(_ status: AudioRetentionStatus?) {
+    lock.withLock { audioRetentionStatus = status }
   }
 
   /// 구간 안의 발화를 이어 붙인 평문. 정답지 대조에 쓴다.

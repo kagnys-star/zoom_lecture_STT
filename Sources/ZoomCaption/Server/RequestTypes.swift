@@ -14,8 +14,10 @@ struct StartRequest: Decodable {
   var folder: String?
   /// 세션 폴더를 만들 상위 위치. 비우면 기본 저장 위치.
   var baseDir: String?
-  /// 소리도 WAV 로 남길지. 나중에 재전사하려면 필요하다.
-  var keepAudio: Bool?
+  /// 정확한 Whisper 자막 생성은 항상 오디오를 사용한다. 이 값은 처리가 성공한 뒤에도
+  /// 원본 WAV를 세션 폴더에 영구 보관할지만 정한다. 예전 `keepAudio`처럼 전사 기능과
+  /// 파일 보관 정책을 한 Boolean에 묶으면 설정 문구와 실제 동작이 달라진다.
+  var retainOriginalAudio: Bool?
 }
 struct TitleRequest: Decodable { var title: String? }
 struct OpenRequest: Decodable { var path: String? }

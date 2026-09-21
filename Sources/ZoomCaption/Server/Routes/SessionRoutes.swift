@@ -15,7 +15,7 @@ extension ZoomCaptionApp {
       guard let path = req.json(OpenRequest.self)?.path, !path.isEmpty else {
         return .response(.json(["ok": false, "error": "경로가 없습니다."]))
       }
-      if stateLock.withLock({ running || isSummarizing }) {
+      if stateLock.withLock({ running || activeSummaryJob != nil }) {
         return .response(.json(["ok": false, "error": "녹음 또는 요약 중에는 다른 세션을 열 수 없습니다."]))
       }
       do {
@@ -29,7 +29,7 @@ extension ZoomCaptionApp {
       }
 
     case ("POST", "/api/session/new"):
-      if stateLock.withLock({ running || isSummarizing }) {
+      if stateLock.withLock({ running || activeSummaryJob != nil }) {
         return .response(.json(["ok": false, "error": "녹음 또는 요약 중에는 새 세션을 만들 수 없습니다."]))
       }
       store.reset(title: "Zoom 수업")
@@ -87,7 +87,7 @@ extension ZoomCaptionApp {
       // 그대로 통과했다. 그러면 오디오 아카이브도 Whisper 워커도 두 벌이 돌고
       // 세션 폴더는 나중 것으로 덮여, 먼저 것은 아무도 안 보는 폴더에 계속 쓴다.
       let claimed = stateLock.withLock { () -> Bool in
-        if running || starting || stopping || isSummarizing { return false }
+        if running || starting || stopping || activeSummaryJob != nil { return false }
         starting = true
         running = true
         return true

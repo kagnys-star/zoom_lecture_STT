@@ -127,9 +127,10 @@ final class ZoomCaptionApp: @unchecked Sendable {
 
   let stateLock = NSLock()
   var running = false
-  /// 요약 버튼의 중복 요청과 오래된 비동기 결과 저장을 막는다. stateLock이 보호한다.
-  var isSummarizing = false
-  var summaryGeneration = 0
+  /// 진행 중인 로컬 요약. nil이 곧 "요약 중이 아님"이라 별도 플래그가 필요 없다.
+  /// stateLock이 보호한다. 두 플래그를 손으로 맞추던 예전 구조가 왜 위험했는지는
+  /// `SummaryJob` 주석에 적어 두었다.
+  var activeSummaryJob: SummaryJob?
   /// start()가 모델·오디오 장치를 준비하는 동안. stop()은 이 단계가 끝난 뒤 정리한다.
   var starting = false
   /// 오디오와 Whisper를 닫고 디스크에 저장하는 동안. 새 시작·세션 전환을 막는다.
@@ -349,6 +350,15 @@ final class ZoomCaptionApp: @unchecked Sendable {
   func shutdown() async {
     // 브라우저가 "종료했습니다" 응답을 받을 틈을 준다.
     try? await Task.sleep(for: .milliseconds(250))
+
+    // 요약을 끊지 않고 프로세스를 끝내면 unload()가 돌지 못해 Qwen 8B가 keep_alive
+    // 10분 동안 Ollama 메모리에 남는다. 여기서 기다리지는 않는다 — /api/quit의 8초
+    // 워치독 안에 Whisper 정리(최대 180초)도 끝내야 해서, 취소만 걸어 두고 이어지는
+    // stop()이 도는 동안 자연스럽게 마무리되게 한다.
+    if let summaryJobAtShutdown = stateLock.withLock({ activeSummaryJob }) {
+      log("종료 0/3 — 진행 중이던 요약을 취소합니다.")
+      summaryJobAtShutdown.cancel()
+    }
 
     log("종료 1/3 — 녹음을 멈추고 저장합니다.")
     // 관리자 A/B probe는 일반 stop() 자원이 아니므로 앱 종료에서 별도로 닫는다.
@@ -608,7 +618,7 @@ final class ZoomCaptionApp: @unchecked Sendable {
       "seq": live.currentSeq,
       "boot": live.bootID,
       "running": isRunning,
-      "summarizing": stateLock.withLock { isSummarizing },
+      "summarizing": stateLock.withLock { activeSummaryJob != nil },
       "title": store.title,
       "segments": segs,
       "whisperSegments": whisper,
@@ -634,6 +644,12 @@ final class ZoomCaptionApp: @unchecked Sendable {
       "audioSeconds": Int((store.sessionDir.map { AudioArchive.clips(in: $0) } ?? [])
         .reduce(Int64(0)) { $0 + $1.bytes } / 32_000),
     ]
+    // SSE 진행 이벤트는 durable: false라 새로고침하면 사라진다. 수 분짜리 작업에서
+    // "요약 중"이라는 문구만 남고 몇 번째인지 알 수 없으면 사용자가 멈춘 줄 알고
+    // 중복 실행을 시도하므로, 마지막 진행률을 상태에 함께 싣는다.
+    if let progress = stateLock.withLock({ activeSummaryJob?.progress }), progress.total > 0 {
+      json["summaryProgress"] = ["done": progress.completed, "total": progress.total]
+    }
     if let sum = store.summary { json["summary"] = sum }
     json["summaryEngine"] = engine.label
     if let summaryEngineNote = store.summaryEngineNote {
@@ -1535,10 +1551,14 @@ final class ZoomCaptionApp: @unchecked Sendable {
     ])
   }
 
-  func runSummary(units: [LectureUnit], from: Double?, generation: Int) async {
+  func runSummary(units: [LectureUnit], from: Double?, job: SummaryJob) async {
     defer {
+      // 해제 지점은 여기 하나뿐이다. 예전에는 defer·성공·실패 세 갈래가 각각
+      // `summaryGeneration == generation`을 걸고 플래그를 껐는데, generation이 진행 중에
+      // 바뀌면 어느 쪽도 끄지 못해 앱이 "요약 중"에 영구히 갇혔다. 조건 없이 자기
+      // 작업만 비우면 그 상태가 성립할 수 없다.
       stateLock.withLock {
-        if summaryGeneration == generation { isSummarizing = false }
+        if activeSummaryJob === job { activeSummaryJob = nil }
       }
     }
     // 범위를 자르기 전에 Store가 붙인 전체 기준 unit id를 그대로 모델과 Renderer까지
@@ -1555,16 +1575,19 @@ final class ZoomCaptionApp: @unchecked Sendable {
       let engineNote = await Summarizer.currentEngine().label
       let result = try await Summarizer.summarize(
         units: units, title: store.title, glossary: glossary) { done, total in
+          // 새로고침한 브라우저가 복원할 수 있도록 작업에도 남기고, 열려 있는 탭에는
+          // 그대로 흘려 보낸다.
+          job.recordProgress(completed: done, total: total)
           self.live.broadcast(event: "summaryProgress",
                               payload: ["done": done, "total": total], durable: false)
         }
-      let isCurrent = stateLock.withLock { () -> Bool in
-        guard isSummarizing && summaryGeneration == generation else { return false }
-        isSummarizing = false
-        return true
-      }
-      guard isCurrent else {
-        logWarn("오래된 요약 결과를 저장하지 않았습니다 — generation \(generation)")
+
+      // 이 작업이 여전히 현재 작업이고, 시작할 때와 같은 세션인지 둘 다 본다. 세션이
+      // 바뀌었다면 결과를 쓰는 순간 autosave가 **다른 수업 폴더**에 이 요약을 적어 넣는다.
+      let shouldApply = stateLock.withLock { activeSummaryJob === job }
+        && job.sessionDir == store.sessionDir
+      guard shouldApply else {
+        logWarn("요약 결과를 저장하지 않았습니다 — 그 사이 취소되었거나 세션이 바뀌었습니다.")
         return
       }
       let lastSummarizedAt = segments.map(\.end).max()
@@ -1572,12 +1595,22 @@ final class ZoomCaptionApp: @unchecked Sendable {
                    engineNote: engineNote, from: from)
       log("요약 완료 — 마지막 지점 \(lastSummarizedAt.map(TranscriptStore.clock) ?? "-")")
     } catch {
-      let isCurrent = stateLock.withLock { () -> Bool in
-        guard summaryGeneration == generation else { return false }
-        isSummarizing = false
-        return true
+      // 취소는 실패가 아니다. 그런데 모델 호출이 URLSession 위에 있어서, 취소가
+      // CancellationError가 아니라 URLError.cancelled로 올라온다. 한 형태만 잡으면
+      // 사용자가 직접 누른 취소가 "요약 실패: cancelled" 오류 배너로 보인다.
+      let wasCancelled = error is CancellationError
+        || (error as? URLError)?.code == .cancelled
+        || Task.isCancelled
+      if wasCancelled {
+        log("요약 취소됨 — 진행 중이던 로컬 요약을 중단했습니다.")
+        live.broadcast(event: "summaryDone", payload: [
+          "ok": false,
+          "cancelled": true,
+          "error": "요약을 취소했습니다.",
+        ])
+        return
       }
-      guard isCurrent else { return }
+      guard stateLock.withLock({ activeSummaryJob === job }) else { return }
       logError("요약 실패: \(error.localizedDescription)")
       live.broadcast(event: "summaryDone", payload: [
         "ok": false,

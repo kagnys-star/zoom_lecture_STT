@@ -420,6 +420,7 @@ extension WebUI {
     border: none; background: transparent; color: var(--accent); padding: 0; font-size: 13px;
   }
   .summaryMeta button:hover:not(:disabled) { background: transparent; border-color: transparent; text-decoration: underline; }
+  .summaryHeadActions { display: flex; align-items: center; gap: 8px; }
   .summaryOnline {
     display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; margin-bottom: 12px;
   }
@@ -644,8 +645,15 @@ extension WebUI {
   #summary h2:first-child { margin-top: 0; }
   #summary h3 { font-size: 20px; margin: 28px 0 11px; color: var(--ink); line-height: 1.4; }
   #summary h4 { font-size: 16px; margin: 22px 0 8px; color: var(--muted); }
-  #summary ul { padding-left: 23px; margin: 10px 0 16px; }
+  #summary ul, #summary ol { padding-left: 23px; margin: 10px 0 16px; }
   #summary li { margin: 7px 0; line-height: 1.75; word-break: keep-all; }
+  /* 온라인 요약 안내의 순서 목록은 번호 자체가 진행 단계를 뜻하므로, 렌더된 요약
+     본문보다 한 톤 옅은 muted-note 안에서도 번호 색은 그대로 눈에 띄게 둔다. */
+  #summary .onlineHelp li::marker { color: var(--accent); font-weight: 650; }
+  #summary .onlineHelp kbd {
+    padding: 1px 6px; border: 1px solid var(--line); border-bottom-width: 2px;
+    border-radius: 5px; background: var(--panel); font-size: 12px;
+  }
   #summary p { margin: 9px 0 16px; line-height: 1.75; word-break: keep-all; }
   #summary .muted-note { font-size: 15px; }
   #summary hr { border: none; border-top: 1px solid var(--line); margin: 24px 0; }

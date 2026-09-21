@@ -44,17 +44,30 @@ extension ZoomCaptionApp {
         return .response(.json(["ok": false,
                                 "error": "쓸 수 있는 Qwen 모델이 없습니다. `ollama pull qwen3:8b`로 내려받으세요."]))
       }
-      let generation = stateLock.withLock { () -> Int? in
-        guard !isSummarizing else { return nil }
-        isSummarizing = true
-        summaryGeneration += 1
-        return summaryGeneration
+      // 시작 시점의 세션을 작업에 새겨 둔다. 끝날 때 같은지 확인해야 그 사이 세션이
+      // 바뀌었을 때 남의 수업 폴더에 이 요약을 적어 넣지 않는다.
+      let job = SummaryJob(sessionDir: store.sessionDir)
+      let claimed = stateLock.withLock { () -> Bool in
+        guard activeSummaryJob == nil else { return false }
+        activeSummaryJob = job
+        return true
       }
-      guard let generation else {
+      guard claimed else {
         return .response(.json(["ok": false, "error": "요약이 이미 진행 중입니다."]))
       }
       let rangeStart = fromUnit == nil ? nil : units.first?.start
-      Task { await self.runSummary(units: units, from: rangeStart, generation: generation) }
+      job.attach(Task { await self.runSummary(units: units, from: rangeStart, job: job) })
+      return .response(.json(["ok": true]))
+
+    case ("POST", "/api/summarize/cancel"):
+      // generation을 올려 결과만 버리던 예전 방식은 모델을 계속 돌게 뒀다. 진짜 취소는
+      // 진행 중인 Ollama 요청까지 끊어, 버릴 결과를 위해 8B 모델이 몇 분 더 도는 낭비를
+      // 없앤다. 작업을 비우는 일은 runSummary의 defer가 한 곳에서 처리한다.
+      guard let cancellingJob = stateLock.withLock({ activeSummaryJob }) else {
+        return .response(.json(["ok": false, "error": "취소할 요약이 없습니다."]))
+      }
+      cancellingJob.cancel()
+      log("요약 취소 요청 — 진행 중이던 로컬 요약을 끊습니다.")
       return .response(.json(["ok": true]))
 
     case ("GET", "/api/summary/units"):
@@ -76,10 +89,9 @@ extension ZoomCaptionApp {
         logWarn("프롬프트 내보내기 거부 — \(rangeError)")
         return .response(.json(["ok": false, "error": rangeError]))
       }
-      if stateLock.withLock({ running || stopping || isSummarizing }) {
-        // 진행 중 generation을 바꿔 온라인 경로만 열면 현재 runSummary의 해제 조건이
-        // 어느 쪽에서도 성립하지 않아 isSummarizing이 영구히 남을 수 있다. 그 수명주기
-        // 교체 전인 이번 단계에서는 온라인 반출도 같은 보수적 잠금을 사용한다.
+      // 온라인 경로는 Ollama도 모델 연산도 쓰지 않으므로 로컬 요약과 동시에 진행해도
+      // 충돌하지 않는다. 입력 스냅샷이 계속 늘어나는 녹음·정리 중에만 막는다.
+      if stateLock.withLock({ running || stopping }) {
         return .response(.json(["ok": false,
                                 "error": "녹음과 Whisper 정리가 끝난 뒤 요약해 주세요."]))
       }
@@ -122,9 +134,16 @@ extension ZoomCaptionApp {
         logWarn("온라인 요약 거부 — 잘못된 범위 (수신 \(receivedMarkdown.count)자)")
         return .response(.json(["ok": false, "error": rangeError]))
       }
-      if stateLock.withLock({ running || stopping || isSummarizing }) {
+      if stateLock.withLock({ running || stopping }) {
         return .response(.json(["ok": false,
                                 "error": "녹음과 Whisper 정리가 끝난 뒤 요약해 주세요."]))
+      }
+      // 사용자가 온라인 결과를 적용했는데 뒤늦게 끝난 로컬 요약이 그것을 덮어쓰면
+      // "Claude로 만든 요약이 왜 사라졌지"가 된다. 방금 도착한 쪽이 사용자의 최신
+      // 의사이므로 진행 중이던 로컬 요약을 끊는다.
+      if let supersededJob = stateLock.withLock({ activeSummaryJob }) {
+        supersededJob.cancel()
+        log("온라인 요약이 도착해 진행 중이던 로컬 요약을 취소합니다.")
       }
       do {
         let result = try SummaryImport.validate(
@@ -229,9 +248,16 @@ extension ZoomCaptionApp {
         logWarn("프롬프트 파일 내보내기 거부 — \(rangeError)")
         return .response(.json(["ok": false, "error": rangeError]))
       }
-      if stateLock.withLock({ running || stopping || isSummarizing }) {
+      if stateLock.withLock({ running || stopping }) {
         return .response(.json(["ok": false,
                                 "error": "녹음과 Whisper 정리가 끝난 뒤 요약해 주세요."]))
+      }
+      // 사용자가 온라인 결과를 적용했는데 뒤늦게 끝난 로컬 요약이 그것을 덮어쓰면
+      // "Claude로 만든 요약이 왜 사라졌지"가 된다. 방금 도착한 쪽이 사용자의 최신
+      // 의사이므로 진행 중이던 로컬 요약을 끊는다.
+      if let supersededJob = stateLock.withLock({ activeSummaryJob }) {
+        supersededJob.cancel()
+        log("온라인 요약이 도착해 진행 중이던 로컬 요약을 취소합니다.")
       }
       let units = store.lectureUnits(fromUnit: fromUnit, toUnit: toUnit)
       guard !units.isEmpty else {

@@ -491,12 +491,30 @@ extension WebUI {
     el.classList.toggle('busy', !!message && busy);
   }
 
+  // WebUI+Markup.swift의 #summary 정적 초기값과 반드시 같은 문구를 유지한다.
+  // 새로고침 직후에는 저 정적 HTML이 보이고, 그 다음부터는 이 함수가 같은 자리를
+  // 다시 그리므로 한쪽만 고치면 새로고침 타이밍에 따라 안내가 달라진다.
+  const summaryEmptyState =
+    '<p class="muted-note">이 수업의 전체 기록을 정리합니다. 위 <b>요약 모델</b>에서 방식을 고른 뒤 진행하세요.</p>' +
+    '<p class="muted-note"><b>로컬 모델</b> — 이 기기에 설치된 Qwen이 인터넷 연결 없이 정리합니다. ' +
+    '<b>요약 생성</b>을 누르면 바로 시작되고, 진행 중에는 <b>요약 취소</b>로 멈출 수 있습니다.</p>' +
+    '<p class="muted-note"><b>Claude · ChatGPT · Gemini</b> — API 키 없이 각 서비스의 웹 화면을 그대로 씁니다. ' +
+    '이 앱이 로그인하거나 화면을 대신 조작하지 않고, 붙여넣을 프롬프트만 준비합니다.</p>' +
+    '<ol class="muted-note">' +
+      '<li>위에서 Claude · ChatGPT · Gemini 중 하나를 고르고, 필요하면 <b>요약 범위</b>로 구간을 지정합니다.</li>' +
+      '<li><b>프롬프트 복사하고 열기</b>를 누르면 프롬프트가 클립보드에 복사되고 그 서비스의 새 탭이 열립니다.</li>' +
+      '<li>새 탭에서 <kbd>⌘V</kbd>로 붙여넣고 Enter를 누릅니다.</li>' +
+      '<li>모델이 만든 문서(아티팩트·캔버스)를 .md 파일로 내려받습니다.</li>' +
+      '<li>내려받은 파일을 이 화면에 끌어다 놓거나, <b>요약 .md 불러오기</b>로 고르거나, 내용을 그대로 붙여넣습니다 — 확인 뒤 자동으로 요약에 반영됩니다.</li>' +
+    '</ol>' +
+    '<p class="muted-note">온라인 모델을 쓰면 이 수업의 기록이 그 서비스로 전달됩니다. 각 서비스의 대화 학습 사용 설정을 먼저 확인하세요.</p>';
+
   function showCurrentSummary(markdown = state.summary, clearNotice = false) {
     $('#summarySource').textContent = '현재 세션 요약';
     $('#btnCurrentSummary').style.display = 'none';
     $('#saveSummaryBox').style.display = markdown ? '' : 'none';
-    $('#summary').innerHTML = markdown ? md(markdown)
-      : '<p class="muted-note">수업이 끝난 뒤 <b>요약 생성</b>을 누르면 전체 기록을 온디바이스 모델로 정리합니다.</p>';
+    $('#summary').innerHTML = markdown ? md(markdown) : summaryEmptyState;
+    $('#summary').classList.toggle('onlineHelp', !markdown);
     if (clearNotice) notice('#sumNotice', '', '');
   }
 
@@ -760,14 +778,15 @@ extension WebUI {
 
   function updateSummaryControls() {
     const busy = !!state.summarizing;
-    // 현재 runSummary는 generation이 도중에 바뀌면 어느 해제 경로도 isSummarizing을
-    // 내리지 못한다. 그 수명주기를 다음 단계에서 교체하기 전까지 로컬·온라인을 모두
-    // running/stopping/summarizing 세 상태에서 같은 방식으로 보수적으로 잠근다.
-    const blocked = running || stopping || busy;
+    // 입력 스냅샷이 계속 늘어나는 녹음·정리 중에는 어느 경로도 쓸 수 없다.
+    const blocked = running || stopping;
     const target = selectedSummaryTarget();
     const usesLocalModel = target === 'local';
+    // 로컬만 Ollama를 점유하므로 진행 중에는 중복 실행을 막는다. 온라인은 프롬프트를
+    // 만들어 건네줄 뿐이라 로컬 요약이 도는 동안에도 병행할 수 있다. 그 사이 도착한
+    // 온라인 결과가 뒤늦게 끝난 로컬 요약에 덮이지 않도록 서버가 로컬 쪽을 취소한다.
     const button = $('#btnSummarize');
-    button.disabled = blocked || localSummaryUnavailable();
+    button.disabled = blocked || (usesLocalModel && (busy || localSummaryUnavailable()));
     button.textContent = usesLocalModel
       ? (busy ? '요약 생성 중…' : (state.summary ? '요약 다시 생성' : '요약 생성'))
       : '프롬프트 복사하고 열기';
@@ -779,9 +798,11 @@ extension WebUI {
     $('#btnImportSummary').style.display = usesLocalModel ? 'none' : '';
     $('#btnPromptFile').disabled = blocked;
     $('#btnImportSummary').disabled = blocked;
-    // 버튼만 잠그고 대상 선택을 열어 두면 못 누르는 버튼 옆에서 고르기만 되는
-    // 어긋난 상태가 보이므로 선택지도 같은 조건으로 함께 잠근다.
+    // 대상 선택까지 잠그면 로컬 요약이 도는 동안 온라인으로 갈아탈 수 없다. 그건
+    // 수 분을 기다리라는 뜻이라, 녹음·정리 중에만 막는다.
     $('#onlineTargets').disabled = blocked;
+    // 취소는 로컬 요약이 실제로 도는 동안에만 의미가 있다.
+    $('#btnCancelSummary').style.display = busy ? '' : 'none';
     const hasMultipleUnits = (state.summaryUnits || []).length > 1;
     $('#sumRangeStart').disabled = blocked || !hasMultipleUnits;
     $('#sumRangeEnd').disabled = blocked || !hasMultipleUnits;
@@ -874,8 +895,14 @@ extension WebUI {
       $('#curSub').textContent = '시작하면 폴더가 만들어집니다';
     }
     renderSummaryEngineLine();
-    if (s.summarizing) showSummaryProgress('요약을 생성하는 중입니다.', true);
-    else showSummaryProgress('');
+    // 새로고침해도 몇 번째 호출인지 보이게 서버가 들고 있던 진행률을 되살린다.
+    // 이게 없으면 수 분짜리 작업이 멈춘 것처럼 보여 사용자가 중복 실행을 시도한다.
+    if (s.summarizing) {
+      const restored = s.summaryProgress;
+      showSummaryProgress(restored && restored.total
+        ? `요약 중… ${restored.done}/${restored.total}`
+        : '요약을 생성하는 중입니다.', true);
+    } else showSummaryProgress('');
     updateSummaryControls();
     notice('#sesNotice', 'info', s.continuing
       ? `이어 적기 모드입니다. 새 자막은 <b>${clock(s.timeBase)}</b> 이후 시각으로 붙습니다.` : '');
@@ -1218,7 +1245,10 @@ extension WebUI {
     showSummaryProgress('');
     updateSummaryControls();
     if (!d.ok) {
-      notice('#sumNotice', 'warn', esc(d.error || '요약에 실패했습니다.'));
+      // 사용자가 직접 멈췄거나 온라인 결과가 대체한 경우다. 오류 배너를 띄우면
+      // 자기가 한 조작을 실패로 읽게 되므로 담백한 안내로 구분한다.
+      notice('#sumNotice', d.cancelled ? 'info' : 'warn',
+             esc(d.error || '요약에 실패했습니다.'));
       if (!state.summary) {
         $('#summary').innerHTML = '<p class="muted-note">요약 결과가 없습니다. 문제를 해결한 뒤 다시 시도해 주세요.</p>';
       }
@@ -1359,8 +1389,10 @@ extension WebUI {
   };
 
   $('#btnSummarize').onclick = async () => {
-    if (running || stopping || state.summarizing) return;
+    if (running || stopping) return;
     const target = selectedSummaryTarget();
+    // 로컬만 중복 실행을 막는다. 온라인은 진행 중인 로컬 요약과 병행할 수 있다.
+    if (target === 'local' && state.summarizing) return;
     const range = selectedSummaryRange();
     if (target !== 'local') {
       notice('#sumNotice', '', '');
@@ -1434,6 +1466,13 @@ extension WebUI {
       notice('#sumNotice', 'warn', esc(response.error || '요약을 시작하지 못했습니다.'));
       updateSummaryControls();
     }
+  };
+
+  $('#btnCancelSummary').onclick = async () => {
+    $('#btnCancelSummary').disabled = true;
+    const response = await post('/api/summarize/cancel', {});
+    $('#btnCancelSummary').disabled = false;
+    if (!response.ok) notice('#sumNotice', 'warn', esc(response.error || '취소하지 못했습니다.'));
   };
 
   $('#btnPromptFile').onclick = () => {

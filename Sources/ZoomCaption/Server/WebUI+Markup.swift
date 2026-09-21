@@ -140,7 +140,11 @@ extension WebUI {
               <button id="btnCurrentSummary" type="button" style="display:none">현재 요약으로 돌아가기</button>
             </div>
           </div>
-          <button id="btnSummarize" class="primary">요약 생성</button>
+          <div class="summaryHeadActions">
+            <button id="btnCancelSummary" class="sm" style="display:none"
+                    title="진행 중인 로컬 요약을 중단합니다">요약 취소</button>
+            <button id="btnSummarize" class="primary">요약 생성</button>
+          </div>
         </div>
 
         <!-- 한 버튼이 선택한 엔진에 따라 로컬 실행 또는 온라인 프롬프트 반출을 맡는다.
@@ -204,7 +208,23 @@ extension WebUI {
         </div>
 
         <div id="sumNotice"></div>
-        <article id="summary" aria-live="polite"><p class="muted-note">수업이 끝난 뒤 <b>요약 생성</b>을 누르면 전체 기록을 온디바이스 모델로 정리합니다.</p></article>
+        <!-- 빈 상태 안내는 WebUI+Script.swift의 showCurrentSummary()가 요약이 없을 때
+             내놓는 내용과 반드시 같아야 한다 — 새로고침 직후엔 이 정적 HTML이,
+             그 뒤로는 JS가 같은 문구를 그린다. 한쪽만 고치면 새로고침 타이밍에 따라
+             안내가 갈린다. -->
+        <article id="summary" aria-live="polite" class="onlineHelp">
+          <p class="muted-note">이 수업의 전체 기록을 정리합니다. 위 <b>요약 모델</b>에서 방식을 고른 뒤 진행하세요.</p>
+          <p class="muted-note"><b>로컬 모델</b> — 이 기기에 설치된 Qwen이 인터넷 연결 없이 정리합니다. <b>요약 생성</b>을 누르면 바로 시작되고, 진행 중에는 <b>요약 취소</b>로 멈출 수 있습니다.</p>
+          <p class="muted-note"><b>Claude · ChatGPT · Gemini</b> — API 키 없이 각 서비스의 웹 화면을 그대로 씁니다. 이 앱이 로그인하거나 화면을 대신 조작하지 않고, 붙여넣을 프롬프트만 준비합니다.</p>
+          <ol class="muted-note">
+            <li>위에서 Claude · ChatGPT · Gemini 중 하나를 고르고, 필요하면 <b>요약 범위</b>로 구간을 지정합니다.</li>
+            <li><b>프롬프트 복사하고 열기</b>를 누르면 프롬프트가 클립보드에 복사되고 그 서비스의 새 탭이 열립니다.</li>
+            <li>새 탭에서 <kbd>⌘V</kbd>로 붙여넣고 Enter를 누릅니다.</li>
+            <li>모델이 만든 문서(아티팩트·캔버스)를 .md 파일로 내려받습니다.</li>
+            <li>내려받은 파일을 이 화면에 끌어다 놓거나, <b>요약 .md 불러오기</b>로 고르거나, 내용을 그대로 붙여넣습니다 — 확인 뒤 자동으로 요약에 반영됩니다.</li>
+          </ol>
+          <p class="muted-note">온라인 모델을 쓰면 이 수업의 기록이 그 서비스로 전달됩니다. 각 서비스의 대화 학습 사용 설정을 먼저 확인하세요.</p>
+        </article>
 
         <div class="summaryUtilities">
           <details class="summaryUtility" id="sumFilesBox" style="display:none">

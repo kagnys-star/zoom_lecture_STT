@@ -120,6 +120,35 @@ func runSummaryPipelineChecks() -> Never {
   check(terms.map(\.term) == ["L1 정규화", "L2 정규화", "ReLU", "ReLU 함수"],
         "용어명 완전 동치만 제거하고 L1/L2 및 접두어 용어를 보존한다")
 
+  // SummaryJob은 예전 isSummarizing/summaryGeneration 짝을 대체한다. 그 짝은 해제
+  // 조건이 세 갈래로 갈라져 있어 generation이 진행 중에 바뀌면 어느 쪽도 플래그를 끄지
+  // 못했고, 앱이 "요약 중"에 갇혀 녹음 시작까지 막혔다. 아래 검사는 그 구조가 다시
+  // 들어오지 못하도록 수명·취소·진행률의 계약을 고정한다.
+  do {
+    let sessionDirectory = URL(fileURLWithPath: "/tmp/zoomcaption-selftest-session")
+    let job = SummaryJob(sessionDir: sessionDirectory)
+    check(job.sessionDir == sessionDirectory, "작업이 시작 시점의 세션을 기억한다")
+    check(job.progress.total == 0, "진행률은 0에서 시작한다")
+
+    job.recordProgress(completed: 3, total: 7)
+    check(job.progress.completed == 3 && job.progress.total == 7,
+          "진행률을 작업에 남겨 새로고침 뒤에도 복원할 수 있다")
+
+    let runningTask = Task { () -> Void in try? await Task.sleep(for: .seconds(30)) }
+    job.attach(runningTask)
+    check(!runningTask.isCancelled, "붙인 직후에는 취소되지 않은 상태다")
+    job.cancel()
+    check(runningTask.isCancelled, "cancel이 실제 Task까지 전달된다")
+
+    // 라우트가 Task를 만들어 붙이는 사이에 사용자가 취소를 누를 수 있다. 그 취소를
+    // 잃어버리면 사용자는 멈춘 줄 아는데 8B 모델이 끝까지 돈다.
+    let earlyCancelJob = SummaryJob(sessionDir: nil)
+    earlyCancelJob.cancel()
+    let lateTask = Task { () -> Void in try? await Task.sleep(for: .seconds(30)) }
+    earlyCancelJob.attach(lateTask)
+    check(lateTask.isCancelled, "attach 전에 들어온 취소를 잃지 않는다")
+  }
+
   // 온라인 경로도 별도 경계 계산을 만들지 않고 Chunker 결과를 그대로 써야, 로컬
   // Qwen과 웹 LLM이 같은 녹취를 서로 다른 강의 수로 해석하는 회귀를 막을 수 있다.
   let promptSegments = [

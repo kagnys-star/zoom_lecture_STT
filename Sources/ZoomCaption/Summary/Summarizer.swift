@@ -89,6 +89,9 @@ enum Summarizer {
         var partSummaries: [UnitSummary] = []
 
         for chunk in chunks {
+          // 취소를 확인하지 않으면 Task.cancel() 이후에도 남은 구간 호출이 계속 시작돼
+          // "취소했는데 8B 모델이 몇 분 더 돈다"가 된다. 끊는 지점은 호출 직전이다.
+          try Task.checkCancellation()
           let request = UnitSummaryRequest(
             lectureTitle: title,
             unitId: unit.id,
@@ -110,6 +113,7 @@ enum Summarizer {
         if partSummaries.count == 1, let only = partSummaries.first {
           summary = only
         } else {
+          try Task.checkCancellation()
           var merged = try await client.mergeUnitParts(
             UnitMergeRequest(lectureTitle: title, unitId: unit.id, parts: partSummaries))
           merged.unitId = unit.id
@@ -120,6 +124,7 @@ enum Summarizer {
         entries.append(.init(unit: unit, summary: summary))
       }
 
+      try Task.checkCancellation()
       let overview = try await client.summarizeOverview(
         OverviewRequest(lectureTitle: title, units: entries.map(\.summary)))
       completedCalls += 1

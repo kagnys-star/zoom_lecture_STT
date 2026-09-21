@@ -46,7 +46,13 @@ struct OllamaQwenSummaryClient: SummaryModelClient {
       "model": modelName, "keep_alive": 0,
     ])
     request.timeoutInterval = 10
-    _ = try? await URLSession.shared.data(for: request)
+    // 취소된 Task 안에서 URLSession을 쓰면 요청이 시작조차 못 하고 즉시 실패한다.
+    // 그러면 요약을 취소하거나 앱을 끌 때마다 Qwen 8B가 keep_alive(10분) 동안 메모리에
+    // 그대로 남는다. 모델을 실제로 내리는 이 요청만큼은 취소가 전파되지 않는 작업에서
+    // 보내야 한다.
+    await Task.detached(priority: .utility) {
+      _ = try? await URLSession.shared.data(for: request)
+    }.value
   }
 
   private func parseUnitSummary(_ parsed: [String: Any], expectedUnitId: Int) throws -> UnitSummary {

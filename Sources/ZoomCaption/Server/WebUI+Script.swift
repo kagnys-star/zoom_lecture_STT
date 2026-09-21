@@ -76,6 +76,16 @@ extension WebUI {
     gemini: { name: 'Gemini', url: 'https://gemini.google.com/app' },
   };
   let promptRequestGeneration = 0;
+  // 프롬프트를 미리 받아 오는 동안의 캐시 키. 이 값이 채워진 동안 버튼을 눌러도
+  // 아직 클립보드에 쓸 데이터가 없어, 클릭 시점에 fetch를 새로 걸고 아직 안 풀린
+  // Promise를 클립보드에 넘기는 우회 경로(ClipboardItem)를 타야 했다. 그 경로는
+  // Chrome 104+ 에서는 표준 기능이지만 Safari(이 macOS 앱의 기본 브라우저일 가능성이
+  // 가장 큰 브라우저)가 같은 방식으로 신뢰성 있게 지원하는지는 확인할 길이 없었다 —
+  // 이 개발 환경의 내장 브라우저는 정책상 clipboard-write 권한을 모든 페이지에서
+  // 항상 denied로 고정해, 실제 Safari로 검증할 방법이 없다. 그래서 그 경로 자체를
+  // 신뢰하는 대신, 버튼을 프리페치가 끝날 때까지 잠가 클릭이 그 경로를 아예 타지
+  // 않게 한다 — 실제 클릭은 거의 항상 이미 검증된 동기 writeText만 쓰게 된다.
+  let promptPrefetchKeyInFlight = null;
   let onlineEnvironmentLogged = false;
   const isAdministratorMode = document.body.classList.contains('administrator-mode');
 
@@ -143,6 +153,22 @@ extension WebUI {
     const errorName = error?.name || error?.constructor?.name || 'Error';
     const errorMessage = error?.message || String(error || '알 수 없는 오류');
     return `${errorName}: ${errorMessage}`;
+  }
+
+  // Safari는 'clipboard-write' 라는 권한 이름 자체를 모른다 — query가 TypeError를
+  // 던지므로 '지원 안 함'과 '명시적으로 거부됨'을 구분해야 한다. 거부됨일 때만
+  // "브라우저 설정에서 허용하라"는, 다시 시도해도 소용없는 실제 원인을 알려줄 수
+  // 있다. 이전에 실패한 클립보드 요청을 사용자가 실수로 "차단"한 적이 있으면 이후
+  // 모든 시도가 사용자 동작 여부와 무관하게 조용히 거부된다 — 타이밍 문제가 아니라
+  // 브라우저가 이 사이트를 기억하고 막아 둔 상태다.
+  async function clipboardWritePermissionState() {
+    if (!navigator.permissions?.query) return 'unsupported';
+    try {
+      const status = await navigator.permissions.query({ name: 'clipboard-write' });
+      return status.state; // 'granted' | 'prompt' | 'denied'
+    } catch {
+      return 'unsupported';
+    }
   }
 
   let toastTimer = null;
@@ -666,6 +692,13 @@ extension WebUI {
   async function fetchPromptBundle(target, showErrors) {
     const cacheKey = summaryRangeCacheKey(target);
     const requestGeneration = ++promptRequestGeneration;
+    // 이 키가 채워진 동안 버튼이 잠긴다. 플래그만 세우고 화면을 다시 그리지 않으면
+    // fetch가 끝날 때까지 버튼은 계속 "활성" 그대로 보이고 실제로도 눌린다 — 잠금이
+    // 이름뿐인 상태가 된다. 여기서 바로 한 번 그려야 클릭이 캐시 미스 구간을 아예
+    // 못 지나가고, 그 결과 클릭 시점에 아직 안 풀린 Promise를 클립보드에 넘기는
+    // 우회 경로를 실전 사용에서 사실상 타지 않게 된다.
+    promptPrefetchKeyInFlight = cacheKey;
+    updateSummaryControls();
     try {
       const response = await post('/api/summary/prompt', promptRequestBody(target));
       if (!response.ok) {
@@ -684,6 +717,9 @@ extension WebUI {
       clientLog('warn', '온라인 프롬프트 준비 실패 — ' + errorDescription(promptFetchError));
       if (showErrors) notice('#sumNotice', 'warn', '프롬프트를 준비하는 동안 서버 연결이 끊겼습니다.');
       return null;
+    } finally {
+      if (promptPrefetchKeyInFlight === cacheKey) promptPrefetchKeyInFlight = null;
+      updateSummaryControls();
     }
   }
 
@@ -733,16 +769,23 @@ extension WebUI {
     container.appendChild(pasteTextarea);
   }
 
-  function showOnlineTransfer(bundle, copiedToClipboard, popupBlocked, clipboardError) {
+  function showOnlineTransfer(bundle, copiedToClipboard, popupBlocked, clipboardError, permissionDenied = false) {
     const onlineStep = $('#onlineStep');
     onlineStep.style.display = '';
+    // 권한이 거부로 기억된 경우와 일시적인 실패를 구분한다 — 전자는 "다시 눌러
+    // 보세요"가 도움이 안 되는 유일한 경우라, 브라우저 설정을 직접 가리켜야 한다.
+    const failureMessage = permissionDenied
+      ? '이 브라우저가 ZoomCaption의 클립보드 쓰기를 차단해 두었습니다. 주소창 왼쪽의 ' +
+        '사이트 정보(자물쇠) 아이콘에서 클립보드 권한을 허용으로 바꾼 뒤 다시 눌러 주세요. ' +
+        '그때까지는 아래 전문이 전체 선택되어 있으니 직접 복사한 뒤 [열기]를 누르세요.'
+      : `자동 복사가 실패했습니다 (${esc(errorDescription(clipboardError))}). ` +
+        '아래 전문이 전체 선택되어 있습니다. 직접 복사한 뒤 [열기]를 누르세요.';
     onlineStep.innerHTML =
       '<div class="onlineStepRow"><span class="onlineStepNumber">1</span><div>' +
       `<strong>${esc(bundle.targetName)}에 프롬프트 전달</strong>` +
       (copiedToClipboard
         ? '프롬프트를 복사했습니다. 열린 탭에서 <kbd>⌘V</kbd> 한 뒤 요약 문서를 .md로 내려받으세요.'
-        : `자동 복사가 실패했습니다 (${esc(errorDescription(clipboardError))}). ` +
-          '아래 전문이 전체 선택되어 있습니다. 직접 복사한 뒤 [열기]를 누르세요.') +
+        : failureMessage) +
       '</div></div>' +
       '<div class="onlineStepRow"><span class="onlineStepNumber">2</span><div>' +
       '<strong>다운로드한 .md를 놓거나, 불러오거나, 붙여넣으세요</strong>' +
@@ -832,10 +875,17 @@ extension WebUI {
     // 만들어 건네줄 뿐이라 로컬 요약이 도는 동안에도 병행할 수 있다. 그 사이 도착한
     // 온라인 결과가 뒤늦게 끝난 로컬 요약에 덮이지 않도록 서버가 로컬 쪽을 취소한다.
     const button = $('#btnSummarize');
-    button.disabled = blocked || (usesLocalModel && (busy || localSummaryUnavailable()));
+    // 프롬프트가 아직 준비되지 않은 동안 버튼을 잠근다 — 그 상태에서 누르면 클립보드
+    // 쓰기가 클릭 도중 동기로 시작되지 못하고, 아직 안 풀린 Promise를 넘기는 우회
+    // 경로를 타야 한다. 그 경로는 브라우저마다 신뢰도가 다르므로(fetchPromptBundle
+    // 주석 참고) 클릭 자체가 그 경로에 들어가지 않게 막는 편이 안전하다.
+    const isPreparingPrompt = !usesLocalModel
+      && promptPrefetchKeyInFlight === summaryRangeCacheKey(target);
+    button.disabled = blocked
+      || (usesLocalModel ? (busy || localSummaryUnavailable()) : isPreparingPrompt);
     button.textContent = usesLocalModel
       ? (busy ? '요약 생성 중…' : (state.summary ? '요약 다시 생성' : '요약 생성'))
-      : '프롬프트 복사하고 열기';
+      : (isPreparingPrompt ? '프롬프트 준비 중…' : '프롬프트 복사하고 열기');
     button.title = running ? '녹음과 Whisper 정리가 끝난 뒤 요약할 수 있습니다.'
                  : stopping ? 'Whisper 정리가 끝난 뒤 요약할 수 있습니다.'
                  : localSummaryUnavailable() ? (state.summarizerNote || 'Ollama와 Qwen 모델이 필요합니다.')
@@ -1543,11 +1593,17 @@ extension WebUI {
       state.onlineJob.unitCount = bundle.unitCount;
 
       if (clipboardError) {
+        // 실패가 확정된 뒤에만 물어야 한다 — 위 두 분기 중 어느 write 호출 앞에도
+        // await가 새로 끼어들면 안 되므로, 권한 상태 확인은 실패를 이미 겪은 다음에
+        // 한다. 이전에 사용자가 이 사이트의 클립보드 요청을 실수로 "차단"했다면
+        // 몇 번을 다시 눌러도 똑같이 조용히 거부되므로, "다시 시도" 대신 브라우저
+        // 설정에서 허용하라는 실제로 도움이 되는 안내로 갈아탄다.
+        const permissionState = await clipboardWritePermissionState();
         console.warn('온라인 프롬프트 클립보드 복사 실패', clipboardError);
-        clientLog('error', '클립보드 복사 실패 — ' + errorDescription(clipboardError));
+        clientLog('error', `클립보드 복사 실패 (권한: ${permissionState}) — ` + errorDescription(clipboardError));
         // 복사가 실패하면 이동하지 않는다. 사용자가 빈 온라인 탭에서 헤매지 않도록
         // 현재 문서에 전문과 두 번째 클릭용 열기 버튼을 먼저 제공한다.
-        showOnlineTransfer(bundle, false, false, clipboardError);
+        showOnlineTransfer(bundle, false, false, clipboardError, permissionState === 'denied');
         return;
       }
 

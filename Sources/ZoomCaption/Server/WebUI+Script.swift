@@ -749,13 +749,7 @@ extension WebUI {
     container.appendChild(openButton);
   }
 
-  function appendOnlineImportInputs(container) {
-    const importButton = document.createElement('button');
-    importButton.className = 'sm';
-    importButton.textContent = '요약 .md 불러오기';
-    importButton.onclick = () => $('#summaryFileInput').click();
-    container.appendChild(importButton);
-
+  function appendOnlinePasteInput(container) {
     const pasteTextarea = document.createElement('textarea');
     pasteTextarea.placeholder = '온라인 LLM이 만든 마크다운을 여기에 붙여넣으세요.';
     pasteTextarea.setAttribute('aria-label', '온라인 요약 붙여넣기');
@@ -808,7 +802,7 @@ extension WebUI {
       appendOnlineOpenButton(firstStepBody, bundle.url);
     }
     const secondStepBody = onlineStep.querySelectorAll('.onlineStepRow > div')[1];
-    appendOnlineImportInputs(secondStepBody);
+    appendOnlinePasteInput(secondStepBody);
   }
 
   async function importOnlineSummary(markdownText) {
@@ -1484,32 +1478,6 @@ extension WebUI {
     document.body.classList.remove('editing');
     stream.querySelectorAll('.pick').forEach(c => c.checked = false);
     syncPicked();
-  };
-  // 시각 없는 전사 파일 왕복. 내보내기는 그냥 내려받기고, 되넣기는 파일 본문을 그대로
-  // 서버에 넘긴다 — 파일 형식을 아는 곳을 TranscriptDocument 한 군데로 유지한다.
-  $('#btnTranscriptFile').onclick = () => { location.href = '/export/transcript.md'; };
-  $('#btnTranscriptImport').onclick = () => $('#transcriptFileInput').click();
-  $('#transcriptFileInput').onchange = async () => {
-    const chosenFile = $('#transcriptFileInput').files?.[0];
-    // 같은 파일을 다시 고쳐 넣어도 change가 또 발생하도록 값을 비운다.
-    $('#transcriptFileInput').value = '';
-    if (!chosenFile) return;
-    try {
-      const markdown = await chosenFile.text();
-      const result = await post('/api/transcript/import', { markdown });
-      if (!result.ok) {
-        $('#editInfo').textContent = result.error || '되넣지 못했습니다.';
-        return;
-      }
-      // 서버가 고친 문장을 화면에 그대로 가져온다. 브라우저가 파일을 해석해 따로
-      // 그리면 저장된 내용과 보이는 내용이 갈릴 수 있다.
-      await resync('전사 문서 되넣기');
-      $('#editInfo').textContent =
-        `${result.lineCount}줄을 읽어 ${result.changed}줄을 고쳤습니다.`
-        + (result.skipped ? ` (${result.skipped}줄은 번호를 찾지 못해 건너뜀)` : '');
-    } catch (importError) {
-      $('#editInfo').textContent = '파일을 읽지 못했습니다 — ' + errorDescription(importError);
-    }
   };
 
   $('#btnDelSel').onclick = async () => {

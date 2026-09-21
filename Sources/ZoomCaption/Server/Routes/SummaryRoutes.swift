@@ -240,25 +240,6 @@ extension ZoomCaptionApp {
     case ("GET", "/export/md"):
       return .response(.download(store.markdown(), filename: "\(fileStem()).md", type: "text/markdown; charset=utf-8"))
 
-    // 시각이 없는 전사 원문. 외부 문장 교정(BERT 등)에 넘겼다가 그대로 되받는 파일이며,
-    // 요약 프롬프트의 녹취 블록과 같은 렌더러를 쓴다 — 고쳐 돌려받은 문장이 곧 요약에
-    // 들어가는 문장이라는 것이 이 공유로 보장된다.
-    case ("GET", "/export/transcript.md"):
-      let transcriptUnits = store.lectureUnits()
-      guard !transcriptUnits.isEmpty else {
-        logWarn("전사 문서 내보내기 거부 — 내보낼 Whisper 문장이 없습니다.")
-        return .response(.json(["ok": false,
-                                "error": "내보낼 Whisper 문장이 아직 없습니다."]))
-      }
-      let transcriptDocument = TranscriptDocument.file(units: transcriptUnits,
-                                                      title: store.title)
-      log("전사 문서 내보내기 — \(transcriptUnits.count)구간, "
-        + "\(transcriptUnits.reduce(0) { $0 + $1.segments.count })줄, "
-        + "\(transcriptDocument.count)자")
-      return .response(.download(transcriptDocument,
-        filename: "\(fileStem())_문장.md",
-        type: "text/markdown; charset=utf-8"))
-
     case ("GET", "/export/prompt.md"):
       let target = PromptTarget(rawValue: req.query["target"] ?? "") ?? .claude
       let fromUnit = req.query["fromUnit"].flatMap(Int.init)

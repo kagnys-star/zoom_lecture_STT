@@ -863,32 +863,6 @@ final class TranscriptStore: @unchecked Sendable {
     }
   }
 
-  /// 밖에서 고쳐져 돌아온 전사 문서의 본문을 Whisper 기록에 되쓴다.
-  ///
-  /// 문장을 **지우지도 만들지도 않는다.** 교정기가 한 줄을 통째로 날려 보내거나
-  /// 모르는 번호를 붙여 보내도 기록이 줄어들면 안 되기 때문이다. 삭제는 화면의 편집
-  /// 기능으로만 한다. 바뀐 줄에는 `edited`를 세워, 오프셋 기반인 `flags`를 그대로
-  /// 믿지 않게 한다(그 필드 주석 참고).
-  func applyTranscriptDocument(_ edits: [TranscriptDocument.Edit])
-    -> (changed: Int, unchanged: Int, skipped: Int) {
-    lock.withLock {
-      var changed = 0, unchanged = 0, skipped = 0
-      for edit in edits {
-        let text = edit.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty,
-              let index = whisperSegments.firstIndex(where: { $0.id == edit.id }) else {
-          skipped += 1
-          continue
-        }
-        if whisperSegments[index].text == text { unchanged += 1; continue }
-        whisperSegments[index].text = text
-        whisperSegments[index].edited = true
-        changed += 1
-      }
-      return (changed, unchanged, skipped)
-    }
-  }
-
   /// 지운 줄이 들고 있던 경계는 바로 앞에 남는 줄이 이어받는다.
   ///
   /// 사용자의 뜻은 "이 문장을 지운다"이지 "두 강의를 합친다"가 아니다. 승계가 없으면

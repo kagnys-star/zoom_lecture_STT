@@ -89,11 +89,9 @@ enum PromptExport {
       throw PromptExportError.emptyTranscript
     }
 
-    // 녹취 본문은 TranscriptDocument 한 곳에서만 만든다. 줄마다 붙던 `[00:12:34] `는
-    // 어떤 판정에도 쓰이지 않으면서 본문의 약 5분의 1을 차지했다(그 근거는 그 파일의
-    // 주석 참고). 대신 구간 머리글에 시각 범위를 한 번씩만 남겨, 모델이 아래 구간
-    // 목록과 본문을 맞출 단서는 오히려 더 분명해진다.
-    let transcriptBody = TranscriptDocument.render(units: units, options: .forPrompt)
+    // 줄마다 붙던 `[00:12:34] ` 대신 구간 머리글에 시각 범위를 한 번씩만 남겨,
+    // 모델이 아래 구간 목록과 본문을 맞추면서 프롬프트 길이는 줄인다.
+    let transcriptBody = TranscriptDocument.render(units: units)
 
     // 현재 호출자는 항상 nil을 보내 원문 전체를 한 번에 전달한다. non-nil 예산은 줄
     // 경계만 사용해 묶어 두므로, 이후 무료 플랜 다중 전송을 붙여도 발화를 자르지 않는다.

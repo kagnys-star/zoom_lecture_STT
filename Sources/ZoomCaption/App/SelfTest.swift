@@ -261,47 +261,6 @@ func runSummaryPipelineChecks() -> Never {
           "옛 값의 화면 라벨은 그대로 유지한다")
   }
 
-  // 밖에서 고쳐져 돌아오는 파일은 번호 하나에 기대 문장을 되찾는다. 번호 규칙이
-  // 조용히 어긋나면 남의 문장을 덮어쓰거나 교정이 통째로 사라지므로 왕복을 고정한다.
-  do {
-    let roundTripUnits = SummaryChunker.makeUnits(from: [
-      input(21, 0, 10, "첫 문장이다", paragraph: 1, boundary: .lectureEnded),
-      input(22, 20, 30, "둘째 문장이다", paragraph: 2),
-    ])
-    let document = TranscriptDocument.file(units: roundTripUnits, title: "왕복 테스트")
-    check(!document.contains("[00:"), "내보낸 전사 문서에는 시각이 없다")
-    check(document.contains("S21 첫 문장이다"), "문장마다 되찾을 번호가 붙는다")
-    check(document.contains("=== 1강 ==="), "편집용 구간 머리글에는 시각을 넣지 않는다")
-
-    let corrected = document.replacingOccurrences(of: "S21 첫 문장이다",
-                                                  with: "S21 첫 문장이었다")
-    let parsed = try? TranscriptDocument.parse(corrected)
-    check(parsed?.lineCount == 2, "고쳐 돌아온 문서에서 두 문장을 모두 읽는다")
-    check(parsed?.edits.first == TranscriptDocument.Edit(id: 21, text: "첫 문장이었다"),
-          "고친 본문이 원래 번호에 그대로 붙는다")
-
-    // 아무 텍스트나 받아 문장을 덮어쓰면 되돌릴 길이 없다. 표식 검사가 유일한 방어선이다.
-    check((try? TranscriptDocument.parse("S21 남의 파일이다")) == nil,
-          "표식이 없는 파일은 되넣기를 거부한다")
-
-    // `S3단계는`처럼 우연히 같은 모양으로 시작하는 발화를 식별자로 읽으면 엉뚱한
-    // 문장을 덮어쓴다. 숫자 뒤 공백까지 봐야 그 사고가 나지 않는다.
-    let lookalike = document.replacingOccurrences(of: "S22 둘째 문장이다",
-                                                  with: "S22 S3단계는 이렇다")
-    let lookalikeParsed = try? TranscriptDocument.parse(lookalike)
-    check(lookalikeParsed?.edits.count == 2,
-          "본문 안의 S로 시작하는 낱말을 문장 번호로 오인하지 않는다")
-
-    // 교정기가 한 줄을 비워 보내도 기록이 줄면 안 된다 — 삭제는 편집 화면에서만 한다.
-    // 비워진 줄은 읽는 단계에서 이미 빠지고, Store도 빈 본문을 한 번 더 건너뛴다.
-    let blanked = try? TranscriptDocument.parse(
-      document.replacingOccurrences(of: "S21 첫 문장이다", with: "S21  "))
-    check(blanked?.edits.contains { $0.id == 21 } == false,
-          "빈 줄로 돌아온 문장은 되쓰기 대상에서 빠진다")
-    check(blanked?.edits.contains { $0.id == 22 } == true,
-          "한 줄이 비워져도 나머지 교정은 그대로 들어온다")
-  }
-
   // 온라인 경로도 별도 경계 계산을 만들지 않고 Chunker 결과를 그대로 써야, 로컬
   // Qwen과 웹 LLM이 같은 녹취를 서로 다른 강의 수로 해석하는 회귀를 막을 수 있다.
   let promptSegments = [

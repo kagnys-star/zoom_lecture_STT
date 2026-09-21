@@ -37,9 +37,6 @@ struct SummaryImportRequest: Decodable {
   var fromUnit: Int?
   var toUnit: Int?
 }
-/// 밖에서 고쳐져 돌아온 전사 문서. 본문 전체를 그대로 받아 서버가 파싱한다 —
-/// 브라우저가 미리 나눠 보내면 파일 형식 규칙이 두 곳에 생긴다.
-struct TranscriptDocumentRequest: Decodable { var markdown: String? }
 struct ClientLogRequest: Decodable { var level: String?; var message: String? }
 struct SaveSummaryRequest: Decodable { var dir: String?; var filename: String? }
 struct ApplyCorrectionsRequest: Decodable {

@@ -177,31 +177,6 @@ extension ZoomCaptionApp {
         return .response(.json(["ok": false, "error": error.localizedDescription]))
       }
 
-    // 밖에서 문장을 고쳐 오는 경로. 화면 편집과 같은 잠금 규칙을 쓴다 — 녹음 중에는
-    // Whisper가 줄을 계속 추가·재배치하므로 파일의 번호가 가리키는 문장이 흔들린다.
-    case ("POST", "/api/transcript/import"):
-      if stateLock.withLock({ running }) {
-        return .response(.json(["ok": false, "error": "녹음 중에는 문장을 되쓸 수 없습니다. 정지한 뒤 넣어 주세요."]))
-      }
-      let documentText = req.json(TranscriptDocumentRequest.self)?.markdown ?? ""
-      do {
-        let parsed = try TranscriptDocument.parse(documentText)
-        let applied = store.applyTranscriptDocument(parsed.edits)
-        autosave()
-        log("전사 문서 되쓰기 — 읽은 줄 \(parsed.lineCount), 수정 \(applied.changed), "
-          + "그대로 \(applied.unchanged), 건너뜀 \(applied.skipped)")
-        return .response(.json([
-          "ok": true,
-          "lineCount": parsed.lineCount,
-          "changed": applied.changed,
-          "unchanged": applied.unchanged,
-          "skipped": applied.skipped,
-        ]))
-      } catch {
-        logWarn("전사 문서 되쓰기 거부 — \(error.localizedDescription) (수신 \(documentText.count)자)")
-        return .response(.json(["ok": false, "error": error.localizedDescription]))
-      }
-
     case ("POST", "/api/segment/delete"):
       if stateLock.withLock({ running }) {
         return .response(.json(["ok": false, "error": "녹음 중에는 편집할 수 없습니다. 정지한 뒤 지워 주세요."]))

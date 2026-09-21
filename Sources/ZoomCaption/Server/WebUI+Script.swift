@@ -1498,25 +1498,53 @@ extension WebUI {
       };
 
       const expectedCacheKey = summaryRangeCacheKey(target);
-      let bundle = state.promptCache?.cacheKey === expectedCacheKey ? state.promptCache : null;
-      if (!bundle) bundle = await fetchPromptBundle(target, true);
+      const cachedBundle = state.promptCache?.cacheKey === expectedCacheKey ? state.promptCache : null;
+      let bundle = cachedBundle;
+      let clipboardError = null;
+      if (cachedBundle) {
+        // 캐시가 있으면 이 호출 전에는 await가 없다. 클릭 제스처와 문서 포커스가
+        // 살아 있는 동안 writeText를 시작해야 Safari/Chrome의 권한 판정을 통과한다.
+        try {
+          if (!navigator.clipboard?.writeText) {
+            throw new Error('Clipboard.writeText를 지원하지 않는 브라우저입니다.');
+          }
+          await navigator.clipboard.writeText(cachedBundle.text);
+        } catch (copyError) {
+          clipboardError = copyError;
+        }
+      } else {
+        // 캐시가 없으면 프롬프트를 새로 받아와야 한다. 그 fetch를 먼저 기다린(await) 뒤
+        // writeText를 부르면 클릭이 만든 제스처가 이미 끊겨 있어 Safari에서 거의 항상
+        // NotAllowedError가 난다 — 권한 판정은 "지금 이 클릭 처리 중"인지만 보고, 그
+        // 사이에 낀 네트워크 왕복 하나로도 끊긴다.
+        //
+        // Clipboard.write에는 아직 안 풀린 Promise를 값으로 넘길 수 있다. 호출 자체는
+        // 클릭 도중 동기로 시작되어 제스처를 그대로 인정받고, 실제 데이터는 fetch가
+        // 끝난 뒤 채워져도 된다(Safari 13.1+, Chrome 104+). 그래서 fetch를 기다리지
+        // 않고 그 Promise를 바로 넘긴다.
+        const bundlePromise = fetchPromptBundle(target, true);
+        try {
+          if (!navigator.clipboard?.write || typeof ClipboardItem === 'undefined') {
+            throw new Error('이 브라우저는 비동기 클립보드 쓰기를 지원하지 않습니다.');
+          }
+          await navigator.clipboard.write([new ClipboardItem({
+            'text/plain': bundlePromise.then(fetchedBundle => {
+              if (!fetchedBundle) throw new Error('프롬프트를 만들지 못했습니다.');
+              return new Blob([fetchedBundle.text], { type: 'text/plain' });
+            }),
+          })]);
+        } catch (copyError) {
+          clipboardError = copyError;
+        }
+        bundle = await bundlePromise;
+      }
       if (!bundle) return;
       state.onlineJob.targetName = bundle.targetName;
       state.onlineJob.unitCount = bundle.unitCount;
 
-      let clipboardError = null;
-      try {
-        if (!navigator.clipboard?.writeText) {
-          throw new Error('Clipboard.writeText를 지원하지 않는 브라우저입니다.');
-        }
-        // 캐시가 있으면 이 호출 전에는 await가 없다. 클릭 제스처와 문서 포커스가
-        // 살아 있는 동안 writeText를 시작해야 Safari/Chrome의 권한 판정을 통과한다.
-        const clipboardWrite = navigator.clipboard.writeText(bundle.text);
-        await clipboardWrite;
-      } catch (copyError) {
-        clipboardError = copyError;
-        console.warn('온라인 프롬프트 클립보드 복사 실패', copyError);
-        clientLog('error', '클립보드 복사 실패 — ' + errorDescription(copyError));
+      if (clipboardError) {
+        console.warn('온라인 프롬프트 클립보드 복사 실패', clipboardError);
+        clientLog('error', '클립보드 복사 실패 — ' + errorDescription(clipboardError));
         // 복사가 실패하면 이동하지 않는다. 사용자가 빈 온라인 탭에서 헤매지 않도록
         // 현재 문서에 전문과 두 번째 클릭용 열기 버튼을 먼저 제공한다.
         showOnlineTransfer(bundle, false, false, clipboardError);
@@ -2548,6 +2576,11 @@ extension WebUI {
       panel.hidden = panel.id !== 'view-' + target;
     });
     document.body.classList.toggle('summary-view', target === 'summary');
+    // 요약 화면을 열 때 미리 데워 둔다. 클립보드 쓰기는 캐시가 있어야 클릭과 같은
+    // 틱에서 동기로 시작할 수 있고(Safari 권한 판정 조건), 그렇지 않아도 비동기
+    // 경로가 대신하지만 사용자가 대상을 고르고 버튼을 누르기까지의 시간을 그냥
+    // 흘려보내지 않고 쓰는 편이 그 경로를 덜 타게 한다.
+    if (target === 'summary') prefetchPromptForSelection();
   }
 
   const workspaceTabs = [...document.querySelectorAll('.workspaceTab')];

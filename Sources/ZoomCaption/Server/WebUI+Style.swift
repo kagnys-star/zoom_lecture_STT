@@ -24,7 +24,7 @@ extension WebUI {
     --shadow-sm: 0 1px 2px color-mix(in srgb, var(--ink) 8%, transparent);
     --shadow-md: 0 12px 32px color-mix(in srgb, var(--ink) 10%, transparent);
     --radius-sm: 9px; --radius-md: 13px; --radius-lg: 18px;
-    --cap: 22px;
+    --cap: 16px; --caption-line-height: 1.55; --caption-row-padding: 7px;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -241,9 +241,12 @@ extension WebUI {
     display: flex; align-items: center; justify-content: center;
     background: var(--panel); border: none;
     border-left: 1px solid var(--line); border-right: 1px solid var(--line); border-radius: 0;
-    color: var(--muted); font-size: 15px; padding: 0; cursor: pointer; box-shadow: none;
+    color: var(--muted); font-size: 13px; padding: 0; cursor: pointer; box-shadow: none;
   }
   #sideToggle:hover { background: var(--bg); color: var(--ink); }
+  /* 세로 레일은 일반 버튼처럼 눌릴 때 이동하면 가장자리 포인터가 버튼 밖으로
+     벗어나 click이 취소될 수 있다. 레일은 위치를 고정해 눌림과 토글을 분리한다. */
+  #sideToggle:active:not(:disabled) { transform: none; }
 
   /* ── 자막 ── */
   section.captions { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
@@ -285,10 +288,10 @@ extension WebUI {
   .editbar .grow { flex: 1; color: var(--accent); font-weight: 600; }
 
   /* 확정된 자막만 여기 쌓인다. 아래 #live 와 영역이 겹치지 않게 스크롤을 따로 가진다. */
-  #stream { flex: 1; overflow-y: auto; padding: 20px clamp(14px, 2.4vw, 30px) 26px; min-height: 0; }
+  #stream { flex: 1; overflow-y: auto; padding: 16px clamp(8px, 1.3vw, 18px) 22px; min-height: 0; }
   .line {
-    display: grid; grid-template-columns: 22px 66px minmax(0,1fr) 30px; gap: 10px;
-    width: min(1120px, 100%); margin-inline: auto; padding: 9px 12px;
+    display: grid; grid-template-columns: 18px 52px minmax(0,1fr) 26px 26px; gap: 6px;
+    width: min(1440px, 100%); margin-inline: auto; padding: var(--caption-row-padding) 6px;
     border-radius: 12px; align-items: baseline;
   }
   .line:hover { background: var(--panel); box-shadow: inset 0 0 0 1px var(--line); }
@@ -304,8 +307,8 @@ extension WebUI {
      grid 열은 그대로 남겨 텍스트 시작 위치는 흔들리지 않는다. */
   .line.paracont .ts { visibility: hidden; }
 
-  .line .pick, .line .del { visibility: hidden; }
-  body.editing .line .pick, body.editing .line .del { visibility: visible; }
+  .line .pick, .line .del, .line .bnd { visibility: hidden; }
+  body.editing .line .pick, body.editing .line .del, body.editing .line .bnd { visibility: visible; }
   .pick { accent-color: var(--danger); margin: 0; align-self: center; }
   .del {
     border: none; background: transparent; color: var(--muted); font-size: 15px;
@@ -313,10 +316,19 @@ extension WebUI {
   }
   .del:hover { background: var(--danger-soft); color: var(--danger); }
 
+  /* 강의 종료 토글. 이미 붙어 있는 줄은 눌린 상태로 보여야 무엇을 지우는 버튼인지 안다. */
+  .bnd {
+    border: none; background: transparent; color: var(--muted); font-size: 13px;
+    min-height: 30px; padding: 2px 6px; border-radius: 6px; line-height: 1; box-shadow: none;
+  }
+  .bnd:hover { background: var(--accent-soft); color: var(--accent); }
+  .bnd[aria-pressed="true"] { color: var(--accent); }
+  .bnd:disabled { opacity: .5; }
+
   .ts { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; padding-top: 4px;
         cursor: pointer; border-radius: 5px; }
   .ts:hover { color: var(--accent); background: var(--accent-soft); }
-  .txt { font-size: var(--cap); line-height: 1.62; word-break: keep-all; overflow-wrap: anywhere;
+  .txt { font-size: var(--cap); line-height: var(--caption-line-height); word-break: keep-all; overflow-wrap: anywhere;
          border-radius: 7px; padding: 2px 5px; margin: -2px -5px; }
   body.editing .txt { cursor: text; }
   body.editing .txt:hover { background: var(--bg); box-shadow: inset 0 0 0 1px var(--line); }
@@ -377,10 +389,10 @@ extension WebUI {
              padding: 2px 8px; border-radius: 999px; }
   .paneTag.main { background: var(--accent-soft); color: var(--accent); }
   .paneTag.fast { background: var(--me-soft); color: var(--me); }
-  #fastStream { flex: 1 1 auto; overflow-y: auto; padding: 8px clamp(14px, 2.4vw, 30px) 10px; min-height: 0; }
-  #fastStream .fline { display: grid; grid-template-columns: 62px minmax(0,1fr); gap: 10px;
-                       width: min(1080px, 100%); margin-inline: auto; padding: 4px 0;
-                       font-size: 14px; line-height: 1.5; color: var(--muted); }
+  #fastStream { flex: 1 1 auto; overflow-y: auto; padding: 8px clamp(8px, 1.3vw, 18px) 10px; min-height: 0; }
+  #fastStream .fline { display: grid; grid-template-columns: 52px minmax(0,1fr); gap: 6px;
+                       width: min(1440px, 100%); margin-inline: auto; padding: 4px 0;
+                       font-size: var(--cap); line-height: var(--caption-line-height); color: var(--muted); }
   #fastStream .fline .t { font-size: 11.5px; font-variant-numeric: tabular-nums; padding-top: 3px; }
   #fastStream .fline:last-child { color: var(--ink); }
   /* Whisper 문장이 하나도 없을 때는 실시간 확정 기록이 정식 기록이므로, 같은 표식을
@@ -394,15 +406,15 @@ extension WebUI {
      받아쓰는 내내 화면이 덜컹거린다. 넘치는 글은 이 칸 안에서 스크롤시킨다. */
   #live {
     flex: 0 0 auto; display: flex; gap: 10px; align-items: flex-start;
-    padding: 12px clamp(14px, 2.4vw, 30px) 14px; border-top: 1px solid var(--line); background: var(--panel-raised);
-    font-size: var(--cap); height: calc(1.6em * 3 + 24px); overflow-y: auto;
+    padding: 12px clamp(8px, 1.3vw, 18px) 14px; border-top: 1px solid var(--line); background: var(--panel-raised);
+    font-size: var(--cap); line-height: var(--caption-line-height); height: calc(var(--caption-line-height) * 3em + 24px); overflow-y: auto;
   }
   #live[hidden] { display: none; }
   #live .liveTag {
     flex: 0 0 auto; margin-top: 3px; font-size: 11.5px; font-weight: 700; letter-spacing: .02em;
     padding: 2px 8px; border-radius: 999px; background: var(--warn-soft); color: var(--warn);
   }
-  #liveText { line-height: 1.6; color: var(--muted);
+  #liveText { line-height: var(--caption-line-height); color: var(--muted);
               font-style: italic; word-break: keep-all; overflow-wrap: anywhere; }
   #liveText:empty::before { content: "듣는 중…"; opacity: .5; }
   /* 커서는 글 끝에 붙어야 한다. 별도 요소로 두면 flex 가 오른쪽 끝으로 밀어낸다. */
@@ -772,7 +784,7 @@ extension WebUI {
     #summary h3 { font-size: 18px; }
     .toolbar { gap: 8px; }
     #search { flex-basis: calc(100% - 70px); }
-    .line { grid-template-columns: 20px 54px minmax(0,1fr) 30px; gap: 7px; padding-inline: 6px; }
+    .line { grid-template-columns: 18px 48px minmax(0,1fr) 26px 26px; gap: 5px; padding-inline: 4px; }
     .ts { font-size: 11px; }
     .paneNote { display: none; }
     #live { flex-direction: column; gap: 6px; }

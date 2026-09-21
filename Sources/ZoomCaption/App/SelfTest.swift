@@ -67,7 +67,7 @@ func runWebUIContractChecks() -> Never {
   check(!markup.contains("data-tab=\"sum\"") && !markup.contains("id=\"panel-sum\""),
         "요약이 사이드 탭에 남아 있지 않는다")
   if let summary = markup.range(of: "id=\"view-summary\""),
-     let aside = markup.range(of: "<aside>") {
+     let aside = markup.range(of: "<aside") {
     check(summary.lowerBound < aside.lowerBound, "요약 화면이 보조 사이드바 밖에 있다")
   } else {
     check(false, "요약 화면과 사이드바 위치를 찾을 수 있다")
@@ -115,9 +115,11 @@ func runSummaryPipelineChecks() -> Never {
   ])
   check(paragraphsOnly.count == 1, "paragraph 변화만으로 상위 강의가 나뉘지 않는다")
 
+  // 녹취 줄에서 시각을 뺀 뒤로는 본문만으로 어느 세그먼트인지 알아볼 수 있어야 하므로
+  // 길이는 같게 두고 끝에 고유 표식을 붙인다.
   let longSegments = (1...8).map { index in
     input(index, Double(index * 10), Double(index * 10 + 5),
-          String(repeating: "가", count: 30), paragraph: (index - 1) / 2)
+          String(repeating: "가", count: 28) + "표식\(index)", paragraph: (index - 1) / 2)
   }
   let longUnit = SummaryChunker.makeUnits(from: longSegments)[0]
   let chunks = SummaryChunker.makeChunks(for: longUnit, tokenBudget: 120, tokensPerCharacter: 1)
@@ -126,9 +128,10 @@ func runSummaryPipelineChecks() -> Never {
     chunk.partIndex == offset + 1 && chunk.partCount == chunks.count
   }, "내부 청크 번호와 전체 개수가 일관된다")
   check((1...8).allSatisfy { index in
-    let stamp = "[\(TranscriptStore.clock(Double(index * 10)))]"
-    return chunks.filter { $0.transcript.contains(stamp) }.count == 1
+    chunks.filter { $0.transcript.contains("표식\(index)") }.count == 1
   }, "내부 청킹이 입력 세그먼트를 누락하거나 중복하지 않는다")
+  check(chunks.allSatisfy { !$0.transcript.contains("[00:") },
+        "로컬 요약 조각에도 줄머리 시각이 들어가지 않는다")
 
   let terms = SummaryRenderer.deduplicateTerms([
     .init(term: "L1 정규화", meaning: "가중치의 절댓값 합을 손실에 더해 과적합을 줄이는 방법"),
@@ -169,6 +172,136 @@ func runSummaryPipelineChecks() -> Never {
     check(lateTask.isCancelled, "attach 전에 들어온 취소를 잃지 않는다")
   }
 
+  // 강의 종료는 이제 세 경로(180초 무음·정지 버튼·편집 화면)가 만든다. 세 경로가
+  // 같은 길이를 쓰는지, 연달아 눌러도 3분 안에 구간이 여러 개 생기지 않는지 고정한다.
+  do {
+    let minimum = TranscriptStore.minimumLectureUnitSeconds
+    check(minimum == 180, "최소 구간 길이가 180초 무음 기준과 같은 값이다")
+    check(!TranscriptStore.shouldCloseUnitOnStop(lastContentEnd: minimum - 1,
+                                                 openSpanReferencePoint: 0),
+          "직전 경계 이후 180초가 안 되면 정지해도 구간을 닫지 않는다")
+    check(TranscriptStore.shouldCloseUnitOnStop(lastContentEnd: minimum,
+                                                openSpanReferencePoint: 0),
+          "180초를 채운 열린 구간은 정지로 닫힌다")
+    check(!TranscriptStore.shouldCloseUnitOnStop(lastContentEnd: 3_600,
+                                                 openSpanReferencePoint: 3_580),
+          "방금 무음으로 닫힌 직후의 정지는 경계를 겹쳐 붙이지 않는다")
+
+    func whisperLine(_ id: Int, _ start: Double, _ end: Double,
+                     boundary: TranscriptBoundary? = nil) -> Segment {
+      Segment(id: id, track: .lecture, start: start, end: end, text: "문장 \(id)",
+              paragraph: id - 1_000_000, boundaryAfter: boundary)
+    }
+    func loadedStore(_ whisper: [Segment]) -> TranscriptStore {
+      let store = TranscriptStore()
+      store.adopt(SessionFile(title: "경계 편집", createdAt: Date(), updatedAt: Date(),
+                              segments: [], nextID: 1, summary: nil, summaryEngineNote: nil,
+                              domainTerms: [], domainSource: nil, duration: 1_000,
+                              lastSummarizedAt: nil, whisperSegments: whisper, whisperAt: nil,
+                              summaryFiles: nil, reference: nil, preCorrection: nil,
+                              audioRetentionStatus: nil),
+                  dir: URL(fileURLWithPath: NSTemporaryDirectory()))
+      return store
+    }
+
+    let lines = [
+      whisperLine(1_000_001, 0, 10),
+      whisperLine(1_000_002, 100, 110),
+      whisperLine(1_000_003, 200, 210),
+      whisperLine(1_000_004, 400, 410),
+      // 마지막 문장은 1_000_004 뒤로 180초가 안 남도록 둔다 — 뒤쪽 간격 규칙과
+      // 마지막 문장 예외를 한 고정물로 같이 확인하기 위해서다.
+      whisperLine(1_000_005, 500, 510),
+    ]
+
+    let editStore = loadedStore(lines)
+    check(editStore.lectureUnits().count == 1, "경계가 없으면 전체가 한 구간이다")
+    var rejectedNearPrevious = false
+    do { _ = try editStore.setWhisperSegmentBoundary(id: 1_000_002, boundary: .lectureEnded) }
+    catch { rejectedNearPrevious = true }
+    check(rejectedNearPrevious, "직전 경계에서 180초가 안 된 문장에는 손으로도 붙지 않는다")
+
+    let applied = try? editStore.setWhisperSegmentBoundary(id: 1_000_003, boundary: .lectureEnded)
+    check(applied != nil, "180초를 넘긴 문장에는 손으로 경계를 붙일 수 있다")
+    check(editStore.lectureUnits().count == 2, "손으로 붙인 경계가 요약 구간을 실제로 나눈다")
+    check((try? editStore.setWhisperSegmentBoundary(id: 1_000_003,
+                                                    boundary: .lectureEnded)) ?? nil == nil,
+          "같은 값을 다시 눌러도 변경으로 보고하지 않는다")
+
+    var rejectedNearNext = false
+    do { _ = try editStore.setWhisperSegmentBoundary(id: 1_000_004, boundary: .lectureEnded) }
+    catch { rejectedNearNext = true }
+    check(rejectedNearNext, "뒤에 180초가 안 남는 자리에는 붙지 않는다")
+    check((try? editStore.setWhisperSegmentBoundary(id: 1_000_005,
+                                                    boundary: .lectureEnded)) ?? nil != nil,
+          "마지막 문장은 뒤에 새 구간이 생기지 않으므로 닫을 수 있다")
+
+    // 떼는 것은 언제나 된다. 아니면 잘못 생긴 경계 하나로 사용자가 갇힌다.
+    let stuckStore = loadedStore([
+      whisperLine(1_000_001, 0, 10, boundary: .lectureEnded),
+      whisperLine(1_000_002, 20, 30),
+    ])
+    check((try? stuckStore.setWhisperSegmentBoundary(id: 1_000_001, boundary: nil)) ?? nil != nil,
+          "간격이 모자라는 자리라도 경계를 떼는 것은 언제나 허용한다")
+    check(stuckStore.lectureUnits().count == 1, "경계를 떼면 두 구간이 다시 하나가 된다")
+
+    // 경계가 붙은 줄을 지우는 것은 "이 문장을 지운다"이지 "강의를 합친다"가 아니다.
+    let deleteStore = loadedStore([
+      whisperLine(1_000_001, 0, 10),
+      whisperLine(1_000_002, 100, 110, boundary: .lectureEnded),
+      whisperLine(1_000_003, 200, 210),
+    ])
+    check(deleteStore.deleteWhisperSegments(ids: [1_000_002]) == 1, "경계가 붙은 줄도 지워진다")
+    check(deleteStore.lectureUnits().count == 2, "지운 줄의 경계를 앞 줄이 이어받아 구간이 합쳐지지 않는다")
+
+    // 옛 세션에는 정지 경계가 recordingStopped로 남아 있다. 새로 쓰지 않을 뿐 계속 읽는다.
+    let legacy = loadedStore([whisperLine(1_000_001, 0, 10, boundary: .recordingStopped)])
+    check(legacy.lectureUnits().count == 1, "옛 recordingStopped 값도 구간 경계로 읽힌다")
+    check(TranscriptStore.markdownLabel(for: .recordingStopped) == "녹음 종료",
+          "옛 값의 화면 라벨은 그대로 유지한다")
+  }
+
+  // 밖에서 고쳐져 돌아오는 파일은 번호 하나에 기대 문장을 되찾는다. 번호 규칙이
+  // 조용히 어긋나면 남의 문장을 덮어쓰거나 교정이 통째로 사라지므로 왕복을 고정한다.
+  do {
+    let roundTripUnits = SummaryChunker.makeUnits(from: [
+      input(21, 0, 10, "첫 문장이다", paragraph: 1, boundary: .lectureEnded),
+      input(22, 20, 30, "둘째 문장이다", paragraph: 2),
+    ])
+    let document = TranscriptDocument.file(units: roundTripUnits, title: "왕복 테스트")
+    check(!document.contains("[00:"), "내보낸 전사 문서에는 시각이 없다")
+    check(document.contains("S21 첫 문장이다"), "문장마다 되찾을 번호가 붙는다")
+    check(document.contains("=== 1강 ==="), "편집용 구간 머리글에는 시각을 넣지 않는다")
+
+    let corrected = document.replacingOccurrences(of: "S21 첫 문장이다",
+                                                  with: "S21 첫 문장이었다")
+    let parsed = try? TranscriptDocument.parse(corrected)
+    check(parsed?.lineCount == 2, "고쳐 돌아온 문서에서 두 문장을 모두 읽는다")
+    check(parsed?.edits.first == TranscriptDocument.Edit(id: 21, text: "첫 문장이었다"),
+          "고친 본문이 원래 번호에 그대로 붙는다")
+
+    // 아무 텍스트나 받아 문장을 덮어쓰면 되돌릴 길이 없다. 표식 검사가 유일한 방어선이다.
+    check((try? TranscriptDocument.parse("S21 남의 파일이다")) == nil,
+          "표식이 없는 파일은 되넣기를 거부한다")
+
+    // `S3단계는`처럼 우연히 같은 모양으로 시작하는 발화를 식별자로 읽으면 엉뚱한
+    // 문장을 덮어쓴다. 숫자 뒤 공백까지 봐야 그 사고가 나지 않는다.
+    let lookalike = document.replacingOccurrences(of: "S22 둘째 문장이다",
+                                                  with: "S22 S3단계는 이렇다")
+    let lookalikeParsed = try? TranscriptDocument.parse(lookalike)
+    check(lookalikeParsed?.edits.count == 2,
+          "본문 안의 S로 시작하는 낱말을 문장 번호로 오인하지 않는다")
+
+    // 교정기가 한 줄을 비워 보내도 기록이 줄면 안 된다 — 삭제는 편집 화면에서만 한다.
+    // 비워진 줄은 읽는 단계에서 이미 빠지고, Store도 빈 본문을 한 번 더 건너뛴다.
+    let blanked = try? TranscriptDocument.parse(
+      document.replacingOccurrences(of: "S21 첫 문장이다", with: "S21  "))
+    check(blanked?.edits.contains { $0.id == 21 } == false,
+          "빈 줄로 돌아온 문장은 되쓰기 대상에서 빠진다")
+    check(blanked?.edits.contains { $0.id == 22 } == true,
+          "한 줄이 비워져도 나머지 교정은 그대로 들어온다")
+  }
+
   // 온라인 경로도 별도 경계 계산을 만들지 않고 Chunker 결과를 그대로 써야, 로컬
   // Qwen과 웹 LLM이 같은 녹취를 서로 다른 강의 수로 해석하는 회귀를 막을 수 있다.
   let promptSegments = [
@@ -183,6 +316,17 @@ func runSummaryPipelineChecks() -> Never {
     check(bundle.unitCount == 3, "온라인 프롬프트가 두 경계와 마지막 꼬리를 세 구간으로 보존한다")
     check(bundle.text.contains("> **강의 종료**") && bundle.text.contains("> **녹음 종료**"),
           "온라인 프롬프트에 두 구조화 경계 라벨이 모두 들어간다")
+
+    // 줄머리 시각은 어떤 판정에도 쓰이지 않으면서 본문의 5분의 1을 먹었다. 다시
+    // 들어오면 조용히 프롬프트만 길어지므로 발화 줄에 시각이 없음을 고정한다.
+    let transcriptBody = bundle.text
+      .components(separatedBy: "<transcript>").last?
+      .components(separatedBy: "</transcript>").first ?? ""
+    check(!transcriptBody.contains("[00:"), "프롬프트 녹취 본문에 줄머리 시각이 없다")
+    check(transcriptBody.contains("=== 1강 · 00:00:00~00:00:12 ==="),
+          "구간 머리글이 시각 범위를 한 번씩만 들고 있다")
+    check(promptSegments.allSatisfy { transcriptBody.contains($0.text) },
+          "시각을 빼도 발화 본문은 하나도 잃지 않는다")
     let expectedRanges = promptUnits.map {
       "- \($0.id)강: \(TranscriptStore.clock($0.start))~\(TranscriptStore.clock($0.end))"
     }

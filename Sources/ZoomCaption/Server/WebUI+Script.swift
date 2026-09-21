@@ -82,7 +82,9 @@ extension WebUI {
   // 자막 크기는 사용자가 의미를 알기 어려운 15~34 연속 숫자가 아니라, 반복해서
   // 같은 결과를 얻을 수 있는 세 가지 읽기 단계로만 제공한다. 픽셀 값은 이 한곳에
   // 모아 CSS와 저장값이 서로 다른 크기를 가리키지 않게 한다.
-  const captionSizePixelsByPreference = Object.freeze({ small: 18, medium: 22, large: 26 });
+  const captionSizePixelsByPreference = Object.freeze({ small: 12, medium: 16, large: 20 });
+  const captionLineHeightByPreference = Object.freeze({ small: 1.4, medium: 1.55, large: 1.7 });
+  const captionRowPaddingByPreference = Object.freeze({ small: '4px', medium: '7px', large: '10px' });
   const captionSizeStorageKey = 'zoomcaption.captionSize';
   const originalAudioRetentionStorageKey = 'zoomcaption.retainOriginalAudio';
 
@@ -102,6 +104,14 @@ extension WebUI {
     // 없는 미래 값도 잘못 표시하는 대신 안전하게 기존 표식을 제거할 수 있다.
     const boundaryLabels = { lectureEnded: '강의 종료', recordingStopped: '녹음 종료' };
     const boundaryLabel = boundaryLabels[boundaryAfter];
+    // 편집 버튼의 눌림 상태도 여기서 맞춘다. 자동 경계·SSE·재동기화가 모두 이 함수를
+    // 거치므로, 어느 경로로 값이 바뀌어도 버튼과 표식이 갈리지 않는다.
+    const boundaryButton = lineElement.querySelector('.bnd');
+    if (boundaryButton) {
+      boundaryButton.setAttribute('aria-pressed', boundaryLabel ? 'true' : 'false');
+      boundaryButton.title = boundaryLabel
+        ? '이 줄의 강의 종료 표시를 지웁니다' : '여기서 강의가 끝났다고 표시합니다';
+    }
     if (!boundaryLabel) {
       delete lineElement.dataset.boundaryAfter;
       if (marker) marker.remove();
@@ -340,6 +350,7 @@ extension WebUI {
       `<input type="checkbox" class="pick">` +
       `<span class="ts">${clock(seg.start)}</span>` +
       `<span class="txt">${esc(seg.text)}</span>` +
+      `<button class="bnd" aria-pressed="false" title="여기서 강의가 끝났다고 표시합니다">⏹</button>` +
       `<button class="del" title="이 줄 삭제">✕</button>`;
     setLectureBoundaryMarker(el, seg.boundaryAfter);
 
@@ -395,6 +406,33 @@ extension WebUI {
       el.classList.add('wasEdited');
       txt.innerHTML = esc(next);
       applyFilter();
+    });
+
+    // 강의 종료 토글. 이 표식이 곧 요약 구간이라, 사용자가 요약을 어디서 끊을지
+    // 직접 정하는 자리다. 응답이 올 때까지 버튼을 잠가 연타가 요청을 겹쳐 보내지
+    // 못하게 하고, 거부 사유(무음과 같은 180초 간격 규칙)는 편집 바에 그대로 보여 준다.
+    const boundaryButton = el.querySelector('.bnd');
+    boundaryButton.addEventListener('click', async () => {
+      boundaryButton.disabled = true;
+      try {
+        const hadBoundary = !!el.dataset.boundaryAfter;
+        const response = await post('/api/segment/boundary',
+          { id, boundary: hadBoundary ? '' : 'lectureEnded', list: 'whisper' });
+        if (!response.ok) {
+          $('#editInfo').textContent = response.error || '강의 종료를 바꾸지 못했습니다.';
+          return;
+        }
+        setLectureBoundaryMarker(el, response.boundaryAfter);
+        await loadSummaryUnits();
+        // 경계가 하나 바뀌면 그 뒤 구간 번호가 통째로 밀린다. 이미 저장해 둔 요약의
+        // "3강"과 지금의 "3강"이 다를 수 있다는 사실은 반드시 눈에 보여야 한다.
+        const unitCountNote = `구간이 ${response.unitCount}개가 되었습니다 — `
+          + '이미 저장한 요약의 강 번호와 다를 수 있습니다.';
+        $('#editInfo').textContent = unitCountNote;
+        notice('#sumNotice', 'warn', esc(unitCountNote));
+      } finally {
+        boundaryButton.disabled = false;
+      }
     });
 
     el.querySelector('.del').addEventListener('click', async () => {
@@ -1397,6 +1435,33 @@ extension WebUI {
     stream.querySelectorAll('.pick').forEach(c => c.checked = false);
     syncPicked();
   };
+  // 시각 없는 전사 파일 왕복. 내보내기는 그냥 내려받기고, 되넣기는 파일 본문을 그대로
+  // 서버에 넘긴다 — 파일 형식을 아는 곳을 TranscriptDocument 한 군데로 유지한다.
+  $('#btnTranscriptFile').onclick = () => { location.href = '/export/transcript.md'; };
+  $('#btnTranscriptImport').onclick = () => $('#transcriptFileInput').click();
+  $('#transcriptFileInput').onchange = async () => {
+    const chosenFile = $('#transcriptFileInput').files?.[0];
+    // 같은 파일을 다시 고쳐 넣어도 change가 또 발생하도록 값을 비운다.
+    $('#transcriptFileInput').value = '';
+    if (!chosenFile) return;
+    try {
+      const markdown = await chosenFile.text();
+      const result = await post('/api/transcript/import', { markdown });
+      if (!result.ok) {
+        $('#editInfo').textContent = result.error || '되넣지 못했습니다.';
+        return;
+      }
+      // 서버가 고친 문장을 화면에 그대로 가져온다. 브라우저가 파일을 해석해 따로
+      // 그리면 저장된 내용과 보이는 내용이 갈릴 수 있다.
+      await resync('전사 문서 되넣기');
+      $('#editInfo').textContent =
+        `${result.lineCount}줄을 읽어 ${result.changed}줄을 고쳤습니다.`
+        + (result.skipped ? ` (${result.skipped}줄은 번호를 찾지 못해 건너뜀)` : '');
+    } catch (importError) {
+      $('#editInfo').textContent = '파일을 읽지 못했습니다 — ' + errorDescription(importError);
+    }
+  };
+
   $('#btnDelSel').onclick = async () => {
     const ids = [...stream.querySelectorAll('.line')]
       .filter(el => el.querySelector('.pick').checked).map(el => +el.dataset.id);
@@ -2427,6 +2492,10 @@ extension WebUI {
       ? requestedPreference : 'medium';
     document.documentElement.style.setProperty(
       '--cap', captionSizePixelsByPreference[normalizedPreference] + 'px');
+    document.documentElement.style.setProperty(
+      '--caption-line-height', captionLineHeightByPreference[normalizedPreference]);
+    document.documentElement.style.setProperty(
+      '--caption-row-padding', captionRowPaddingByPreference[normalizedPreference]);
     document.querySelectorAll('[data-caption-size]').forEach(captionSizeButton => {
       captionSizeButton.setAttribute(
         'aria-pressed', captionSizeButton.dataset.captionSize === normalizedPreference ? 'true' : 'false');

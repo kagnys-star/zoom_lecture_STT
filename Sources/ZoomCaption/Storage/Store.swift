@@ -85,6 +85,27 @@ struct Segment: Codable, Sendable, Identifiable {
 /// 기록 경계가 어느 기록에 붙었는지 호출부에 알려 주는 결과다. Whisper가 이번 녹음
 /// 구간에 한 줄이라도 있으면 정식 기록인 Whisper를 선택하고, 없을 때만 실시간 확정
 /// 기록으로 폴백해, 경계 이유가 늘어나도 숫자 ID 범위로 목록을 추측하지 않게 한다.
+/// 손으로 경계를 붙일 수 없는 이유. 사용자가 그대로 읽을 문장이라 남은 시간을 같이 든다.
+enum BoundaryEditError: LocalizedError {
+  case unknownSegment
+  case tooCloseToPrevious(Double)
+  case tooCloseToNext(Double)
+
+  var errorDescription: String? {
+    let minimum = Int(TranscriptStore.minimumLectureUnitSeconds)
+    switch self {
+    case .unknownSegment:
+      return "그 문장을 찾지 못했습니다. 화면을 새로 고친 뒤 다시 해 주세요."
+    case .tooCloseToPrevious(let seconds):
+      return "직전 강의 종료에서 \(Int(seconds))초밖에 지나지 않았습니다. "
+        + "\(minimum)초 이상 지난 문장에만 붙일 수 있습니다."
+    case .tooCloseToNext(let seconds):
+      return "뒤에 \(Int(seconds))초밖에 남지 않아 너무 짧은 구간이 생깁니다. "
+        + "다음 종료까지 \(minimum)초 이상 남은 문장에만 붙일 수 있습니다."
+    }
+  }
+}
+
 struct TranscriptBoundaryUpdate: Sendable {
   enum Collection: String, Sendable {
     case live
@@ -150,6 +171,16 @@ struct Reference: Codable, Sendable {
 
 /// 세션 전체 상태. 웹 UI와 파일 저장이 모두 여기서 읽는다.
 final class TranscriptStore: @unchecked Sendable {
+  /// 하나의 강의 단위가 되려면 직전 경계 이후 최소한 이만큼은 말이 있어야 한다.
+  ///
+  /// 이 값 하나를 세 경로가 함께 쓴다 — 180초 무음 판정, 정지 버튼의 경계, 편집
+  /// 화면에서 손으로 붙이는 경계. 예전에는 무음이 180초, 정지가 600초로 서로를
+  /// 모르는 숫자였고, 그래서 "한 시간 강의를 듣고 정지했는데 아무 표시가 없다"와
+  /// "짧은 시험 녹음이 한 강의가 된다"가 같은 코드에서 동시에 났다. 한 곳에 두면
+  /// 기준을 바꿀 때 세 경로가 같이 움직이고, 연달아 눌리는 종료를 막는 방어의
+  /// 길이도 무음 판정과 정확히 같다는 것이 구조로 보장된다.
+  static let minimumLectureUnitSeconds: TimeInterval = 180
+
   private let lock = NSLock()
   private var segments: [Segment] = []
   private var volatile: [Track: String] = [:]
@@ -765,12 +796,127 @@ final class TranscriptStore: @unchecked Sendable {
     }
   }
 
+  /// 정지 버튼이 이번 열린 구간을 하나의 강의로 닫을지 정한다.
+  ///
+  /// 앱의 정지 경로에서 조건식을 직접 쓰면 무음 판정과 다른 숫자로 조용히 갈라지고,
+  /// 자가검사로 고정할 수도 없다. 판단을 여기 두면 세 경로(무음·정지·수동)가 같은
+  /// 상수를 쓴다는 것이 코드로 확인된다.
+  ///
+  /// - Parameters:
+  ///   - lastContentEnd: 정지 직전 마지막 발화의 끝(초).
+  ///   - openSpanReferencePoint: 직전에 닫힌 구간의 끝. 없으면 이번 녹음의 시작.
+  static func shouldCloseUnitOnStop(lastContentEnd: Double,
+                                    openSpanReferencePoint: Double) -> Bool {
+    lastContentEnd - openSpanReferencePoint >= minimumLectureUnitSeconds
+  }
+
+  /// 편집 화면에서 손으로 경계를 붙이거나 뗄 때 쓴다. 자동 경로와 달리 "이 문장"을
+  /// 지목한다 — 그래서 "이번 구간의 마지막 문장"이라는 뜻을 가진
+  /// `markLatestSegmentAsLectureEnded`와 섞지 않고 따로 둔다.
+  ///
+  /// Whisper 기록만 손댄다. 요약 구간은 Whisper 기록에서만 만들어지므로
+  /// (`lectureUnits`), 실시간 줄에 표식을 달면 화면에는 보이는데 구간은 안 나뉘는
+  /// 거짓말이 된다.
+  ///
+  /// 붙일 때는 앞뒤 경계와 `minimumLectureUnitSeconds` 이상 떨어져 있어야 한다.
+  /// 버튼을 인접한 줄에 연달아 눌러 3분 안에 구간이 여러 개 생기는 것을 막는 방어이며,
+  /// 길이는 180초 무음 판정과 같은 상수를 쓴다. **떼는 것은 언제나 허용한다** —
+  /// 그래야 잘못 생긴 경계 때문에 사용자가 갇히지 않는다.
+  ///
+  /// - Returns: 실제로 바뀌었으면 갱신분, 이미 같은 값이면 nil.
+  func setWhisperSegmentBoundary(id: Int,
+                                 boundary: TranscriptBoundary?) throws -> TranscriptBoundaryUpdate? {
+    try lock.withLock {
+      let ordered = whisperSegments.sorted { ($0.start, $0.id) < ($1.start, $1.id) }
+      guard let position = ordered.firstIndex(where: { $0.id == id }),
+            let index = whisperSegments.firstIndex(where: { $0.id == id }),
+            let first = ordered.first, let last = ordered.last else {
+        throw BoundaryEditError.unknownSegment
+      }
+      guard whisperSegments[index].boundaryAfter != boundary else { return nil }
+
+      if boundary != nil {
+        let candidateEnd = ordered[position].end
+        // 앞쪽 기준점은 직전 경계의 끝이고, 없으면 기록의 시작이다.
+        let previousEnd = ordered[..<position].last(where: { $0.boundaryAfter != nil })?.end
+          ?? first.start
+        let openedSeconds = candidateEnd - previousEnd
+        if openedSeconds < Self.minimumLectureUnitSeconds {
+          throw BoundaryEditError.tooCloseToPrevious(openedSeconds)
+        }
+        // 뒤쪽도 같이 본다. 다음 경계 바로 앞에 붙이면 뒤에 몇십 초짜리 구간이 남아
+        // 앞쪽만 검사할 때와 똑같은 문제가 반대편에서 생긴다. 다만 기록의 **마지막
+        // 문장**은 예외다 — 그 뒤에는 문장이 없어 새 구간이 생기지 않으므로, 짧은
+        // 수업의 끝을 손으로 닫으려는 사람을 막을 이유가 없다.
+        if position < ordered.count - 1 {
+          let nextEnd = ordered[(position + 1)...].first(where: { $0.boundaryAfter != nil })?.end
+            ?? last.end
+          let remainingSeconds = nextEnd - candidateEnd
+          if remainingSeconds < Self.minimumLectureUnitSeconds {
+            throw BoundaryEditError.tooCloseToNext(remainingSeconds)
+          }
+        }
+      }
+
+      whisperSegments[index].boundaryAfter = boundary
+      return TranscriptBoundaryUpdate(collection: .whisper, segment: whisperSegments[index])
+    }
+  }
+
+  /// 밖에서 고쳐져 돌아온 전사 문서의 본문을 Whisper 기록에 되쓴다.
+  ///
+  /// 문장을 **지우지도 만들지도 않는다.** 교정기가 한 줄을 통째로 날려 보내거나
+  /// 모르는 번호를 붙여 보내도 기록이 줄어들면 안 되기 때문이다. 삭제는 화면의 편집
+  /// 기능으로만 한다. 바뀐 줄에는 `edited`를 세워, 오프셋 기반인 `flags`를 그대로
+  /// 믿지 않게 한다(그 필드 주석 참고).
+  func applyTranscriptDocument(_ edits: [TranscriptDocument.Edit])
+    -> (changed: Int, unchanged: Int, skipped: Int) {
+    lock.withLock {
+      var changed = 0, unchanged = 0, skipped = 0
+      for edit in edits {
+        let text = edit.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty,
+              let index = whisperSegments.firstIndex(where: { $0.id == edit.id }) else {
+          skipped += 1
+          continue
+        }
+        if whisperSegments[index].text == text { unchanged += 1; continue }
+        whisperSegments[index].text = text
+        whisperSegments[index].edited = true
+        changed += 1
+      }
+      return (changed, unchanged, skipped)
+    }
+  }
+
+  /// 지운 줄이 들고 있던 경계는 바로 앞에 남는 줄이 이어받는다.
+  ///
+  /// 사용자의 뜻은 "이 문장을 지운다"이지 "두 강의를 합친다"가 아니다. 승계가 없으면
+  /// 경계가 붙은 줄 하나를 지우는 것만으로 요약 구간이 조용히 합쳐져, 나중에 왜 강의
+  /// 수가 줄었는지 알 길이 없다. 지운 줄이 맨 앞이라 이어받을 줄이 없을 때만 경계가
+  /// 사라지며, 그때는 그 앞에 구간이 없으므로 합쳐질 것도 없다.
   @discardableResult
   func deleteWhisperSegments(ids: [Int]) -> Int {
     let set = Set(ids)
     return lock.withLock {
       let before = whisperSegments.count
+      let ordered = whisperSegments.sorted { ($0.start, $0.id) < ($1.start, $1.id) }
+      var inheritedBoundaries: [Int: TranscriptBoundary] = [:]
+      for (position, segment) in ordered.enumerated() {
+        guard set.contains(segment.id), let boundary = segment.boundaryAfter else { continue }
+        // 지워지는 줄이 연달아 있으면 그 앞으로 계속 거슬러 올라가 남는 줄을 찾는다.
+        guard let heir = ordered[..<position].last(where: { !set.contains($0.id) }) else { continue }
+        inheritedBoundaries[heir.id] = boundary
+      }
       whisperSegments.removeAll { set.contains($0.id) }
+      for (heirID, boundary) in inheritedBoundaries {
+        guard let index = whisperSegments.firstIndex(where: { $0.id == heirID }) else { continue }
+        // 이어받을 줄이 이미 경계를 들고 있으면 그대로 둔다 — 같은 자리에 두 경계를
+        // 겹쳐도 구간은 하나뿐이고, 원래 있던 값이 더 오래된 사실이다.
+        if whisperSegments[index].boundaryAfter == nil {
+          whisperSegments[index].boundaryAfter = boundary
+        }
+      }
       return before - whisperSegments.count
     }
   }

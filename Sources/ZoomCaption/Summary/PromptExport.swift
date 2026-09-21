@@ -89,20 +89,16 @@ enum PromptExport {
       throw PromptExportError.emptyTranscript
     }
 
-    let transcriptLines = units.flatMap(\.segments).flatMap { segment -> [String] in
-      var lines = ["[\(TranscriptStore.clock(segment.start))] "
-        + segment.text.trimmingCharacters(in: .whitespacesAndNewlines)]
-      if let boundaryLabel = TranscriptStore.markdownLabel(for: segment.boundaryAfter) {
-        // 저장 Markdown과 같은 라벨 함수를 거쳐야 경계 종류가 늘어도 프롬프트만
-        // 예전 문구를 쓰거나 경계를 누락하는 일이 생기지 않는다.
-        lines.append("> **\(boundaryLabel)**")
-      }
-      return lines
-    }
+    // 녹취 본문은 TranscriptDocument 한 곳에서만 만든다. 줄마다 붙던 `[00:12:34] `는
+    // 어떤 판정에도 쓰이지 않으면서 본문의 약 5분의 1을 차지했다(그 근거는 그 파일의
+    // 주석 참고). 대신 구간 머리글에 시각 범위를 한 번씩만 남겨, 모델이 아래 구간
+    // 목록과 본문을 맞출 단서는 오히려 더 분명해진다.
+    let transcriptBody = TranscriptDocument.render(units: units, options: .forPrompt)
 
     // 현재 호출자는 항상 nil을 보내 원문 전체를 한 번에 전달한다. non-nil 예산은 줄
     // 경계만 사용해 묶어 두므로, 이후 무료 플랜 다중 전송을 붙여도 발화를 자르지 않는다.
-    let transcript = transcriptBlocks(lines: transcriptLines, characterBudget: characterBudget)
+    let transcript = transcriptBlocks(lines: transcriptBody.components(separatedBy: "\n"),
+                                      characterBudget: characterBudget)
       .joined(separator: "\n")
     let glossaryBlock = glossary.trimmingCharacters(in: .whitespacesAndNewlines)
     let unitRanges = units.map {
@@ -127,7 +123,8 @@ enum PromptExport {
     교안 용어 철자 힌트: \(glossaryBlock.isEmpty ? "없음" : glossaryBlock)
 
     [구간 경계]
-    녹취 안의 `> **강의 종료**` 와 `> **녹음 종료**` 줄이 구간 경계다.
+    녹취는 `=== N강 ===` 머리글로 구간이 나뉘고, `> **강의 종료**` 와 `> **녹음 종료**`
+    줄이 그 구간의 끝이다. 발화 줄에는 시각이 없으니 구간 판단은 이 두 표시만 쓴다.
     이것은 확정된 경계이므로 임의로 합치거나 나누지 말라.
     이 녹취에는 구간이 정확히 \(units.count)개 있다:
     \(unitRanges)

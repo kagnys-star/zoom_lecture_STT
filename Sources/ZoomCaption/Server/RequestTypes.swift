@@ -23,6 +23,8 @@ struct TitleRequest: Decodable { var title: String? }
 struct OpenRequest: Decodable { var path: String? }
 /// `list` 가 "whisper" 면 Whisper 기록을, 아니면 실시간 기록을 고친다.
 struct EditRequest: Decodable { var id: Int?; var text: String?; var list: String? }
+/// 편집 화면에서 강의 종료를 붙이거나 뗄 때 오는 요청. `boundary`가 비어 있으면 뗀다.
+struct BoundaryRequest: Decodable { var id: Int?; var boundary: String?; var list: String? }
 struct DeleteRequest: Decodable { var ids: [Int]?; var from: Double?; var to: Double?; var list: String? }
 struct SummarizeRequest: Decodable { var fromUnit: Int?; var toUnit: Int? }
 struct PromptRequest: Decodable { var fromUnit: Int?; var toUnit: Int?; var target: String? }
@@ -35,6 +37,9 @@ struct SummaryImportRequest: Decodable {
   var fromUnit: Int?
   var toUnit: Int?
 }
+/// 밖에서 고쳐져 돌아온 전사 문서. 본문 전체를 그대로 받아 서버가 파싱한다 —
+/// 브라우저가 미리 나눠 보내면 파일 형식 규칙이 두 곳에 생긴다.
+struct TranscriptDocumentRequest: Decodable { var markdown: String? }
 struct ClientLogRequest: Decodable { var level: String?; var message: String? }
 struct SaveSummaryRequest: Decodable { var dir: String?; var filename: String? }
 struct ApplyCorrectionsRequest: Decodable {

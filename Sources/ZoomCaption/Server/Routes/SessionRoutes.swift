@@ -136,6 +136,72 @@ extension ZoomCaptionApp {
       autosave()
       return .response(.json(["ok": ok]))
 
+    // 강의 종료를 손으로 붙이고 뗀다. 요약 구간이 곧 이 표식이므로, 이 버튼이 사실상
+    // "요약을 어디서 끊을지"를 사용자가 정하는 자리다.
+    case ("POST", "/api/segment/boundary"):
+      if stateLock.withLock({ running }) {
+        return .response(.json(["ok": false, "error": "녹음 중에는 강의 종료를 바꿀 수 없습니다. 정지한 뒤 고쳐 주세요."]))
+      }
+      guard let boundaryRequest = req.json(BoundaryRequest.self), let id = boundaryRequest.id else {
+        return .response(.json(["ok": false, "error": "잘못된 요청"]))
+      }
+      let requestedBoundary = (boundaryRequest.boundary ?? "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      var boundary: TranscriptBoundary?
+      if !requestedBoundary.isEmpty {
+        // 모르는 값을 조용히 무시하면 사용자는 눌렀다고 믿는데 아무 일도 일어나지 않는다.
+        guard let parsed = TranscriptBoundary(rawValue: requestedBoundary) else {
+          return .response(.json(["ok": false, "error": "알 수 없는 경계 종류입니다."]))
+        }
+        boundary = parsed
+      }
+      do {
+        let boundaryUpdate = try store.setWhisperSegmentBoundary(id: id, boundary: boundary)
+        if let boundaryUpdate {
+          autosave()
+          // 다른 탭도 같은 표식과 구간 목록을 받아야 한다. 자동 경계와 같은 이벤트를
+          // 쓰면 브라우저가 이미 가진 처리 경로가 그대로 동작한다.
+          live.broadcast(event: "lectureBoundary", payload: [
+            "collection": boundaryUpdate.collection.rawValue,
+            "id": boundaryUpdate.segment.id,
+            "boundaryAfter": boundary?.rawValue ?? "",
+          ])
+          log("강의 종료 \(boundary == nil ? "해제" : "설정") — 문장 \(id), "
+            + "구간 \(store.lectureUnits().count)개")
+        }
+        return .response(.json(["ok": true,
+                                "boundaryAfter": boundary?.rawValue ?? "",
+                                "unitCount": store.lectureUnits().count]))
+      } catch {
+        logWarn("강의 종료 변경 거부 — 문장 \(id), \(error.localizedDescription)")
+        return .response(.json(["ok": false, "error": error.localizedDescription]))
+      }
+
+    // 밖에서 문장을 고쳐 오는 경로. 화면 편집과 같은 잠금 규칙을 쓴다 — 녹음 중에는
+    // Whisper가 줄을 계속 추가·재배치하므로 파일의 번호가 가리키는 문장이 흔들린다.
+    case ("POST", "/api/transcript/import"):
+      if stateLock.withLock({ running }) {
+        return .response(.json(["ok": false, "error": "녹음 중에는 문장을 되쓸 수 없습니다. 정지한 뒤 넣어 주세요."]))
+      }
+      let documentText = req.json(TranscriptDocumentRequest.self)?.markdown ?? ""
+      do {
+        let parsed = try TranscriptDocument.parse(documentText)
+        let applied = store.applyTranscriptDocument(parsed.edits)
+        autosave()
+        log("전사 문서 되쓰기 — 읽은 줄 \(parsed.lineCount), 수정 \(applied.changed), "
+          + "그대로 \(applied.unchanged), 건너뜀 \(applied.skipped)")
+        return .response(.json([
+          "ok": true,
+          "lineCount": parsed.lineCount,
+          "changed": applied.changed,
+          "unchanged": applied.unchanged,
+          "skipped": applied.skipped,
+        ]))
+      } catch {
+        logWarn("전사 문서 되쓰기 거부 — \(error.localizedDescription) (수신 \(documentText.count)자)")
+        return .response(.json(["ok": false, "error": error.localizedDescription]))
+      }
+
     case ("POST", "/api/segment/delete"):
       if stateLock.withLock({ running }) {
         return .response(.json(["ok": false, "error": "녹음 중에는 편집할 수 없습니다. 정지한 뒤 지워 주세요."]))

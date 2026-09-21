@@ -116,7 +116,8 @@ final class ZoomCaptionApp: @unchecked Sendable {
   private var lastDeviceChangeName: String?
   /// 마지막 유효 소리 뒤 이 시간이 지나면 하나의 강의가 끝난 것으로 확정한다.
   /// 30초 캡처 이상 경고와 목적이 다르므로 AudioActivityClock의 짧은 기준과 분리한다.
-  private static let lectureBoundarySilenceSeconds: TimeInterval = 180
+  /// 값 자체는 정지·수동 경계와 공유한다 — `TranscriptStore.minimumLectureUnitSeconds` 참고.
+  private static let lectureBoundarySilenceSeconds = TranscriptStore.minimumLectureUnitSeconds
   /// 긴 무음 시점에는 Whisper가 보통 이미 따라잡아 있다. 그래도 실행 중인 한 조각을
   /// 중간에서 자르지 않도록 최대 60초 기다리고, 끝나지 않으면 다음 감시 틱에서 재시도한다.
   private static let lectureBoundaryWhisperWaitSeconds: TimeInterval = 60
@@ -127,9 +128,6 @@ final class ZoomCaptionApp: @unchecked Sendable {
   /// 오래됐으면 콘텐츠 무음이 아니라 전달 경로 중단 후보로 본다. 실제 경고 평가는
   /// 5초마다 하므로 순간적인 스케줄 지연 한 번으로 사용자에게 오류를 띄우지 않는다.
   private static let audioCallbackStallSeconds: TimeInterval = 5
-  /// 사용자가 정지한 열린 구간이 10분보다 짧으면 오류 복구나 짧은 시험 녹음일 수 있어
-  /// 독립적인 요약 단위로 오인되지 않도록 녹음 종료 경계를 붙이지 않는다.
-  private static let stopBoundaryMinimumOpenSpanSeconds: TimeInterval = 600
 
   let stateLock = NSLock()
   var running = false
@@ -1450,22 +1448,33 @@ final class ZoomCaptionApp: @unchecked Sendable {
     await lectureTranscriber?.finish(); lectureTranscriber = nil
     audioSink = nil
 
-    // 정지 직전의 실제 전사 끝만 보고 10분 이상 열린 구간에 표식을 붙인다. 이번 녹음
-    // 오프셋 검사는 이어 적기 후 발화가 없을 때 과거 세션의 마지막 문장을 오염시키지 않는다.
+    // 정지 직전의 실제 전사 끝만 보고, 직전 경계 이후 무음 판정과 같은 길이만큼 말이
+    // 있었던 구간에만 표식을 붙인다. 이번 녹음 오프셋 검사는 이어 적기 후 발화가 없을 때
+    // 과거 세션의 마지막 문장을 오염시키지 않는다.
+    //
+    // 이유를 `lectureEnded`로 쓰는 것은 사용자에게 종료가 하나의 개념이기 때문이다 —
+    // 180초 무음으로 끝났든 사람이 정지를 눌렀든 "여기서 강의가 끝났다"는 같은 사실이고,
+    // 요약 구간도 똑같이 나뉜다. `recordingStopped`는 이 값이 들어 있는 기존 세션
+    // 파일을 계속 읽기 위해 남겨 둘 뿐 새로 쓰지 않는다.
+    //
+    // 이 길이 검사가 곧 연타 방어다. 시작·정지를 반복하거나 180초 무음으로 방금 닫힌
+    // 직후에 정지를 눌러도 `openSpanReferencePoint`가 그 경계를 가리키므로 경계가
+    // 겹쳐 붙지 않는다.
     if let lastContentEnd = store.primarySegments.last(where: {
       $0.end >= currentRecordingStartOffset
     })?.end,
-       lastContentEnd - openSpanReferencePoint >= Self.stopBoundaryMinimumOpenSpanSeconds {
+       TranscriptStore.shouldCloseUnitOnStop(lastContentEnd: lastContentEnd,
+                                             openSpanReferencePoint: openSpanReferencePoint) {
       let boundaryUpdate = store.markLatestSegmentAsLectureEnded(
         after: currentRecordingStartOffset,
-        reason: .recordingStopped)
+        reason: .lectureEnded)
       if let boundaryUpdate {
-        // 저장소 변경만으로는 이미 열린 브라우저가 이유를 알 수 없으므로 구조화 값을
-        // 함께 보내며, 재동기화 전에도 강의 종료와 녹음 종료를 정확히 구분하게 한다.
+        // 저장소 변경만으로는 이미 열린 브라우저가 표식을 알 수 없으므로 구조화 값을
+        // 함께 보내, 재동기화 전에도 같은 경계가 화면에 보이게 한다.
         live.broadcast(event: "lectureBoundary", payload: [
           "collection": boundaryUpdate.collection.rawValue,
           "id": boundaryUpdate.segment.id,
-          "boundaryAfter": TranscriptBoundary.recordingStopped.rawValue,
+          "boundaryAfter": TranscriptBoundary.lectureEnded.rawValue,
         ])
       }
     }

@@ -109,6 +109,9 @@ extension WebUI {
     </div>
     <div class="editbar">
       <span class="grow" id="editInfo">줄을 눌러 고치고, 체크해서 지우세요. Shift+클릭으로 구간 선택.</span>
+      <button id="btnTranscriptFile" class="sm" title="시각 없이 문장만 담은 .md 파일을 내려받습니다. 밖에서 고친 뒤 다시 넣을 수 있습니다.">문장 .md 내보내기</button>
+      <button id="btnTranscriptImport" class="sm" title="내보낸 문장 파일을 고쳐서 다시 넣습니다.">되넣기</button>
+      <input id="transcriptFileInput" type="file" accept=".md,.markdown,.txt" hidden>
       <button id="btnDelSel" class="danger sm" disabled>선택 삭제</button>
       <button id="btnEditDone" class="sm">완료</button>
     </div>

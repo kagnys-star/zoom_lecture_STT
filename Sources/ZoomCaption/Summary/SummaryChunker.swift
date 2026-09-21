@@ -85,8 +85,11 @@ enum SummaryChunker {
     }
   }
 
+  /// 로컬 경로는 한 요청에 한 조각만 넣고 그 시간 범위를 `SummaryPrompts.unitUser`가
+  /// 따로 알려 준다. 줄마다 시각을 반복하면 같은 정보를 조각 하나에 수백 번 넣으면서
+  /// 예산만 먹으므로 본문에는 발화만 남긴다 — 자세한 근거는 `TranscriptDocument` 주석.
   private static func formatted(_ segment: SummaryInputSegment) -> String {
-    "[\(TranscriptStore.clock(segment.start))] \(segment.text.trimmingCharacters(in: .whitespacesAndNewlines))"
+    segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
   }
 
   /// 정상적인 Whisper 문장은 이 경로에 오지 않는다. 한 세그먼트 자체가 예산을
@@ -94,8 +97,9 @@ enum SummaryChunker {
   private static func splitOversized(_ segment: SummaryInputSegment,
                                      characterBudget: Int) -> [SummaryInputSegment] {
     let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
-    let prefixReserve = 16
-    let limit = max(1, characterBudget - prefixReserve)
+    // 예전에는 줄머리 타임스탬프 자리로 16자를 예약했다. 이제 본문만 넣으므로 예약이
+    // 필요 없고, 줄바꿈 한 글자만 남겨 둔다.
+    let limit = max(1, characterBudget - 1)
     guard text.count > limit else { return [segment] }
 
     var fragments: [String] = []

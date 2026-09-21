@@ -24,7 +24,7 @@ enum OllamaClient {
       case .notRunning:
         return "Ollama 서버가 떠 있지 않습니다. 터미널에서 `ollama serve` 를 실행하세요."
       case .noModel:
-        return "쓸 수 있는 모델이 없습니다. `ollama pull qwen3:8b` 로 내려받으세요."
+        return "Qwen 모델이 없습니다. 프로젝트 폴더에서 `./setup-qwen.sh`를 실행하세요."
       case .contextExceeded(let estimated, let limit):
         return "요약 입력이 컨텍스트 한도를 넘습니다(추정 \(estimated)토큰, 한도 \(limit)토큰)."
       case .badResponse(let s):

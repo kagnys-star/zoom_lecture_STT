@@ -31,7 +31,7 @@ enum Summarizer {
       case .emptyTranscript:
         return "Whisper 전사가 아직 준비되지 않았거나 요약할 내용이 없습니다."
       case .noQwenModel:
-        return "쓸 수 있는 Qwen 모델이 없습니다. `ollama pull qwen3:8b`로 내려받으세요."
+        return "로컬 Qwen 요약이 설치되지 않았습니다. 프로젝트 폴더에서 `./setup-qwen.sh`를 실행하세요."
       case .serverUnavailable:
         return "Ollama 서버를 시작하지 못했습니다. 설치 상태와 실행 권한을 확인하세요."
       case .noLectureUnit:
@@ -50,7 +50,7 @@ enum Summarizer {
        let model = OllamaClient.pickSummaryModel(from: OllamaClient.installedModelsOffline()) {
       return .ollama(model)
     }
-    return .unavailable("Ollama와 Qwen 모델이 필요합니다. Apple 모델로 자동 전환하지 않습니다.")
+    return .unavailable("로컬 요약은 Ollama와 Qwen 모델을 별도로 설치해야 합니다. `./setup-qwen.sh`를 실행하세요.")
   }
 
   /// - Parameter onProgress: 완료된 모델 호출 수와 전체 모델 호출 수.

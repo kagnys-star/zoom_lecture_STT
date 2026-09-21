@@ -1977,8 +1977,10 @@ extension WebUI {
   // "완전히 끄는" 길은 따로 있어야 하고, 정말 꺼졌는지도 확인해서 알려 줘야 한다.
   // 종료 절차를 밟는 중인가. 이때는 창 닫기를 붙잡지 않는다.
   let quitting = false;
+  let quitReturnFocus = { current: null };
 
   function askQuit() {
+    quitReturnFocus.current = document.activeElement;
     $('#quitTitle').textContent = '진짜 종료하시겠습니까?';
     $('#quitBody').innerHTML = running
       ? '지금 <b>녹음 중</b>입니다. 종료하면 여기까지의 기록을 저장한 뒤 앱이 완전히 꺼집니다.'
@@ -1989,6 +1991,14 @@ extension WebUI {
     $('#quitGo').disabled = false;
     $('#quitCancel').disabled = false;
     $('#quitVeil').hidden = false;
+    $('#quitCancel').focus();
+  }
+
+  function closeQuitDialog() {
+    $('#quitVeil').hidden = true;
+    if (quitReturnFocus.current && document.contains(quitReturnFocus.current)) {
+      quitReturnFocus.current.focus();
+    }
   }
 
   // 서버가 응답을 멈출 때까지 확인한다. 응답이 끊겨야 진짜로 죽은 것이다.
@@ -2026,10 +2036,18 @@ extension WebUI {
       + '설정 탭의 <b>진단 복사</b> 를 눌러 로그를 함께 남겨 주시면 원인을 찾을 수 있습니다.';
     $('.quitBtns').hidden = true;
   };
-  $('#quitCancel').onclick = () => $('#quitVeil').hidden = true;
-  $('#quitVeil').onclick = e => { if (e.target === $('#quitVeil')) $('#quitVeil').hidden = true; };
+  $('#quitCancel').onclick = closeQuitDialog;
+  $('#quitVeil').onclick = e => { if (e.target === $('#quitVeil')) closeQuitDialog(); };
   document.addEventListener('keydown', e => {
-    if (e.key === 'Escape' && !$('#quitVeil').hidden && !$('#quitCancel').disabled) $('#quitVeil').hidden = true;
+    if ($('#quitVeil').hidden) return;
+    if (e.key === 'Escape' && !$('#quitCancel').disabled) closeQuitDialog();
+    if (e.key === 'Tab') {
+      const focusable = [...$('#quitVeil').querySelectorAll('button:not(:disabled)')];
+      if (!focusable.length) return;
+      const first = focusable[0], last = focusable[focusable.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
   });
   $('#btnQuitTop').onclick = askQuit;
   $('#btnQuit').onclick = askQuit;
@@ -2521,6 +2539,9 @@ extension WebUI {
     document.body.classList.toggle('side-collapsed', on);
     $('#sideToggle').textContent = on ? '›' : '‹';
     $('#sideToggle').title = on ? '사이드 패널 펼치기' : '사이드 패널 접기';
+    $('#sideToggle').setAttribute('aria-label', on ? '사이드 패널 펼치기' : '사이드 패널 접기');
+    $('#sideToggle').setAttribute('aria-expanded', on ? 'false' : 'true');
+    $('#utilityPanel').setAttribute('aria-hidden', on ? 'true' : 'false');
     localStorage.setItem(SIDE_KEY, on ? '1' : '0');
   }
   $('#sideToggle').onclick = () => setSideCollapsed(!document.body.classList.contains('side-collapsed'));

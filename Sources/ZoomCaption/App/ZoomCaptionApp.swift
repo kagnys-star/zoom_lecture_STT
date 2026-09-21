@@ -1603,7 +1603,7 @@ final class ZoomCaptionApp: @unchecked Sendable {
       model = m
     } else {
       live.broadcast(event: "polishDone", payload: [
-        "ok": false, "error": "쓸 수 있는 Ollama 모델이 없습니다. `ollama pull qwen3:8b` 로 내려받으세요."])
+        "ok": false, "error": "로컬 Qwen 요약이 설치되지 않았습니다. 프로젝트 폴더에서 `./setup-qwen.sh`를 실행하세요."])
       return
     }
     guard await OllamaClient.ensureServer() else {

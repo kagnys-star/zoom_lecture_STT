@@ -16,9 +16,13 @@ extension WebUI {
   /// CSS는 보이지 않게 만드는 UX 경계이고, 실제 권한 경계는 서버 라우트다.
   static let markup = #"""
 
-<header>
+<a class="skipLink" href="#primaryWorkspace">자막 화면으로 건너뛰기</a>
+
+<header class="appHeader">
   <div class="headerIdentity">
-    <span class="brand"><span class="brandMark" aria-hidden="true">Z</span>ZoomCaption</span>
+    <span class="brand"><span class="brandMark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" focusable="false"><path d="M5 14v-4M9.5 17V7M14.5 15.5v-7M19 14v-4"/></svg>
+    </span><span>ZoomCaption</span></span>
     <span class="administratorBadge administratorOnly" aria-label="관리자 모드">관리자 모드</span>
     <input id="title" value="Zoom 수업" spellcheck="false" aria-label="수업 제목">
     <span class="pill sub" id="sessionChip" style="display:none"></span>
@@ -38,20 +42,20 @@ extension WebUI {
 
   <div class="recordingStatus" aria-label="녹음 상태">
     <span class="statusCaption">녹음 상태</span>
-    <span class="pill" id="status"><span class="dot"></span><span id="statusText">대기 중</span><span class="conn" id="connDot" title="서버와 연결됨"></span></span>
+    <span class="pill" id="status" role="status" aria-live="polite"><span class="dot" aria-hidden="true"></span><span id="statusText">대기 중</span><span class="conn" id="connDot" title="서버와 연결됨" aria-hidden="true"></span></span>
     <span class="pill clockPill" id="clock">00:00:00</span>
   </div>
 
   <div class="headerActions">
-    <button id="btnStart" class="primary recordAction"><span aria-hidden="true">●</span> __RECORD_BUTTON_LABEL__</button>
-    <button id="btnStop" class="stop recordAction" style="display:none"><span aria-hidden="true">■</span> 녹음 정지</button>
-    <button id="btnQuitTop" class="danger quitAction" title="ZoomCaption 앱을 완전히 종료합니다" aria-label="ZoomCaption 완전 종료">⏻</button>
+    <button id="btnStart" class="primary recordAction"><span class="recordGlyph" aria-hidden="true"></span> __RECORD_BUTTON_LABEL__</button>
+    <button id="btnStop" class="stop recordAction" style="display:none"><span class="stopGlyph" aria-hidden="true"></span> 녹음 정지</button>
+    <button id="btnQuitTop" class="danger quitAction" title="ZoomCaption 앱을 완전히 종료합니다" aria-label="ZoomCaption 완전 종료"><span class="powerGlyph" aria-hidden="true"></span></button>
   </div>
 </header>
 
 <!-- 완전 종료 확인 -->
 <div id="quitVeil" hidden>
-  <div class="quitCard">
+  <div class="quitCard" role="dialog" aria-modal="true" aria-labelledby="quitTitle" aria-describedby="quitBody">
     <h3 id="quitTitle">ZoomCaption을 완전히 종료할까요?</h3>
     <p id="quitBody"></p>
     <div class="quitBtns">
@@ -65,15 +69,15 @@ extension WebUI {
      지금은 Whisper 정리 한 단계뿐이지만, 나중에 LLM 다듬기를 자동으로 붙이면
      이 카드에 줄이 하나 늘어난다(WebUI+Script.swift 의 stopSteps 주석 참고). -->
 <div id="stopVeil" hidden>
-  <div class="stopCard">
-    <h3>마무리하는 중…</h3>
-    <p class="stopHint">기록을 정리하는 중입니다. 창을 닫지 말고 잠시만 기다려 주세요.</p>
+  <div class="stopCard" role="dialog" aria-modal="true" aria-labelledby="stopTitle" aria-describedby="stopHint">
+    <h3 id="stopTitle">마무리하는 중…</h3>
+    <p class="stopHint" id="stopHint">기록을 정리하는 중입니다. 창을 닫지 말고 잠시만 기다려 주세요.</p>
     <div id="stopStepsBox"></div>
   </div>
 </div>
 
 <main>
-  <div id="primaryWorkspace">
+  <div id="primaryWorkspace" tabindex="-1">
     <!-- 어느 메인 탭에 있든 녹음 상태 문제를 놓치지 않도록 공통 영역에 둔다. -->
     <div id="resumeBar">
       <span class="grow" id="resumeText"></span>
@@ -88,6 +92,7 @@ extension WebUI {
            aria-labelledby="tab-whisper">
     <div class="toolbar">
       <span class="paneTag main">Whisper</span>
+      <label class="srOnly" for="search">자막 검색</label>
       <input id="search" type="search" placeholder="자막 검색…" autocomplete="off">
       <button id="btnEdit" class="sm">편집</button>
       <label class="toggle administratorOnly" title="실시간 기록과 갈린 자리에 밑줄을 긋습니다. 눌러서 고칠 수 있습니다.">
@@ -100,7 +105,7 @@ extension WebUI {
         <button type="button" data-caption-size="large" aria-pressed="false">크게</button>
       </fieldset>
       <span class="size-ctl" id="waitNote"></span>
-      <span class="size-ctl" id="count">0줄</span>
+      <span class="size-ctl" id="count" role="status" aria-live="polite">0줄</span>
     </div>
     <div class="editbar">
       <span class="grow" id="editInfo">줄을 눌러 고치고, 체크해서 지우세요. Shift+클릭으로 구간 선택.</span>
@@ -243,9 +248,10 @@ extension WebUI {
   </section>
   </div>
 
-  <button id="sideToggle" title="사이드 패널 접기" aria-label="사이드 패널 접기">‹</button>
+  <button id="sideToggle" title="사이드 패널 접기" aria-label="사이드 패널 접기"
+          aria-controls="utilityPanel" aria-expanded="true"><span aria-hidden="true">‹</span></button>
 
-  <aside>
+  <aside id="utilityPanel" aria-label="교안, 세션 및 설정">
     <div class="tabs" role="tablist" aria-label="보조 도구">
       <button class="tab on" id="side-tab-doc" type="button" role="tab" aria-selected="true"
               aria-controls="panel-doc" data-tab="doc">교안</button>
@@ -401,7 +407,7 @@ extension WebUI {
       </div>
       <div class="field">
         <label>앱 종료</label>
-        <button id="btnQuit" class="danger" style="width:100%">⏻ ZoomCaption 완전 종료</button>
+        <button id="btnQuit" class="danger" style="width:100%"><span class="powerGlyph" aria-hidden="true"></span> ZoomCaption 완전 종료</button>
         <div class="hint">브라우저 탭만 닫으면 앱은 뒤에서 계속 돌아갑니다.
           정말 끄려면 이 버튼(또는 위쪽 <b>완전 종료</b>)을 누르세요.</div>
       </div>

@@ -14,22 +14,43 @@ extension WebUI {
   /// - 위 칸(Whisper)이 주가 되고 아래 칸(실시간)은 `max-height: 42%` 로 눌러 둔다.
   static let style = #"""
   :root {
-    --bg: #f6f7f9;      --panel: #ffffff;   --ink: #16181d;     --muted: #6b7280;
-    --line: #e3e6ea;    --accent: #2f6df6;  --accent-soft: #e8f0ff;
-    --me: #0f9d6b;      --me-soft: #e6f7f0; --warn: #b45309;    --warn-soft: #fef3c7;
-    --danger: #d9342b;  --danger-soft: #fdeceb; --on-accent: #ffffff;
+    color-scheme: light dark;
+    --bg: #f4f6f8;      --panel: #ffffff;   --panel-raised: #ffffff;
+    --ink: #172033;     --muted: #657083;   --muted-strong: #475569;
+    --line: #dfe4ea;    --line-strong: #c8d0da;
+    --accent: #315efb;  --accent-hover: #244bd3; --accent-soft: #eaf0ff;
+    --me: #087f5b;      --me-soft: #e7f7f1; --warn: #9a5b0a;    --warn-soft: #fff4d8;
+    --danger: #c9362d;  --danger-soft: #feeeec; --on-accent: #ffffff;
+    --shadow-sm: 0 1px 2px color-mix(in srgb, var(--ink) 8%, transparent);
+    --shadow-md: 0 12px 32px color-mix(in srgb, var(--ink) 10%, transparent);
+    --radius-sm: 9px; --radius-md: 13px; --radius-lg: 18px;
     --cap: 22px;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #0f1115;    --panel: #171a21;   --ink: #e8eaed;     --muted: #9aa1ad;
-      --line: #262a33;  --accent: #6f9dff;  --accent-soft: #1c2740;
-      --me: #4ad3a1;    --me-soft: #142b23; --warn: #fbbf24;    --warn-soft: #33280d;
-      --danger: #ff6b60; --danger-soft: #351917;
+      --bg: #0d1118;    --panel: #151a23;   --panel-raised: #1a202b;
+      --ink: #edf1f7;   --muted: #a0a9b7;  --muted-strong: #c2c9d3;
+      --line: #29313e;  --line-strong: #3b4656;
+      --accent: #84a4ff; --accent-hover: #a2b9ff; --accent-soft: #202d4f;
+      --me: #55d6aa;    --me-soft: #15372d; --warn: #f4c05e;    --warn-soft: #3a2b10;
+      --danger: #ff8278; --danger-soft: #3f201e; --on-accent: #0b1535;
     }
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; }
+  html { background: var(--bg); scroll-behavior: smooth; }
+  ::selection { background: color-mix(in srgb, var(--accent) 24%, transparent); }
+  .srOnly {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+  }
+  .skipLink {
+    position: fixed; top: 10px; left: 12px; z-index: 1000; padding: 9px 13px;
+    border-radius: var(--radius-sm); background: var(--ink); color: var(--bg);
+    font-weight: 700; text-decoration: none; transform: translateY(-160%);
+    transition: transform .16s ease;
+  }
+  .skipLink:focus { transform: translateY(0); }
   /* 관리자 요소는 일반 화면에서 단순히 흐리게 두지 않고 레이아웃과 접근성 트리에서
      함께 제외한다. 서버 라우트도 별도로 거부하므로 이 규칙은 보안 경계가 아니라
      일반 사용자에게 실험 도구를 노출하지 않기 위한 표현 계층이다. */
@@ -37,26 +58,28 @@ extension WebUI {
   body {
     margin: 0; background: var(--bg); color: var(--ink);
     font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Pretendard", sans-serif;
-    font-size: 15px; line-height: 1.5; display: flex; flex-direction: column;
+    font-size: 15px; line-height: 1.55; display: flex; flex-direction: column;
+    -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
   }
 
   header {
-    position: relative; z-index: 10; display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
-    min-height: 64px; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line);
-    box-shadow: 0 3px 14px color-mix(in srgb, var(--ink) 5%, transparent);
+    position: relative; z-index: 10; display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    min-height: 72px; padding: 12px clamp(14px, 2vw, 24px); background: color-mix(in srgb, var(--panel) 96%, transparent);
+    border-bottom: 1px solid var(--line); box-shadow: var(--shadow-sm);
   }
   .headerIdentity {
     display: flex; align-items: center; gap: 10px; flex: 1 1 300px; min-width: 220px;
   }
   .brand {
     display: inline-flex; align-items: center; gap: 8px; flex: 0 0 auto;
-    font-weight: 750; letter-spacing: -.025em; font-size: 16px;
+    font-weight: 760; letter-spacing: -.035em; font-size: 17px;
   }
   .brandMark {
-    display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px;
-    border-radius: 9px; background: var(--accent); color: var(--on-accent); font-size: 14px; font-weight: 800;
-    box-shadow: 0 4px 10px color-mix(in srgb, var(--accent) 28%, transparent);
+    display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px;
+    border-radius: 10px; background: var(--accent); color: var(--on-accent);
+    box-shadow: 0 6px 16px color-mix(in srgb, var(--accent) 24%, transparent);
   }
+  .brandMark svg { width: 21px; height: 21px; fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; }
   .administratorBadge {
     display: inline-flex; align-items: center; min-height: 26px; padding: 4px 9px;
     border-radius: 999px; background: var(--warn-soft); color: var(--warn);
@@ -65,7 +88,7 @@ extension WebUI {
   }
   #title {
     font: inherit; font-weight: 600; color: var(--ink); background: transparent;
-    border: 1px solid transparent; border-radius: 9px; padding: 7px 9px;
+    border: 1px solid transparent; border-radius: var(--radius-sm); padding: 8px 10px;
     width: clamp(140px, 17vw, 250px); min-width: 0;
   }
   #title:hover { border-color: var(--line); background: var(--bg); }
@@ -103,18 +126,24 @@ extension WebUI {
   button {
     font: inherit; font-weight: 600; font-size: 14px; cursor: pointer;
     border: 1px solid var(--line); background: var(--panel); color: var(--ink);
-    padding: 7px 13px; border-radius: 9px; transition: background .12s, border-color .12s;
+    min-height: 38px; padding: 7px 13px; border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-sm); touch-action: manipulation;
+    transition: background .16s ease, border-color .16s ease, color .16s ease, box-shadow .16s ease, transform .16s ease;
   }
-  button:hover:not(:disabled) { background: var(--bg); border-color: var(--muted); }
-  button:disabled { opacity: .45; cursor: default; }
+  button:hover:not(:disabled) { background: var(--bg); border-color: var(--line-strong); }
+  button:active:not(:disabled) { transform: translateY(1px); box-shadow: none; }
+  button:disabled { opacity: .46; cursor: not-allowed; box-shadow: none; }
   button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
-  button.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent); }
+  button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
   button.stop { background: var(--danger); border-color: var(--danger); color: var(--on-accent); }
   button.stop:hover:not(:disabled) { filter: brightness(1.08); background: var(--danger); }
   button.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 30%, var(--line)); }
   button.danger:hover:not(:disabled) { background: var(--danger-soft); }
-  button.sm { font-size: 13px; padding: 5px 10px; }
-  button:focus-visible { outline: 3px solid var(--accent-soft); outline-offset: 2px; }
+  button.sm { min-height: 34px; font-size: 13px; padding: 5px 10px; }
+  button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible,
+  textarea:focus-visible, summary:focus-visible, [tabindex]:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
   .recordAction {
     display: inline-flex; align-items: center; justify-content: center; gap: 8px;
     min-width: 118px; min-height: 42px; padding: 8px 16px; border-radius: 12px;
@@ -122,7 +151,16 @@ extension WebUI {
     box-shadow: 0 5px 14px color-mix(in srgb, var(--accent) 24%, transparent);
     transition: transform .14s ease, box-shadow .14s ease, filter .14s ease;
   }
-  .recordAction > span { font-size: 9px; }
+  .recordGlyph { width: 9px; height: 9px; border-radius: 50%; background: currentColor; }
+  .stopGlyph { width: 9px; height: 9px; border-radius: 2px; background: currentColor; }
+  .powerGlyph {
+    position: relative; display: inline-block; width: 16px; height: 16px;
+    border: 1.8px solid currentColor; border-top-color: transparent; border-radius: 50%;
+  }
+  .powerGlyph::before {
+    content: ""; position: absolute; left: 50%; top: -3px; width: 2px; height: 9px;
+    border-radius: 2px; background: currentColor; transform: translateX(-50%);
+  }
   .recordAction:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 7px 18px color-mix(in srgb, var(--accent) 30%, transparent); }
   .recordAction.stop { box-shadow: 0 5px 14px color-mix(in srgb, var(--danger) 24%, transparent); }
   .recordAction.stop:hover:not(:disabled) { box-shadow: 0 7px 18px color-mix(in srgb, var(--danger) 30%, transparent); }
@@ -131,7 +169,7 @@ extension WebUI {
     width: 42px; height: 42px; padding: 0; border-radius: 12px; font-size: 17px;
   }
 
-  main { flex: 1; display: grid; grid-template-columns: minmax(0,1fr) 22px 390px; min-height: 0; }
+  main { flex: 1; display: grid; grid-template-columns: minmax(0,1fr) 24px 400px; min-height: 0; }
   #primaryWorkspace { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
   .workspaceView { flex: 1; min-width: 0; min-height: 0; }
   .workspaceView[hidden] { display: none !important; }
@@ -140,12 +178,12 @@ extension WebUI {
      활성 화면은 떠 있는 카드처럼 보여 탭 자체가 클릭 가능한 영역임을 드러낸다. */
   .workspaceTabs {
     display: inline-flex; gap: 3px; flex: 0 0 auto; padding: 4px;
-    background: var(--bg); border: 1px solid var(--line); border-radius: 13px;
+    background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius-md);
     box-shadow: inset 0 1px 2px color-mix(in srgb, var(--ink) 5%, transparent);
   }
   .workspaceTab {
     display: inline-flex; align-items: center; justify-content: center; gap: 8px;
-    min-width: 100px; min-height: 36px; padding: 6px 14px; border: none; border-radius: 9px;
+    min-width: 100px; min-height: 38px; padding: 6px 14px; border: none; border-radius: var(--radius-sm);
     background: transparent; color: var(--muted); font-size: 14px; font-weight: 700;
     transition: color .14s ease, background .14s ease, box-shadow .14s ease, transform .14s ease;
   }
@@ -153,7 +191,7 @@ extension WebUI {
   .workspaceTab:active:not(:disabled) { transform: scale(.98); }
   .workspaceTab.on {
     color: var(--accent); background: var(--panel);
-    box-shadow: 0 2px 8px color-mix(in srgb, var(--ink) 12%, transparent), inset 0 -2px 0 var(--accent);
+    box-shadow: var(--shadow-sm);
   }
   .workspaceTab.on:hover:not(:disabled) { background: var(--panel); }
   .workspaceTab:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
@@ -186,6 +224,7 @@ extension WebUI {
     main { grid-template-columns: 1fr; overflow-y: auto; }
     #primaryWorkspace { min-height: 70vh; }
     aside { border-left: none !important; border-top: 1px solid var(--line); min-height: 55vh; }
+    #sideToggle { width: 100%; min-height: 32px; border: 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
   }
 
   /* 사이드 접기. #sideToggle 은 <aside> 앞에 오는 별도 DOM 요소라 grid 세 번째
@@ -202,33 +241,34 @@ extension WebUI {
     display: flex; align-items: center; justify-content: center;
     background: var(--panel); border: none;
     border-left: 1px solid var(--line); border-right: 1px solid var(--line); border-radius: 0;
-    color: var(--muted); font-size: 13px; padding: 0; cursor: pointer;
+    color: var(--muted); font-size: 15px; padding: 0; cursor: pointer; box-shadow: none;
   }
   #sideToggle:hover { background: var(--bg); color: var(--ink); }
 
   /* ── 자막 ── */
   section.captions { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
   .toolbar {
-    display: flex; gap: 9px; align-items: center; padding: 9px 18px;
-    border-bottom: 1px solid var(--line); flex-wrap: wrap;
+    display: flex; gap: 9px; align-items: center; padding: 11px clamp(14px, 2vw, 24px);
+    border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap;
   }
   #search {
-    flex: 1; min-width: 120px; font: inherit; padding: 7px 11px;
-    border: 1px solid var(--line); border-radius: 9px; background: var(--panel); color: var(--ink);
+    flex: 1; min-width: 160px; min-height: 38px; font: inherit; padding: 8px 12px;
+    border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--bg); color: var(--ink);
+    transition: border-color .16s ease, box-shadow .16s ease, background .16s ease;
   }
-  #search:focus { outline: none; border-color: var(--accent); }
+  #search:focus { outline: none; border-color: var(--accent); background: var(--panel); box-shadow: 0 0 0 3px var(--accent-soft); }
   .toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); cursor: pointer; user-select: none; }
   .size-ctl { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
   .captionSizeControl {
     display: inline-flex; align-items: center; gap: 2px; margin: 0; padding: 3px;
-    border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 11px; background: var(--bg);
   }
   .captionSizeControl legend {
     position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
     overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
   }
   .captionSizeControl button {
-    min-height: 34px; padding: 5px 9px; border: 0; border-radius: 7px;
+    min-height: 32px; padding: 5px 9px; border: 0; border-radius: 7px; box-shadow: none;
     background: transparent; color: var(--muted); font-size: 12.5px;
   }
   .captionSizeControl button[aria-pressed="true"] {
@@ -245,12 +285,13 @@ extension WebUI {
   .editbar .grow { flex: 1; color: var(--accent); font-weight: 600; }
 
   /* 확정된 자막만 여기 쌓인다. 아래 #live 와 영역이 겹치지 않게 스크롤을 따로 가진다. */
-  #stream { flex: 1; overflow-y: auto; padding: 16px 18px 20px; min-height: 0; }
+  #stream { flex: 1; overflow-y: auto; padding: 20px clamp(14px, 2.4vw, 30px) 26px; min-height: 0; }
   .line {
     display: grid; grid-template-columns: 22px 66px minmax(0,1fr) 30px; gap: 10px;
-    padding: 8px 10px; border-radius: 11px; align-items: baseline;
+    width: min(1120px, 100%); margin-inline: auto; padding: 9px 12px;
+    border-radius: 12px; align-items: baseline;
   }
-  .line:hover { background: var(--panel); }
+  .line:hover { background: var(--panel); box-shadow: inset 0 0 0 1px var(--line); }
   .line.hit { background: var(--accent-soft); }
   .line.picked { background: var(--danger-soft); }
   .line.fresh { animation: slidein .28s ease-out; }
@@ -268,7 +309,7 @@ extension WebUI {
   .pick { accent-color: var(--danger); margin: 0; align-self: center; }
   .del {
     border: none; background: transparent; color: var(--muted); font-size: 15px;
-    padding: 2px 6px; border-radius: 6px; line-height: 1;
+    min-height: 30px; padding: 2px 6px; border-radius: 6px; line-height: 1; box-shadow: none;
   }
   .del:hover { background: var(--danger-soft); color: var(--danger); }
 
@@ -328,17 +369,18 @@ extension WebUI {
 
   /* 아래 칸 — 실시간 전사기. 위(Whisper)와 높이를 나눠 갖는다. */
   #fastPane { flex: 0 0 auto; display: flex; flex-direction: column;
-              border-top: 2px solid var(--line); background: var(--panel); max-height: 42%; }
+              border-top: 1px solid var(--line-strong); background: var(--panel); max-height: 42%; }
   .paneBar { display: flex; align-items: center; gap: 8px; padding: 6px 18px;
-             border-bottom: 1px solid var(--line); }
+             min-height: 38px; border-bottom: 1px solid var(--line); }
   .paneNote { font-size: 11.5px; color: var(--muted); }
   .paneTag { flex: 0 0 auto; font-size: 11px; font-weight: 700; letter-spacing: .02em;
              padding: 2px 8px; border-radius: 999px; }
   .paneTag.main { background: var(--accent-soft); color: var(--accent); }
   .paneTag.fast { background: var(--me-soft); color: var(--me); }
-  #fastStream { flex: 1 1 auto; overflow-y: auto; padding: 6px 18px 8px; min-height: 0; }
+  #fastStream { flex: 1 1 auto; overflow-y: auto; padding: 8px clamp(14px, 2.4vw, 30px) 10px; min-height: 0; }
   #fastStream .fline { display: grid; grid-template-columns: 62px minmax(0,1fr); gap: 10px;
-                       padding: 3px 0; font-size: 14px; line-height: 1.5; color: var(--muted); }
+                       width: min(1080px, 100%); margin-inline: auto; padding: 4px 0;
+                       font-size: 14px; line-height: 1.5; color: var(--muted); }
   #fastStream .fline .t { font-size: 11.5px; font-variant-numeric: tabular-nums; padding-top: 3px; }
   #fastStream .fline:last-child { color: var(--ink); }
   /* Whisper 문장이 하나도 없을 때는 실시간 확정 기록이 정식 기록이므로, 같은 표식을
@@ -352,7 +394,7 @@ extension WebUI {
      받아쓰는 내내 화면이 덜컹거린다. 넘치는 글은 이 칸 안에서 스크롤시킨다. */
   #live {
     flex: 0 0 auto; display: flex; gap: 10px; align-items: flex-start;
-    padding: 11px 18px 13px; border-top: 1px solid var(--line); background: var(--panel);
+    padding: 12px clamp(14px, 2.4vw, 30px) 14px; border-top: 1px solid var(--line); background: var(--panel-raised);
     font-size: var(--cap); height: calc(1.6em * 3 + 24px); overflow-y: auto;
   }
   #live[hidden] { display: none; }
@@ -372,12 +414,13 @@ extension WebUI {
   /* 완전 종료 확인 */
   #quitVeil {
     position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center;
-    background: color-mix(in srgb, #000 45%, transparent); padding: 20px;
+    background: color-mix(in srgb, var(--ink) 48%, transparent); padding: 20px;
+    backdrop-filter: blur(4px);
   }
   #quitVeil[hidden] { display: none; }
   .quitCard {
-    background: var(--panel); border: 1px solid var(--line); border-radius: 15px;
-    padding: 22px 24px; max-width: 460px; width: 100%; box-shadow: 0 18px 50px rgba(0,0,0,.3);
+    background: var(--panel-raised); border: 1px solid var(--line-strong); border-radius: var(--radius-lg);
+    padding: 24px 26px; max-width: 460px; width: 100%; box-shadow: var(--shadow-md);
   }
   .quitCard h3 { margin: 0 0 10px; font-size: 17px; }
   .quitCard p { margin: 0; font-size: 14px; line-height: 1.65; color: var(--muted); word-break: keep-all; }
@@ -394,12 +437,13 @@ extension WebUI {
   /* 정지 → 마무리 대기 */
   #stopVeil {
     position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center;
-    background: color-mix(in srgb, #000 45%, transparent); padding: 20px;
+    background: color-mix(in srgb, var(--ink) 48%, transparent); padding: 20px;
+    backdrop-filter: blur(4px);
   }
   #stopVeil[hidden] { display: none; }
   .stopCard {
-    background: var(--panel); border: 1px solid var(--line); border-radius: 15px;
-    padding: 22px 24px; max-width: 380px; width: 100%; box-shadow: 0 18px 50px rgba(0,0,0,.3);
+    background: var(--panel-raised); border: 1px solid var(--line-strong); border-radius: var(--radius-lg);
+    padding: 24px 26px; max-width: 380px; width: 100%; box-shadow: var(--shadow-md);
   }
   .stopCard h3 { margin: 0 0 6px; font-size: 17px; }
   .stopHint { margin: 0 0 16px; font-size: 13px; color: var(--muted); line-height: 1.6; word-break: keep-all; }
@@ -434,14 +478,15 @@ extension WebUI {
   /* ── 넓은 요약 읽기 화면 ── */
   .summaryView { background: var(--bg); }
   .summaryScroll { height: 100%; overflow-y: auto; overscroll-behavior: contain; }
-  .summaryShell { width: min(1040px, 100%); margin: 0 auto; padding: 28px 34px 72px; }
+  .summaryShell { width: min(1080px, 100%); margin: 0 auto; padding: 36px 38px 80px; }
   .summaryHead {
     display: flex; align-items: flex-start; justify-content: space-between; gap: 20px;
     margin-bottom: 18px;
   }
-  .summaryHead h1 { margin: 0 0 5px; font-size: 25px; line-height: 1.3; letter-spacing: -.025em; }
+  .summaryHead h1 { margin: 0 0 6px; font-size: clamp(26px, 3vw, 32px); line-height: 1.2; letter-spacing: -.04em; }
   .summaryMeta { display: flex; gap: 9px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
   .summaryMeta span + span::before { content: "·"; margin-right: 9px; color: var(--line); }
+  .summaryMeta span:empty + span::before { content: none; }
   .summaryMeta button {
     border: none; background: transparent; color: var(--accent); padding: 0; font-size: 13px;
   }
@@ -459,7 +504,7 @@ extension WebUI {
     padding: 0; margin-bottom: 6px; font-size: 14px; font-weight: 650; color: var(--ink);
   }
   .onlineTargetOption {
-    display: inline-flex; align-items: center; min-height: 38px; padding: 7px 14px;
+    display: inline-flex; align-items: center; min-height: 40px; padding: 7px 14px;
     font-size: 14px; font-weight: 600; color: var(--muted); cursor: pointer;
     border: 1px solid var(--line); background: var(--panel);
   }
@@ -511,8 +556,9 @@ extension WebUI {
   }
   .summaryControls {
     display: grid; grid-template-columns: minmax(260px, .9fr) minmax(360px, 1.1fr); gap: 18px;
-    align-items: start; padding: 16px 18px; margin-bottom: 14px;
-    background: var(--panel); border: 1px solid var(--line); border-radius: 13px;
+    align-items: start; padding: 18px 20px; margin-bottom: 16px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-md);
+    box-shadow: var(--shadow-sm);
   }
   .summaryRange > label, .summarySave > label {
     display: block; margin-bottom: 6px; font-size: 14px; font-weight: 650;
@@ -521,14 +567,14 @@ extension WebUI {
      select가 버튼을 밀어내지 않도록 min-width:0과 유연한 비율을 함께 둔다. */
   .summaryRangeRow { display: flex; align-items: center; gap: 8px; }
   .summaryRangeRow select {
-    flex: 1 1 0; min-width: 0; font: inherit; font-size: 14px; padding: 8px 10px;
+    flex: 1 1 0; min-width: 0; min-height: 40px; font: inherit; font-size: 14px; padding: 8px 10px;
     border: 1px solid var(--line); border-radius: 9px; background: var(--bg); color: var(--ink);
   }
   .summaryRangeRow select:focus { outline: none; border-color: var(--accent); }
   .summaryRangeRow > span { color: var(--muted); }
   .summarySaveDestination { margin-top: 8px; }
   .summaryView input[type=text] {
-    width: 100%; min-width: 0; font: inherit; font-size: 14px; padding: 8px 10px;
+    width: 100%; min-width: 0; min-height: 40px; font: inherit; font-size: 14px; padding: 8px 10px;
     border: 1px solid var(--line); border-radius: 9px; background: var(--bg); color: var(--ink);
   }
   .summaryView input[type=text]:focus { outline: none; border-color: var(--accent); }
@@ -541,10 +587,9 @@ extension WebUI {
     border-radius: 50%; animation: spin .8s linear infinite;
   }
   #summary {
-    min-height: 260px; padding: 34px 42px 42px; margin-top: 14px;
-    background: var(--panel); border: 1px solid var(--line); border-radius: 15px;
-    box-shadow: 0 8px 30px color-mix(in srgb, var(--ink) 5%, transparent);
-    font-size: 16.5px; line-height: 1.75;
+    min-height: 260px; padding: 38px clamp(24px, 5vw, 56px) 48px; margin-top: 16px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-sm); font-size: 16.5px; line-height: 1.78;
   }
   .summaryUtilities { display: grid; grid-template-columns: 1fr; gap: 12px; margin-top: 14px; }
   .summaryUtility { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
@@ -555,38 +600,42 @@ extension WebUI {
   .summaryUtilityBody { padding: 14px; }
   .summaryUtilityBody .card:last-child { margin-bottom: 0; }
 
-  .empty { color: var(--muted); text-align: center; padding: 56px 20px; line-height: 1.9; }
+  .empty { color: var(--muted); text-align: center; padding: 56px 20px; line-height: 1.9; word-break: keep-all; }
   .empty kbd { background: var(--panel); border: 1px solid var(--line); border-bottom-width: 2px;
                border-radius: 6px; padding: 2px 7px; font-size: 13px; font-family: inherit; }
 
   /* ── 사이드 ── */
   aside { border-left: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
-  .tabs { display: flex; border-bottom: 1px solid var(--line); }
+  .tabs { display: flex; min-height: 48px; border-bottom: 1px solid var(--line); background: var(--panel); }
   .tab { flex: 1; padding: 11px 4px; text-align: center; font-size: 13.5px; font-weight: 600;
          color: var(--muted); cursor: pointer; border: 0; border-radius: 0;
          background: transparent; border-bottom: 2px solid transparent; }
   .tab:hover:not(:disabled) { background: var(--bg); border-color: transparent; color: var(--ink); }
   .tab.on { color: var(--accent); border-bottom-color: var(--accent); }
   .tab.on:hover:not(:disabled) { border-bottom-color: var(--accent); }
-  .panel { flex: 1; overflow-y: auto; padding: 17px; display: none; }
+  .panel { flex: 1; overflow-y: auto; padding: 22px 20px 36px; display: none; }
   .panel.on { display: block; }
 
-  .field { margin-bottom: 17px; }
-  .field > label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+  .field { margin-bottom: 22px; }
+  .field > label { display: block; font-size: 13px; font-weight: 700; margin-bottom: 7px; color: var(--muted-strong); }
   .hint { font-size: 12.5px; color: var(--muted); line-height: 1.55; margin-top: 5px; }
   /* 체크박스·라디오 안의 설명은 제목 아래로 내려야 읽힌다 */
   .check .hint { display: block; margin-top: 2px; font-weight: 400; }
   .field textarea, .field input[type=text], .field select {
-    width: 100%; font: inherit; font-size: 14px; padding: 8px 10px;
+    width: 100%; min-height: 40px; font: inherit; font-size: 14px; padding: 8px 10px;
     border: 1px solid var(--line); border-radius: 9px; background: var(--bg); color: var(--ink);
+    transition: border-color .16s ease, box-shadow .16s ease, background .16s ease;
+  }
+  .field textarea:focus, .field input[type=text]:focus, .field select:focus {
+    outline: none; border-color: var(--accent); background: var(--panel); box-shadow: 0 0 0 3px var(--accent-soft);
   }
   .field textarea { min-height: 68px; resize: vertical; }
   .check { display: flex; align-items: flex-start; gap: 9px; margin-bottom: 9px; font-size: 14px; cursor: pointer; }
   .check input { margin-top: 3px; accent-color: var(--accent); }
 
   .notice { padding: 10px 12px; border-radius: 10px; font-size: 13px; line-height: 1.6; margin-bottom: 13px; }
-  .notice.warn { background: var(--warn-soft); color: var(--warn); }
-  .notice.info { background: var(--accent-soft); color: var(--accent); }
+  .notice.warn { background: var(--warn-soft); color: var(--warn); border: 1px solid color-mix(in srgb, var(--warn) 20%, transparent); }
+  .notice.info { background: var(--accent-soft); color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent); }
 
   .row { display: flex; gap: 8px; }
   .row > * { flex: 1; }
@@ -652,7 +701,7 @@ extension WebUI {
   .goldKeys { font-size: 11.5px; color: var(--muted); margin-top: 9px; text-align: center; }
 
   .card {
-    border: 1px solid var(--line); border-radius: 11px; padding: 11px 13px; margin-bottom: 9px;
+    border: 1px solid var(--line); border-radius: 12px; padding: 13px 14px; margin-bottom: 9px;
     display: flex; align-items: center; gap: 10px;
   }
   .card .meta { flex: 1; min-width: 0; }
@@ -665,8 +714,9 @@ extension WebUI {
           background: var(--bg); border: 1px solid var(--line); color: var(--muted); }
 
   .drop {
-    border: 2px dashed var(--line); border-radius: 12px; padding: 22px 14px; text-align: center;
-    color: var(--muted); font-size: 13.5px; cursor: pointer; line-height: 1.7;
+    border: 1.5px dashed var(--line-strong); border-radius: 13px; padding: 28px 16px; text-align: center;
+    color: var(--muted); background: var(--bg); font-size: 13.5px; cursor: pointer; line-height: 1.7;
+    transition: border-color .16s ease, color .16s ease, background .16s ease;
   }
   .drop:hover, .drop.over { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
 
@@ -691,8 +741,14 @@ extension WebUI {
                         font-size: 15px; color: var(--muted); }
 
   @media (max-width: 700px) {
+    header { gap: 10px; padding: 10px 12px; }
+    .headerIdentity { flex-basis: 100%; gap: 8px; }
+    .brand > span:last-child { display: none; }
+    #title { flex: 1; width: auto; }
     header .spacer { display: none; }
-    .headerActions { width: 100%; }
+    .workspaceTabs { flex: 1 1 100%; width: 100%; }
+    .recordingStatus { flex: 1 1 100%; min-width: 0; justify-content: center; padding-left: 0; }
+    .headerActions { width: 100%; padding-left: 0; border-left: 0; }
     .headerActions .recordAction { flex: 1; }
     .workspaceTabs { flex: 1; }
     .workspaceTab { flex: 1; min-width: 0; }
@@ -714,6 +770,24 @@ extension WebUI {
     #summary { padding: 24px 20px 32px; border-radius: 12px; font-size: 16px; }
     #summary h2 { font-size: 21px; }
     #summary h3 { font-size: 18px; }
+    .toolbar { gap: 8px; }
+    #search { flex-basis: calc(100% - 70px); }
+    .line { grid-template-columns: 20px 54px minmax(0,1fr) 30px; gap: 7px; padding-inline: 6px; }
+    .ts { font-size: 11px; }
+    .paneNote { display: none; }
+    #live { flex-direction: column; gap: 6px; }
+    .row { flex-wrap: wrap; }
+    .row > * { min-width: 120px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    *, *::before, *::after {
+      scroll-behavior: auto !important;
+      animation-duration: .01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: .01ms !important;
+    }
   }
 """#
 }

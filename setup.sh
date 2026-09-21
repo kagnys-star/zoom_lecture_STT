@@ -61,58 +61,7 @@ else
 fi
 
 echo
-bold "3. 요약 모델 (로컬 LLM)"
-
-RAM_GB=$(($(sysctl -n hw.memsize) / 1073741824))
-if [ "$RAM_GB" -ge 24 ]; then WANT_MODEL="qwen3:14b"; MODEL_SIZE="9GB"
-elif [ "$RAM_GB" -ge 16 ]; then WANT_MODEL="qwen3:8b";  MODEL_SIZE="5GB"
-else                           WANT_MODEL="qwen3:4b";  MODEL_SIZE="3GB"
-fi
-ok "메모리 ${RAM_GB}GB → 권장 모델 $WANT_MODEL (약 $MODEL_SIZE)"
-
-if ! command -v brew >/dev/null 2>&1; then
-  if command -v ollama >/dev/null 2>&1; then
-    warn "Homebrew가 없습니다. 이미 설치된 Ollama를 사용합니다."
-  else
-    warn "Homebrew가 없어 Ollama를 설치할 수 없습니다. Qwen 요약과 LLM 다듬기는 사용할 수 없습니다."
-  fi
-elif ! command -v ollama >/dev/null 2>&1; then
-  echo "  → Ollama 설치 중…"
-  brew install ollama >/dev/null 2>&1 && ok "Ollama 설치 완료" \
-    || warn "Ollama 설치 실패 — 설치하기 전까지 Qwen 요약과 LLM 다듬기를 사용할 수 없습니다."
-else
-  ok "Ollama 이미 설치됨"
-fi
-
-if command -v ollama >/dev/null 2>&1; then
-  if ! curl -s --max-time 3 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-    echo "  → Ollama 서버 시작 중…"
-    nohup ollama serve >/tmp/ollama.log 2>&1 &
-    sleep 4
-  fi
-  if curl -s --max-time 3 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-    INSTALLED=$(curl -s http://127.0.0.1:11434/api/tags | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
-    if echo "$INSTALLED" | grep -qE '^(qwen3|qwen2\.5)'; then
-      ok "Qwen 요약 모델 있음: $(echo "$INSTALLED" | grep -E '^(qwen3|qwen2\.5)' | head -1)"
-    else
-      warn "Qwen 요약 모델이 없습니다. $WANT_MODEL 를 받으려면 (약 $MODEL_SIZE, 시간이 걸립니다):"
-      echo "      ollama pull $WANT_MODEL"
-      warn "받기 전까지 Qwen 요약을 사용할 수 없습니다. 다른 앱 기능은 계속 사용할 수 있습니다."
-    fi
-  else
-    warn "Ollama 서버를 띄우지 못했습니다. Qwen 요약과 LLM 다듬기를 사용할 수 없습니다."
-    warn "모델을 받으려면 'ollama serve' 후 'ollama pull $WANT_MODEL'."
-  fi
-
-  # Ollama 를 로그인 때마다 상주시킬 필요가 없다. 앱이 요약할 때만 알아서 띄운다.
-  if brew services list 2>/dev/null | grep -q "^ollama *started"; then
-    echo "  → Ollama 상시 실행(brew service)을 끕니다. 요약할 때 앱이 자동으로 띄웁니다."
-    brew services stop ollama >/dev/null 2>&1 && ok "Ollama 상주 해제" || warn "상주 해제 실패"
-  fi
-fi
-
-echo
-bold "4. Whisper (재전사 — 선택)"
+bold "3. Whisper (정확한 자막)"
 # 실시간 자막은 macOS 내장 엔진이 맡는다. Whisper 는 수업이 끝난 뒤
 # 저장된 소리를 다시 들어 정확도를 끌어올리는 용도라 없어도 앱은 돈다.
 if command -v whisper-cli >/dev/null 2>&1; then
@@ -143,7 +92,7 @@ elif command -v whisper-cli >/dev/null 2>&1; then
 fi
 
 echo
-bold "5. 빌드"
+bold "4. 빌드"
 if ./build.sh >/tmp/zoomcaption-build.log 2>&1; then
   ok "ZoomCaption.app 생성 완료"
 else
@@ -153,7 +102,7 @@ else
 fi
 
 echo
-bold "6. 남은 것 — 직접 해주셔야 합니다"
+bold "5. 남은 것 — 직접 해주셔야 합니다"
 cat <<'GUIDE'
   ① 시스템 오디오 권한  (필수)
      시스템 설정 → 개인정보 보호 및 보안 → 화면 및 시스템 오디오 기록
@@ -168,4 +117,8 @@ GUIDE
 echo
 bold "실행"
 echo "  open $(pwd)/ZoomCaption.app"
+echo
+bold "선택 설치"
+echo "  로컬 Qwen 3 8B 요약이 필요하면:  ./setup-qwen.sh"
+echo "  자막 녹음과 편집은 Qwen 없이도 모두 사용할 수 있습니다."
 echo

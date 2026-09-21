@@ -42,7 +42,7 @@ extension ZoomCaptionApp {
       }
       guard case .ollama = await Summarizer.currentEngine() else {
         return .response(.json(["ok": false,
-                                "error": "쓸 수 있는 Qwen 모델이 없습니다. `ollama pull qwen3:8b`로 내려받으세요."]))
+                                "error": "로컬 Qwen 요약이 설치되지 않았습니다. 프로젝트 폴더에서 `./setup-qwen.sh`를 실행하세요."]))
       }
       // 시작 시점의 세션을 작업에 새겨 둔다. 끝날 때 같은지 확인해야 그 사이 세션이
       // 바뀌었을 때 남의 수업 폴더에 이 요약을 적어 넣지 않는다.

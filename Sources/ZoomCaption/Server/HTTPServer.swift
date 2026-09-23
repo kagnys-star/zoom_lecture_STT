@@ -250,7 +250,12 @@ final class HTTPServer: @unchecked Sendable {
     var head = "HTTP/1.1 \(res.status) \(Self.reason(res.status))\r\n"
     head += "Content-Type: \(res.contentType)\r\n"
     head += "Content-Length: \(res.body.count)\r\n"
-    head += "Cache-Control: no-store\r\n"
+    // API와 세션 응답은 기본적으로 저장하지 않는다. 버전이 고정된 글꼴처럼 명시적인
+    // 캐시 정책을 준 정적 자산은 extraHeaders의 값을 사용해 같은 헤더가 중복되지 않게 한다.
+    let overridesCacheControl = res.extraHeaders.keys.contains {
+      $0.caseInsensitiveCompare("Cache-Control") == .orderedSame
+    }
+    if !overridesCacheControl { head += "Cache-Control: no-store\r\n" }
     for (k, v) in res.extraHeaders { head += "\(k): \(v)\r\n" }
     head += keepAlive ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n"
 

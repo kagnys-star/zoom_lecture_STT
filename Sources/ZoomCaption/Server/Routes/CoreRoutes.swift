@@ -37,6 +37,18 @@ extension ZoomCaptionApp {
     case ("GET", "/events"):
       return .eventStream
 
+    // setup.sh 가 내려받아 둔 자막 글자체. 없으면 404 → CSS가 시스템 폰트로 조용히 넘어간다.
+    case ("GET", "/fonts/pretendard.woff2"):
+      guard let path = FontAssets.pretendardVariablePath,
+            let data = try? Data(contentsOf: path) else {
+        return .response(.notFound)
+      }
+      return .response(HTTPResponse(
+        contentType: "font/woff2",
+        body: data,
+        extraHeaders: ["Cache-Control": "public, max-age=604800, immutable"]
+      ))
+
     // 주기 대조용 최소 정보. 90분 수업의 /api/state 는 수백 KB 라 이걸 대신 쓴다.
     case ("GET", "/api/sync"):
       return .response(.json([

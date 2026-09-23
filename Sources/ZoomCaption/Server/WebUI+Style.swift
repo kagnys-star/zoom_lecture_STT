@@ -36,6 +36,15 @@ extension WebUI {
       --danger: #ff8278; --danger-soft: #3f201e; --on-accent: #0b1535;
     }
   }
+  /* setup.sh 가 내려받아 두면 /fonts/pretendard.woff2 가 서빙된다. 없으면 이 규칙 자체가
+     조용히 무시되고 body 의 다음 폰트(시스템 한글 폰트)로 넘어간다 — 자막 표시에 필수가
+     아니라 실패해도 사용자에게 보이는 문제가 없다. */
+  @font-face {
+    font-family: "Pretendard Variable";
+    src: url("/fonts/pretendard.woff2") format("woff2-variations");
+    font-weight: 45 920;
+    font-display: swap;
+  }
   * { box-sizing: border-box; }
   html, body { height: 100%; }
   html { background: var(--bg); scroll-behavior: smooth; }
@@ -57,7 +66,7 @@ extension WebUI {
   body:not(.administrator-mode) .administratorOnly { display: none !important; }
   body {
     margin: 0; background: var(--bg); color: var(--ink);
-    font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Pretendard", sans-serif;
+    font-family: "Pretendard Variable", -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif;
     font-size: 15px; line-height: 1.55; display: flex; flex-direction: column;
     -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
   }

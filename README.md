@@ -38,6 +38,7 @@ xcode-select --install
 설치 스크립트는 시스템 조건을 확인하고 다음 항목을 준비합니다.
 
 - 실시간 자막 앱
+- 자막 가독성을 위한 Pretendard 글꼴 — 다운로드에 실패하면 시스템 글꼴을 사용합니다
 - 정확한 재전사용 Whisper와 모델
 - 교안 용어 추출용 `mecab-ko` (Homebrew가 있을 때)
 - `ZoomCaption.app` 빌드
@@ -140,6 +141,7 @@ ollama list
 - **설정 → Whisper 처리 후 원본 소리 보관**을 끄면 정확한 자막을 만든 뒤 WAV 원본을 삭제합니다.
 - Claude, ChatGPT, Gemini 요약을 선택하면 사용자가 직접 해당 서비스로 녹취 프롬프트를 보냅니다.
 - 앱 서버는 외부에 공개되지 않고 `127.0.0.1`에서만 열립니다.
+- 선택 글꼴은 `~/Library/Application Support/ZoomCaption/fonts/`에 저장되고 로컬 앱 서버에서만 제공됩니다.
 
 ## 문제가 있을 때
 

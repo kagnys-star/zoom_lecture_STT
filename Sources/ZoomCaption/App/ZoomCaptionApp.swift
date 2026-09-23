@@ -14,6 +14,7 @@ final class ZoomCaptionApp: @unchecked Sendable {
   private enum AudioCaptureIssue: Equatable {
     case callbackStalled
     case targetProcessLost
+    case targetProcessChanged
     case outputRouteChanged
   }
 
@@ -109,6 +110,9 @@ final class ZoomCaptionApp: @unchecked Sendable {
   /// 번 비어 보일 수 있다. 실제 대상 소실 역시 두 번 연속 확인해야 사용자 오류로
   /// 승격해, 정상 녹음 중 순간적인 조회 실패가 빨간 배너로 번쩍이지 않게 한다.
   private var consecutiveMissingCaptureTargetChecks = 0
+  /// 자동 재연결이 실패할 때 5초 타이머마다 Core Audio 장치를 계속 만들고 부수지 않도록
+  /// 마지막 시도 시각을 기억한다. 경로가 실제로 복구되거나 새 녹음이 시작되면 초기화한다.
+  private var lastAudioCaptureReconnectAttemptAt: Date?
   /// 기본 출력 장치가 마지막으로 바뀐 시각·이름(이어폰 꽂기/빼기 등). 무음 감시가
   /// "왜 조용해졌는지" 문구를 구체적으로 채울 때 참고만 한다 — 이것 자체로는
   /// 아무것도 알리지 않는다(장치가 바뀌어도 캡처가 안 죽는 경우가 더 흔하다).
@@ -128,6 +132,9 @@ final class ZoomCaptionApp: @unchecked Sendable {
   /// 오래됐으면 콘텐츠 무음이 아니라 전달 경로 중단 후보로 본다. 실제 경고 평가는
   /// 5초마다 하므로 순간적인 스케줄 지연 한 번으로 사용자에게 오류를 띄우지 않는다.
   private static let audioCallbackStallSeconds: TimeInterval = 5
+  /// 실패한 자동 재연결의 재시도 간격. Zoom의 짧은 내부 경로 재구성은 기다려 주되,
+  /// 사용자가 수동으로 녹음을 다시 시작하지 않아도 장기 장애에서 회복할 수 있게 한다.
+  private static let audioCaptureReconnectRetrySeconds: TimeInterval = 30
 
   let stateLock = NSLock()
   var running = false
@@ -293,6 +300,7 @@ final class ZoomCaptionApp: @unchecked Sendable {
     json["captureHasReceivedBuffer"] = heartbeatSnapshot?.hasReceivedAudioBuffer ?? false
     json["secondsSinceCaptureBuffer"] = heartbeatSnapshot?.secondsSinceMostRecentBufferOrStart ?? 0
     json["captureScope"] = tap?.captureScope?.rawValue ?? "-"
+    json["captureTargetHealth"] = tap?.captureTargetHealth.rawValue ?? "-"
     json["sourceFormat"] = tap?.sourceFormat.map { "\($0.sampleRate)Hz ch\($0.channelCount)" } ?? "-"
     json["peak"] = Double(activityClock?.peakLevel ?? 0)
     let db = activityClock?.peakDBFS ?? -Double.infinity
@@ -931,6 +939,7 @@ final class ZoomCaptionApp: @unchecked Sendable {
         currentAudioCaptureIssue = nil
         consecutiveAudioCallbackStallChecks = 0
         consecutiveMissingCaptureTargetChecks = 0
+        lastAudioCaptureReconnectAttemptAt = nil
       }
       // 되먹임은 실제 탭 시작이 없으므로 sink까지 모두 준비된 이 지점을 녹음 시작으로
       // 확정한다. 파일 입력이 끝난 뒤에도 기존 180초 경계를 시험할 수 있어야 한다.
@@ -974,6 +983,7 @@ final class ZoomCaptionApp: @unchecked Sendable {
         currentAudioCaptureIssue = nil
         consecutiveAudioCallbackStallChecks = 0
         consecutiveMissingCaptureTargetChecks = 0
+        lastAudioCaptureReconnectAttemptAt = nil
       }
       throw error
     }
@@ -983,6 +993,7 @@ final class ZoomCaptionApp: @unchecked Sendable {
       currentAudioCaptureIssue = nil
       consecutiveAudioCallbackStallChecks = 0
       consecutiveMissingCaptureTargetChecks = 0
+      lastAudioCaptureReconnectAttemptAt = nil
     }
     // 실제 탭이 성공한 뒤에만 Store의 녹음 시계를 연다. 실패 rollback에서
     // endRecording()을 호출해 이어 적기 기준이 불필요하게 2초 늘어나는 일을 막는다.
@@ -1075,8 +1086,8 @@ final class ZoomCaptionApp: @unchecked Sendable {
   }
 
   /// 실제 탭의 전달 경로만 5초마다 검사한다. PCM이 0인지 아닌지는 전혀 보지 않기
-  /// 때문에 발표자 침묵은 정상으로 남고, 버퍼 자체가 멈추거나 시작 때 선택한 Zoom
-  /// 프로세스가 모두 사라진 경우에만 사용자에게 오류를 알린다.
+  /// 때문에 발표자 침묵은 정상으로 남긴다. 버퍼 자체가 멈추거나, 시작 때 선택한 Zoom
+  /// 프로세스의 전체 정체성이 사라진 경우에는 재연결 또는 구체적인 오류를 수행한다.
   private func startAudioCaptureHealthWatchdog() {
     let timer = DispatchSource.makeTimerSource(queue: .global())
     timer.schedule(deadline: .now() + 5, repeating: 5)
@@ -1090,7 +1101,8 @@ final class ZoomCaptionApp: @unchecked Sendable {
       let heartbeatSnapshot = captureHeartbeat.snapshot()
       let callbackAppearsStalled = heartbeatSnapshot.secondsSinceMostRecentBufferOrStart
         > Self.audioCallbackStallSeconds
-      let captureTargetIsAvailable = currentAudioTap.hasAvailableCapturedTarget
+      let captureTargetHealth = currentAudioTap.captureTargetHealth
+      let captureTargetIsAvailable = captureTargetHealth == .healthy
       let confirmedHealthState = self.stateLock.withLock { () -> (
         callbackStalled: Bool, captureTargetMissing: Bool
       ) in
@@ -1109,9 +1121,59 @@ final class ZoomCaptionApp: @unchecked Sendable {
           self.consecutiveMissingCaptureTargetChecks >= 2
         )
       }
+
+      // 같은 objectID가 다른 PID·bundle ID에 재사용됐거나 Zoom이 새 objectID를 받은
+      // 경우에는 정상 침묵으로 기다리지 않고 현재 후보로 탭을 다시 만든다. 일시적인
+      // HAL 목록 흔들림을 피하려고 기존 정책과 같이 두 번 연속 확인한 뒤 실행한다.
+      var reconnectFailureDescription: String?
+      if confirmedHealthState.captureTargetMissing,
+         captureTargetHealth == .replacementAvailable {
+        let reconnectAttemptedAt = Date()
+        let shouldAttemptReconnect = self.stateLock.withLock { () -> Bool in
+          guard self.running, !self.stopping, self.tap === currentAudioTap else { return false }
+          if let lastAttempt = self.lastAudioCaptureReconnectAttemptAt,
+             reconnectAttemptedAt.timeIntervalSince(lastAttempt)
+               < Self.audioCaptureReconnectRetrySeconds {
+            return false
+          }
+          self.lastAudioCaptureReconnectAttemptAt = reconnectAttemptedAt
+          return true
+        }
+
+        if shouldAttemptReconnect {
+          do {
+            if try currentAudioTap.reconnectZoomCaptureIfNeeded() {
+              let shouldPublishRecovery = self.stateLock.withLock { () -> Bool in
+                guard self.running, !self.stopping, self.tap === currentAudioTap else {
+                  return false
+                }
+                self.consecutiveAudioCallbackStallChecks = 0
+                self.consecutiveMissingCaptureTargetChecks = 0
+                self.lastAudioCaptureReconnectAttemptAt = nil
+                self.currentAudioCaptureIssue = nil
+                return true
+              }
+              guard shouldPublishRecovery else { return }
+              log("Zoom 오디오 캡처 경로 자동 재연결 완료 — 새 프로세스 정체성과 버퍼를 다시 감시합니다.")
+              self.live.broadcast(event: "status", payload: [
+                "silent": false,
+                "message": "Zoom 오디오 경로가 바뀌어 자동으로 다시 연결했습니다.",
+                "level": "info",
+              ])
+              return
+            }
+          } catch {
+            reconnectFailureDescription = error.localizedDescription
+            logWarn("Zoom 오디오 캡처 경로 자동 재연결 실패: \(error.localizedDescription)")
+          }
+        }
+      }
+
       let detectedIssue: AudioCaptureIssue?
       if confirmedHealthState.captureTargetMissing {
-        detectedIssue = .targetProcessLost
+        detectedIssue = captureTargetHealth == .replacementAvailable
+          ? .targetProcessChanged
+          : .targetProcessLost
       } else if captureTargetIsAvailable && confirmedHealthState.callbackStalled {
         let outputDeviceChangedRecently = self.stateLock.withLock {
           self.lastDeviceChangeAt.map { Date().timeIntervalSince($0) < 60 } == true
@@ -1141,6 +1203,11 @@ final class ZoomCaptionApp: @unchecked Sendable {
       case .targetProcessLost:
         issueMessage = "녹음을 시작할 때 선택한 Zoom 오디오 프로세스가 종료되었습니다. "
           + "시스템 전체 소리로 전환하지 않았습니다. Zoom 회의 상태를 확인한 뒤 녹음을 다시 시작해 주세요."
+      case .targetProcessChanged:
+        let failureDetail = reconnectFailureDescription.map { " 자동 재연결 실패: \($0)" } ?? ""
+        issueMessage = "Zoom 오디오 프로세스의 Core Audio 정체성이 바뀌어 기존 탭을 더 이상 신뢰할 수 없습니다."
+          + failureDetail
+          + " 앱이 자동 재연결을 다시 시도합니다. 계속되면 녹음을 다시 시작해 주세요."
       case .outputRouteChanged:
         let changedOutputName = self.stateLock.withLock { self.lastDeviceChangeName }
         issueMessage = "오디오 출력 장치가 \(changedOutputName ?? "다른 장치")로 바뀐 뒤 "
@@ -1380,6 +1447,7 @@ final class ZoomCaptionApp: @unchecked Sendable {
       currentAudioCaptureIssue = nil
       consecutiveAudioCallbackStallChecks = 0
       consecutiveMissingCaptureTargetChecks = 0
+      lastAudioCaptureReconnectAttemptAt = nil
       return task
     }
     boundaryTaskToCancel?.cancel()

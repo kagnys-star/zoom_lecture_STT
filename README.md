@@ -5,6 +5,7 @@ Zoom 수업의 소리를 실시간 자막으로 보고, 더 정확한 기록과 
 - Zoom 오디오를 직접 받아 자막으로 변환합니다.
 - 빠른 실시간 자막과 정확한 Whisper 기록을 함께 제공합니다.
 - 자막 검색, 편집, 세션 이어 적기, Markdown·SRT 내보내기를 지원합니다.
+- Zoom의 내부 오디오 경로가 바뀌면 대상을 다시 확인하고 자동으로 재연결합니다.
 - 음성과 로컬 요약 데이터는 기본적으로 이 Mac 안에서 처리됩니다.
 - BlackHole 같은 가상 오디오 드라이버가 필요하지 않습니다.
 
@@ -97,6 +98,7 @@ PDF를 넣으면 수업의 주요 용어를 찾아 음성 인식 힌트와 요�
 ```text
 자료구조-3주차/
 ├── session.json          앱이 다시 여는 원본 데이터
+├── audio_000000.wav      원본 소리 보관을 켰을 때 생성되는 오디오
 ├── transcript.md         요약과 전체 Whisper 기록
 ├── transcript.srt        영상 편집용 자막
 ├── transcript_live.md    전체 실시간 기록
@@ -146,7 +148,12 @@ ollama list
 1. Zoom 회의에서 실제로 소리가 재생 중인지 확인합니다.
 2. **화면 및 시스템 오디오 기록** 권한이 켜져 있는지 확인합니다.
 3. 권한을 바꿨다면 ZoomCaption을 완전히 종료한 뒤 다시 실행합니다.
-4. 앱의 **설정 → 문제 해결**에서 진단 정보를 확인합니다.
+4. 상단 버튼이 **녹음 정지**로 표시되는지 확인합니다. **녹음 시작**이면 현재 녹음이 꺼진 상태입니다.
+5. 앱의 **설정 → 문제 해결**에서 `대상 healthy`와 최근 버퍼 수신 시간이 표시되는지 확인합니다.
+
+Zoom이 오디오 프로세스를 내부적으로 다시 만들면 ZoomCaption은 새 프로세스 정체성을 확인해
+자동으로 재연결합니다. `replacementAvailable` 또는 대상 변경 경고가 계속되면 녹음을 정지했다가
+다시 시작하세요. Zoom 후보가 없을 때 시스템 전체 소리로 조용히 전환하지는 않습니다.
 
 ### Whisper 자막이 만들어지지 않아요
 
@@ -178,7 +185,9 @@ ollama list
 ./open-admin.command
 ```
 
-관리자 모드는 별도 포트와 별도 저장 폴더를 사용합니다.
+관리자 모드는 일반 앱과 분리된 `127.0.0.1:8766` 포트와
+`~/Documents/ZoomCaption-Admin/` 저장 폴더를 사용합니다. 라이브 수업 중에는 실제 탭 A/B probe를
+필요한 경우에만 짧게 실행하고, 저장된 WAV 되먹임 테스트를 우선 사용하세요.
 
 ## 개발 및 확인
 
@@ -191,6 +200,9 @@ swift run ZoomCaption --webui-check
 
 # 요약 파이프라인 회귀 검사
 swift run ZoomCaption --summary-check
+
+# Core Audio 프로세스 정체성·objectID 재사용 회귀 검사
+swift run ZoomCaption --audio-capture-check
 ```
 
 주요 소스 위치:
@@ -199,5 +211,6 @@ swift run ZoomCaption --summary-check
 - `Sources/ZoomCaption/Server/WebUI+Style.swift` — 화면 스타일
 - `Sources/ZoomCaption/Server/WebUI+Script.swift` — 화면 동작
 - `Sources/ZoomCaption/App/ZoomCaptionApp.swift` — 앱 상태와 API
+- `Sources/ZoomCaption/Audio/AudioTap.swift` — Zoom 프로세스 선택, 정체성 확인, 자동 재연결
 
 배포용 서명과 공증은 `build.sh`의 애드혹 서명과 별도로 준비해야 합니다.

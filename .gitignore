@@ -3,3 +3,23 @@
 .swiftpm/
 ZoomCaption.app/
 *.xcodeproj
+
+# Local agent/review and document-generation workspaces
+.agents/
+.codex_review/
+output/
+work_rag_doc/
+
+# Internal investigation and implementation notes (not release documentation)
+docs/audio-capture-hardening-porting-prompt.md
+docs/audio-capture-object-identity-recovery-plan.md
+docs/audio-capture-silence-and-microphone-reassessment.md
+docs/claude-codex-collaboration-briefing.md
+docs/lecture-boundary-porting-prompt.md
+docs/qwen-time-segment-summary-implementation-plan.md
+docs/qwen-time-segment-summary-implementation-report.md
+docs/summary-system-analysis-and-improvement-plan.md
+docs/ui-admin-audio-settings-redesign-report.md
+docs/whisper-silence-stall-analysis.md
+docs/zoom-microphone-capture-leak-analysis.md
+docs/zoom-silence-popup-false-positive-analysis.md

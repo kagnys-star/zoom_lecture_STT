@@ -2033,7 +2033,7 @@ extension WebUI {
         `요약 엔진: ${esc(state.summaryEngine || '-')}<br>` +
         `오디오 입력: ${esc(d.levelAdvice || '-')}<br>` +
         (d.framesSeen ? `피크 ${(d.peakDBFS).toFixed(1)} dBFS · RMS ${(d.rms).toFixed(4)}<br>` : '') +
-        `캡처 경로: ${esc(d.captureScope || '-')} · ` +
+        `캡처 경로: ${esc(d.captureScope || '-')} · 대상 ${esc(d.captureTargetHealth || '-')} · ` +
           `${d.captureHasReceivedBuffer ? `${Number(d.secondsSinceCaptureBuffer || 0).toFixed(1)}초 전 버퍼 수신` : '버퍼 대기'}<br>` +
         `소리 보관: ${d.audioClips ? `${d.audioClips}개 · ${clock(d.audioSeconds)} · ${d.audioMB.toFixed(0)}MB` : '없음'}<br>` +
         `재전사: ${d.whisperReady ? '' : '<b>불가</b> — '}${esc(d.whisperDetail || '-')}<br>` +
@@ -2073,7 +2073,8 @@ extension WebUI {
       '세션: ' + (st.sessionDir || '없음'),
       '오디오 프레임: ' + d.framesSeen + ', 소리 감지: ' + d.heardSound,
       '탭 포맷: ' + d.sourceFormat + ', 피크 ' + (d.peakDBFS||0).toFixed(1) + ' dBFS',
-      '캡처 경로: ' + (d.captureScope || '-') + ', 최근 버퍼: '
+      '캡처 경로: ' + (d.captureScope || '-') + ', 대상 상태: '
+        + (d.captureTargetHealth || '-') + ', 최근 버퍼: '
         + (d.captureHasReceivedBuffer ? Number(d.secondsSinceCaptureBuffer || 0).toFixed(1) + '초 전' : '없음'),
       '소리 보관: ' + d.audioClips + '개 / ' + d.audioSeconds + '초 / ' + (d.audioMB||0).toFixed(0) + 'MB',
       'whisper: ' + (d.whisperReady ? 'OK' : '불가') + ' — ' + d.whisperDetail,

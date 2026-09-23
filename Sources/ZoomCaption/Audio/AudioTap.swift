@@ -11,10 +11,46 @@ private func sysAddr(_ sel: AudioObjectPropertySelector) -> AudioObjectPropertyA
                              mElement: kAudioObjectPropertyElementMain)
 }
 
-struct AudioProcessInfo: Sendable {
+struct AudioProcessInfo: Sendable, Hashable {
   let objectID: AudioObjectID
   let pid: pid_t
   let bundleID: String
+}
+
+/// 시작 때 붙잡은 Core Audio 프로세스와 현재 프로세스 목록의 관계다.
+///
+/// `AudioObjectID`는 영구 식별자가 아니다. 프로세스의 오디오 경로가 다시 만들어지면
+/// 같은 PID가 새 objectID를 받을 수 있고, 해제된 번호는 전혀 다른 프로세스에 재사용될
+/// 수 있다. 따라서 번호 하나가 목록에 남아 있다는 이유만으로 캡처 대상이 살아 있다고
+/// 판단하면 안 된다.
+enum AudioCaptureTargetHealth: String, Sendable, Equatable {
+  /// objectID, PID, bundle ID가 모두 같은 대상이 현재도 존재한다.
+  case healthy
+  /// 예전 대상은 사라졌지만 허용된 Zoom 후보가 있어 새 탭으로 갈아탈 수 있다.
+  case replacementAvailable
+  /// 현재 허용된 Zoom 오디오 후보가 하나도 없다.
+  case missing
+}
+
+enum AudioCaptureTargetIdentity {
+  static func evaluate(
+    captured: [AudioProcessInfo],
+    current: [AudioProcessInfo],
+    allowedBundleIDs: Set<String>
+  ) -> AudioCaptureTargetHealth {
+    let capturedIdentities = Set(captured)
+    let currentAllowedIdentities = Set(current.filter {
+      allowedBundleIDs.contains($0.bundleID)
+    })
+    guard !currentAllowedIdentities.isEmpty else { return .missing }
+
+    // 사라진 보조 프로세스는 현재 탭의 나머지 대상을 무효화하지 않는다. 반대로 새로
+    // 생긴 허용 후보는 기존 CATapDescription에 들어 있지 않으므로, 예전 후보 하나가
+    // 남아 있어도 반드시 새 탭으로 교체해야 한다.
+    return currentAllowedIdentities.isSubset(of: capturedIdentities)
+      ? .healthy
+      : .replacementAvailable
+  }
 }
 
 /// 관리자 A/B 진단 화면에만 노출하는 출력 스트림 정보다. `streamIndex`는
@@ -395,6 +431,7 @@ final class AudioActivityClock: @unchecked Sendable {
 final class SystemAudioTap: @unchecked Sendable {
   enum TapError: LocalizedError {
     case zoomAudioProcessUnavailable
+    case zoomAudioProcessChangedDuringStart
     case tapCreationFailed(OSStatus)
     case aggregateCreationFailed(OSStatus)
     case ioProcFailed(OSStatus)
@@ -405,6 +442,8 @@ final class SystemAudioTap: @unchecked Sendable {
       switch self {
       case .zoomAudioProcessUnavailable:
         return "Zoom 회의 오디오 프로세스를 찾지 못했습니다. Zoom 회의에 들어간 뒤 다시 시작해 주세요."
+      case .zoomAudioProcessChangedDuringStart:
+        return "Zoom 오디오 프로세스가 캡처 준비 중 계속 교체되어 안정된 경로를 만들지 못했습니다. 잠시 뒤 다시 시작해 주세요."
       case .tapCreationFailed(let s): return "오디오 탭 생성 실패 (OSStatus \(s))"
       case .aggregateCreationFailed(let s): return "집합 장치 생성 실패 (OSStatus \(s))"
       case .ioProcFailed(let s): return "오디오 콜백 등록 실패 (OSStatus \(s))"
@@ -419,10 +458,19 @@ final class SystemAudioTap: @unchecked Sendable {
     "us.zoom.xos", "us.zoom.ZoomClips", "us.zoom.ZoomLauncher", "us.zoom.ZoomAudioDaemon",
   ]
 
+  /// 탭 생성 자체가 오디오 프로세스 목록을 바꾸는 경우가 있어, 만든 직후 정체성을
+  /// 다시 확인하고 새 후보로 제한 횟수만큼 재시도한다. 무한 재시도는 시작 요청을
+  /// 영원히 붙잡으므로 허용하지 않는다.
+  private static let maximumIdentityStabilizationAttempts = 3
+
+  private let lifecycleLock = NSLock()
   private var tapID = AudioObjectID(kAudioObjectUnknown)
   private var aggregateID = AudioObjectID(kAudioObjectUnknown)
   private var ioProcID: AudioDeviceIOProcID?
   private var tapUUID: UUID?
+  /// 집합 장치를 만들 때 실제 사용한 UID. 로그 시점에 기본 장치가 다시 바뀌어도
+  /// 생성에 쓴 경로를 정확히 보고하기 위해 별도로 보존한다.
+  private var selectedOutputDeviceUID: String?
   /// 실사용 탭을 만들 때 실제로 포함한 Zoom 프로세스들이다. 실행 도중 이 대상이
   /// 모두 사라졌는지를 판정하는 데만 쓰며, A/B 진단 전에는 특정 프로세스가 최종
   /// 회의 오디오 경로라고 가정하지 않는다.
@@ -454,6 +502,56 @@ final class SystemAudioTap: @unchecked Sendable {
   /// 명시된 범위만 캡처한다. Zoom 대상이 없을 때 시스템 전체 탭으로 넓히지 않고
   /// 즉시 실패해야 사용자가 Zoom 전용이라고 믿는 녹음에 다른 앱 소리가 섞이지 않는다.
   func start(scope requestedCaptureScope: AudioCaptureScope) throws {
+    try lifecycleLock.withLock {
+      stopLocked()
+      try startWithStableIdentityLocked(scope: requestedCaptureScope)
+    }
+  }
+
+  /// 시작 직후 목록을 다시 읽어 CATapDescription에 넣은 프로세스가 여전히 같은
+  /// PID·bundle ID인지 확인한다. objectID가 다른 프로세스에 재사용됐다면 방금 만든
+  /// 탭을 즉시 폐기하고 현재 Zoom 후보로 다시 만든다.
+  private func startWithStableIdentityLocked(scope requestedCaptureScope: AudioCaptureScope) throws {
+    let maximumAttempts = requestedCaptureScope == .zoomMeetingOutput
+      ? Self.maximumIdentityStabilizationAttempts
+      : 1
+
+    for attempt in 1...maximumAttempts {
+      do {
+        try startOnceLocked(scope: requestedCaptureScope)
+      } catch TapError.zoomAudioProcessUnavailable where attempt < maximumAttempts {
+        stopLocked()
+        logWarn("Zoom 오디오 후보가 시작 안정화 중 잠시 사라졌습니다 — "
+          + "다시 탐색합니다 (\(attempt + 1)/\(maximumAttempts))")
+        Thread.sleep(forTimeInterval: 0.1)
+        continue
+      } catch {
+        stopLocked()
+        throw error
+      }
+
+      let targetHealth = captureTargetHealthLocked(current: CoreAudioInfo.processes())
+      if requestedCaptureScope != .zoomMeetingOutput || targetHealth == .healthy {
+        logCaptureRoute(attempt: attempt)
+        return
+      }
+
+      let staleDescription = capturedProcessDescriptionLocked()
+      stopLocked()
+      guard attempt < maximumAttempts else {
+        logError("Zoom 캡처 대상 정체성이 시작 중 안정되지 않았습니다 — 마지막 대상: \(staleDescription)")
+        throw TapError.zoomAudioProcessChangedDuringStart
+      }
+      logWarn("Zoom 캡처 대상이 시작 중 교체됐습니다 — \(staleDescription); "
+        + "현재 후보로 다시 연결합니다 (\(attempt + 1)/\(maximumAttempts))")
+    }
+
+    throw TapError.zoomAudioProcessChangedDuringStart
+  }
+
+  /// 한 번의 Core Audio 자원 생성을 수행한다. 이 함수가 성공해도 호출자는 반드시
+  /// 프로세스 정체성을 다시 확인해야 한다.
+  private func startOnceLocked(scope requestedCaptureScope: AudioCaptureScope) throws {
     let availableAudioProcesses = CoreAudioInfo.processes()
     let zoomAudioProcessCandidates = availableAudioProcesses.filter {
       Self.zoomBundleIDs.contains($0.bundleID)
@@ -498,6 +596,7 @@ final class SystemAudioTap: @unchecked Sendable {
     guard let selectedOutputDeviceUID = CoreAudioInfo.defaultOutputUID() else {
       throw TapError.noOutputDevice
     }
+    self.selectedOutputDeviceUID = selectedOutputDeviceUID
 
     let aggregateDeviceDescription: [String: Any] = [
       kAudioAggregateDeviceNameKey: "ZoomCaption Aggregate",
@@ -530,31 +629,85 @@ final class SystemAudioTap: @unchecked Sendable {
     let startErr = AudioDeviceStart(agg, proc)
     guard startErr == noErr else { throw TapError.ioProcFailed(startErr) }
     captureScope = requestedCaptureScope
+  }
 
+  private func logCaptureRoute(attempt: Int) {
+    let requestedCaptureScope = captureScope
+    let selectedOutputDeviceUID = selectedOutputDeviceUID ?? "unknown"
     let processesIncludedInTap = requestedCaptureScope == .zoomMeetingOutput
-      ? zoomAudioProcessCandidates
+      ? capturedZoomProcesses
       : []
     let capturedProcessDescription = processesIncludedInTap.isEmpty
       ? "none"
       : processesIncludedInTap.map {
           "\($0.bundleID)(pid=\($0.pid),object=\($0.objectID))"
         }.joined(separator: ",")
-    log("오디오 캡처 경로 — scope=\(requestedCaptureScope.rawValue), "
+    let sourceFormatDescription = sourceFormat.map {
+      "\($0.sampleRate)Hz ch\($0.channelCount) \($0.commonFormat)"
+    } ?? "unknown"
+    log("오디오 캡처 경로 — scope=\(requestedCaptureScope?.rawValue ?? "none"), "
       + "processes=\(capturedProcessDescription), "
       + "defaultOutputUID=\(selectedOutputDeviceUID), "
+      + "sourceFormat=\(sourceFormatDescription), "
+      + "identityAttempt=\(attempt), "
       + "systemWideCapture=\(requestedCaptureScope == .administratorSystemOutput), "
       + "automaticGlobalFallback=false")
   }
 
-  /// 시작 때 선택했던 Zoom 대상 중 하나라도 현재 남아 있는지 확인한다. 허용 목록에는
-  /// 여러 보조 프로세스가 포함될 수 있어 하나가 종료됐다는 이유만으로 전체 경로를
-  /// 잃었다고 판단하지 않고, 선택 대상이 모두 사라졌을 때만 false를 반환한다.
-  var hasAvailableCapturedTarget: Bool {
-    guard captureScope == .zoomMeetingOutput else { return true }
-    let currentAudioProcessObjectIDs = Set(CoreAudioInfo.processes().map(\.objectID))
-    return capturedZoomProcesses.contains {
-      currentAudioProcessObjectIDs.contains($0.objectID)
+  /// 시작 때 선택한 대상의 objectID·PID·bundle ID가 모두 현재도 같은지 확인한다.
+  /// objectID만 비교하면 그 번호가 ZoomCaption 자신에게 재사용된 경우를 정상으로
+  /// 오판하므로 반드시 전체 정체성을 비교한다.
+  var captureTargetHealth: AudioCaptureTargetHealth {
+    lifecycleLock.withLock {
+      captureTargetHealthLocked(current: CoreAudioInfo.processes())
     }
+  }
+
+  var hasAvailableCapturedTarget: Bool {
+    captureTargetHealth == .healthy
+  }
+
+  private func captureTargetHealthLocked(
+    current currentAudioProcesses: [AudioProcessInfo]
+  ) -> AudioCaptureTargetHealth {
+    guard captureScope == .zoomMeetingOutput else { return .healthy }
+    return AudioCaptureTargetIdentity.evaluate(
+      captured: capturedZoomProcesses,
+      current: currentAudioProcesses,
+      allowedBundleIDs: Self.zoomBundleIDs)
+  }
+
+  /// 런타임에 Zoom이 같은 PID로 AudioObjectID만 새로 받거나, 완전히 새 프로세스로
+  /// 재시작된 경우 기존 탭을 현재 후보로 교체한다. sink와 heartbeat는 그대로 유지해
+  /// Apple 전사·WAV·Whisper 타임라인을 새 세션으로 끊지 않는다.
+  ///
+  /// - Returns: 실제로 경로를 다시 만들었으면 true, 이미 건강하면 false.
+  func reconnectZoomCaptureIfNeeded() throws -> Bool {
+    try lifecycleLock.withLock {
+      guard captureScope == .zoomMeetingOutput else { return false }
+      let healthBeforeReconnect = captureTargetHealthLocked(current: CoreAudioInfo.processes())
+      guard healthBeforeReconnect != .healthy else { return false }
+
+      let previousTargets = capturedProcessDescriptionLocked()
+      logWarn("Zoom 캡처 대상 변경 감지 — health=\(healthBeforeReconnect.rawValue), "
+        + "previous=\(previousTargets); 현재 후보로 탭을 재생성합니다.")
+      stopLocked()
+      do {
+        try startWithStableIdentityLocked(scope: .zoomMeetingOutput)
+      } catch {
+        stopLocked()
+        throw error
+      }
+      return true
+    }
+  }
+
+  private func capturedProcessDescriptionLocked() -> String {
+    capturedZoomProcesses.isEmpty
+      ? "none"
+      : capturedZoomProcesses.map {
+          "\($0.bundleID)(pid=\($0.pid),object=\($0.objectID))"
+        }.joined(separator: ",")
   }
 
   private func handle(_ inData: UnsafePointer<AudioBufferList>) {
@@ -578,6 +731,10 @@ final class SystemAudioTap: @unchecked Sendable {
   }
 
   func stop() {
+    lifecycleLock.withLock { stopLocked() }
+  }
+
+  private func stopLocked() {
     if aggregateID != AudioObjectID(kAudioObjectUnknown), let proc = ioProcID {
       AudioDeviceStop(aggregateID, proc)
       AudioDeviceDestroyIOProcID(aggregateID, proc)
@@ -592,6 +749,7 @@ final class SystemAudioTap: @unchecked Sendable {
     aggregateID = AudioObjectID(kAudioObjectUnknown)
     tapID = AudioObjectID(kAudioObjectUnknown)
     tapUUID = nil
+    selectedOutputDeviceUID = nil
     captureScope = nil
     capturedZoomProcesses = []
   }

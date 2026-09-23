@@ -6,6 +6,83 @@ import AVFoundation
 // 오디오 권한·Zoom·화면 없이 각 경로만 따로 확인하는 명령들이다.
 // 앱을 띄우지 않고 터미널에서 바로 돌린다.
 
+/// Core Audio objectID 재사용과 Zoom 내부 재시작을 구분하는 순수 정체성 계약 검사다.
+/// 실제 장치나 권한 없이 실행되므로 빌드·배포 전 회귀 검사에서 항상 돌릴 수 있다.
+func runAudioCaptureIdentityChecks() -> Never {
+  var failures: [String] = []
+  func check(_ condition: @autoclosure () -> Bool, _ message: String) {
+    if condition() { print("✓ \(message)") }
+    else { print("✗ \(message)"); failures.append(message) }
+  }
+  func process(_ objectID: AudioObjectID, _ pid: pid_t, _ bundleID: String) -> AudioProcessInfo {
+    AudioProcessInfo(objectID: objectID, pid: pid, bundleID: bundleID)
+  }
+
+  let allowed = SystemAudioTap.zoomBundleIDs
+  let captured = [process(120, 48_004, "us.zoom.xos")]
+
+  check(AudioCaptureTargetIdentity.evaluate(
+    captured: captured,
+    current: captured,
+    allowedBundleIDs: allowed) == .healthy,
+    "objectID·PID·bundle ID가 모두 같을 때만 건강하다")
+
+  check(AudioCaptureTargetIdentity.evaluate(
+    captured: captured,
+    current: [
+      process(120, 51_628, "com.local.zoomcaption"),
+      process(117, 48_004, "us.zoom.xos"),
+    ],
+    allowedBundleIDs: allowed) == .replacementAvailable,
+    "objectID가 ZoomCaption에 재사용되고 Zoom이 새 번호를 받으면 교체 대상으로 판정한다")
+
+  check(AudioCaptureTargetIdentity.evaluate(
+    captured: captured,
+    current: [process(117, 48_004, "us.zoom.xos")],
+    allowedBundleIDs: allowed) == .replacementAvailable,
+    "같은 Zoom PID가 새 objectID를 받으면 재연결 대상으로 판정한다")
+
+  check(AudioCaptureTargetIdentity.evaluate(
+    captured: captured,
+    current: [process(130, 60_001, "us.zoom.xos")],
+    allowedBundleIDs: allowed) == .replacementAvailable,
+    "Zoom이 새 PID로 재시작돼도 허용된 후보가 있으면 재연결 대상으로 판정한다")
+
+  check(AudioCaptureTargetIdentity.evaluate(
+    captured: captured,
+    current: [process(120, 51_628, "com.local.zoomcaption")],
+    allowedBundleIDs: allowed) == .missing,
+    "번호만 남고 Zoom 후보가 없으면 대상 소실로 판정한다")
+
+  check(AudioCaptureTargetIdentity.evaluate(
+    captured: [
+      process(120, 48_004, "us.zoom.xos"),
+      process(121, 48_015, "us.zoom.ZoomAudioDaemon"),
+    ],
+    current: [process(121, 48_015, "us.zoom.ZoomAudioDaemon")],
+    allowedBundleIDs: allowed) == .healthy,
+    "복수 대상 중 하나의 완전한 정체성이 남아 있으면 경로를 유지한다")
+
+  check(AudioCaptureTargetIdentity.evaluate(
+    captured: [
+      process(120, 48_004, "us.zoom.xos"),
+      process(121, 48_015, "us.zoom.ZoomAudioDaemon"),
+    ],
+    current: [
+      process(121, 48_015, "us.zoom.ZoomAudioDaemon"),
+      process(130, 60_001, "us.zoom.xos"),
+    ],
+    allowedBundleIDs: allowed) == .replacementAvailable,
+    "예전 보조 대상이 남아도 새 Zoom 후보가 생기면 탭 교체 대상으로 판정한다")
+
+  if failures.isEmpty {
+    print("오디오 캡처 정체성 자가검사 통과")
+    exit(0)
+  }
+  print("오디오 캡처 정체성 자가검사 실패: \(failures.count)건")
+  exit(1)
+}
+
 /// WebUI 마크업과 스크립트의 정적 계약을 검사한다.
 ///
 /// 이 앱은 HTML과 JS를 문자열로 함께 싣기 때문에 존재하지 않는 id 하나를 참조해도
